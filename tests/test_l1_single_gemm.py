@@ -1576,6 +1576,8 @@ def test_vllm_profile_env_mode(monkeypatch, mode, expected_type):
     assert profile_env.name == "vllm_env"
     if mode == "host":
         assert profile_env.python_executable == env_module._VLLM_FORK_PYTHON
+        assert profile_env.additional_python_paths == (env_module._VLLM_FORK_CHECKOUT,)
+        assert profile_env.isolated_site_packages
 
 
 def test_vllm_profile_env_rejects_unknown_mode(monkeypatch):

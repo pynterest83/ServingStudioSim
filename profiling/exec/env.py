@@ -101,22 +101,28 @@ _VLLM_FORK_TORCH_LIB = (
 )
 _SGLANG_PYTHON_ROOT = _SGLANG_CHECKOUT / "python"
 _SGLANG_PYTHON = _SGLANG_PYTHON_ROOT / ".venv-sglang" / "bin" / "python"
-_VLLM_FORK_PYTHON = _PROJECT_ROOT / "alignment" / "profiler" / "vllm" / ".venv" / "bin" / "python"
 _VLLM_PROFILE_IMAGE = "vibesim-profiler-vllm:cu130-3f667d7e"
 
 
 def _vllm_profile_env() -> ProfileEnv | ContainerProfileEnv:
     """The vLLM runners' environment: the pinned image unless the host is chosen.
 
-    ``VIBESIM_VLLM_PROFILE_ENV=host`` runs the same environment the image
-    bakes -- the alignment fork checkout and its ``.venv`` -- as a host
-    subprocess, for machines that cannot run Docker (an unprivileged
-    Kubernetes pod). The image stays the default because it freezes the
-    environment; a host run is only as reproducible as that checkout.
+    ``VIBESIM_VLLM_PROFILE_ENV=host`` runs the alignment fork checkout and its
+    ``.venv`` as a host subprocess, isolated exactly like
+    ``vllm_upstream_fork_env``, for machines that cannot run Docker (an
+    unprivileged Kubernetes pod). The image stays the default because it
+    freezes the environment; a host run is only as reproducible as that
+    checkout.
     """
     mode = os.environ.get("VIBESIM_VLLM_PROFILE_ENV", "container")
     if mode == "host":
-        return ProfileEnv("vllm_env", _VLLM_FORK_PYTHON)
+        return ProfileEnv(
+            "vllm_env",
+            _VLLM_FORK_PYTHON,
+            additional_python_paths=(_VLLM_FORK_CHECKOUT,),
+            additional_library_paths=(_VLLM_FORK_TORCH_LIB,),
+            isolated_site_packages=True,
+        )
     if mode != "container":
         raise ValueError(
             f"VIBESIM_VLLM_PROFILE_ENV must be 'container' or 'host', got {mode!r}"

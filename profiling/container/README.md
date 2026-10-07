@@ -63,8 +63,9 @@ docker image inspect vibesim-profiler-vllm:cu130-3f667d7e
 
 On a machine that cannot run Docker (an unprivileged Kubernetes pod, for
 example), set `VIBESIM_VLLM_PROFILE_ENV=host`. `vllm_env` rows then run as host
-subprocesses of `alignment/profiler/vllm/.venv/bin/python` -- the checkout and
-environment this image bakes -- with this repository on `PYTHONPATH`. Create
+subprocesses of `alignment/profiler/vllm/.venv/bin/python`, isolated like
+`vllm_upstream_fork_env` (the checkout and this repository on `PYTHONPATH`,
+inherited site-packages dropped, the venv's Torch libraries first). Create
 that environment exactly as the fork's `ALIGNMENT.md` describes. A host run is
 only as reproducible as that checkout, so record its commit with the
 measurement; the image remains the default and the release path.
