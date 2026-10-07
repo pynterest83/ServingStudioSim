@@ -46,4 +46,8 @@ def test_only_the_vllm_upstream_fork_env_is_isolated():
         for name, env in ENV_REGISTRY.items()
         if isinstance(env, ProfileEnv) and env.isolated_site_packages
     }
-    assert isolated == {"vllm_upstream_fork_env"}
+    expected = {"vllm_upstream_fork_env"}
+    if os.environ.get("VIBESIM_VLLM_PROFILE_ENV") == "host":
+        # A host without Docker backs vllm_env with the same isolated fork venv.
+        expected.add("vllm_env")
+    assert isolated == expected
