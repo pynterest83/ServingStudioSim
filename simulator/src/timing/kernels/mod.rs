@@ -73,6 +73,7 @@ pub mod residual_rms_norm;
 pub mod rms_norm;
 pub mod single_gemm;
 pub mod vllm_fused_moe;
+pub mod vllm_fused_moe_demand;
 pub mod vllm_mla_rope;
 
 pub use all_reduce::{AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput, AllReduceSpec};
@@ -319,6 +320,9 @@ pub use single_gemm::{
 pub use vllm_fused_moe::{
     VllmFusedMoeKernel, VllmFusedMoeKernelConfig, VllmFusedMoeKernelInput, VllmFusedMoeSpec,
     LAUNCH_ROLE_DOWN, LAUNCH_ROLE_GATE_UP,
+};
+pub use vllm_fused_moe_demand::{
+    VllmFusedMoeDemandKernel, VllmFusedMoeDemandKernelConfig, VllmFusedMoeDemandKernelInput,
 };
 pub use vllm_mla_rope::{
     VllmMlaRopeKernel, VllmMlaRopeKernelConfig, VllmMlaRopeKernelInput, VllmMlaRopeSpec,

@@ -37,8 +37,8 @@ use crate::timing::kernels::{
     MoeTopkSoftplusSqrtKernelInput, Mxfp4MarlinMoeGemmKernelInput, Nvfp4FusedMoeKernelInput,
     Nvfp4QuantKernelInput, P2pInterKernelInput, P2pIntraKernelInput,
     PackedKvCacheGatherKernelInput, QKvRmsNormKernelInput, QnormRopeKvInsertKernelInput,
-    ResidualRmsNormKernelInput, RmsNormKernelInput, SingleGemmKernelInput, VllmFusedMoeKernelInput,
-    VllmMlaRopeKernelInput,
+    ResidualRmsNormKernelInput, RmsNormKernelInput, SingleGemmKernelInput,
+    VllmFusedMoeDemandKernelInput, VllmFusedMoeKernelInput, VllmMlaRopeKernelInput,
 };
 
 use crate::timing::kernels::CompressedSparseMlaRopeCastKernelInput;
@@ -180,6 +180,7 @@ log_inputs! {
     DsaSparseMlaAttention => DsaSparseMlaAttentionKernelInput,
     DsaTopkPrefill => DsaTopkPrefillKernelInput,
     VllmFusedMoe => VllmFusedMoeKernelInput,
+    VllmFusedMoeDemand => VllmFusedMoeDemandKernelInput,
     VllmMlaRope => VllmMlaRopeKernelInput,
     AllReduce   => AllReduceKernelInput,
     AllReduceFusion => AllReduceFusionKernelInput,

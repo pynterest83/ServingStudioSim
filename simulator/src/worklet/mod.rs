@@ -39,9 +39,12 @@ pub mod glm52_mtp_prelude_local;
 pub mod glm52_shared_expert_local;
 mod glm53_common;
 pub mod glm53_dsa_attn_local;
+pub mod glm53_dsa_spec_attn_local;
 pub mod glm53_fp8_mlp_local;
 pub mod glm53_kda_attn_local;
+pub mod glm53_kda_spec_attn_local;
 pub mod glm53_moe_local;
+pub mod glm53_triton_moe_tp_local;
 pub mod mlp_block_tp;
 pub mod moe_expert_compute_local;
 pub mod native_fp8_moe_router_local;
@@ -171,6 +174,10 @@ pub use glm53_dsa_attn_local::{
     Glm53DsaAttnLocalWorklet, Glm53DsaAttnLocalWorkletConfig, Glm53DsaAttnLocalWorkletInput,
     Glm53DsaAttnLocalWorkletResolved,
 };
+pub use glm53_dsa_spec_attn_local::{
+    Glm53DsaSpecAttnLocalWorklet, Glm53DsaSpecAttnLocalWorkletConfig,
+    Glm53DsaSpecAttnLocalWorkletInput, Glm53DsaSpecAttnLocalWorkletResolved,
+};
 pub use glm53_fp8_mlp_local::{
     Glm53Fp8MlpLocalWorklet, Glm53Fp8MlpLocalWorkletConfig, Glm53Fp8MlpLocalWorkletInput,
     Glm53Fp8MlpLocalWorkletResolved,
@@ -179,10 +186,20 @@ pub use glm53_kda_attn_local::{
     Glm53KdaAttnLocalWorklet, Glm53KdaAttnLocalWorkletConfig, Glm53KdaAttnLocalWorkletInput,
     Glm53KdaAttnLocalWorkletResolved,
 };
+pub use glm53_kda_spec_attn_local::{
+    Glm53KdaSpecAttnLocalWorklet, Glm53KdaSpecAttnLocalWorkletConfig,
+    Glm53KdaSpecAttnLocalWorkletInput, Glm53KdaSpecAttnLocalWorkletResolved,
+};
 pub use glm53_moe_local::{
     Glm53MoeRouterLocalWorklet, Glm53MoeRouterLocalWorkletConfig, Glm53MoeRouterLocalWorkletInput,
     Glm53RoutedMoeLocalWorklet, Glm53RoutedMoeLocalWorkletConfig, Glm53RoutedMoeLocalWorkletInput,
     Glm53RoutedMoeLocalWorkletResolved,
+};
+pub use glm53_triton_moe_tp_local::{
+    Glm53TritonMoeRouterLocalWorklet, Glm53TritonMoeRouterLocalWorkletConfig,
+    Glm53TritonMoeRouterLocalWorkletInput, Glm53TritonMoeRouterLocalWorkletResolved,
+    Glm53TritonMoeTpLocalWorklet, Glm53TritonMoeTpLocalWorkletConfig,
+    Glm53TritonMoeTpLocalWorkletInput, Glm53TritonMoeTpLocalWorkletResolved,
 };
 pub use mlp_block_tp::{
     MlpBlockTpWorklet, MlpBlockTpWorkletConfig, MlpBlockTpWorkletInput, MlpBlockTpWorkletResolved,

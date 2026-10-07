@@ -60,6 +60,7 @@ use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Dim, Evaluator, FlatCostNode,
     LeafMetrics, PerfApiBridge, SlotInput,
 };
+use crate::worklet::glm53_fp8_mlp_local::PACKED_SCALE_FORMAT;
 use crate::worklet::{
     Glm53DsaAttnLocalWorklet, Glm53DsaAttnLocalWorkletConfig, Glm53DsaAttnLocalWorkletInput,
     Glm53DsaAttnLocalWorkletResolved, Glm53Fp8MlpLocalWorklet, Glm53Fp8MlpLocalWorkletConfig,
@@ -182,6 +183,7 @@ pub fn build_configs(
         quant_backends: FP8_QUANT_BACKENDS.to_vec(),
         fp8_gemm_backends: FP8_GEMM_BACKENDS.to_vec(),
         elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+        quant_scale_format: PACKED_SCALE_FORMAT,
     };
     if model.index_topk + model.index_kpool - 1 > SELECTED_K {
         return Err(fit_failed(

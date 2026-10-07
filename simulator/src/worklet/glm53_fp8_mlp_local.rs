@@ -20,6 +20,8 @@ use super::glm53_common::{atomic, elementwise, push_or_zero};
 
 /// DeepGEMM's Blackwell operand layout: four UE8M0 exponents per int32.
 pub const PACKED_SCALE_FORMAT: &str = "ue8m0_packed_int32";
+/// DeepGEMM's Hopper operand layout: one fp32 scale per group, column-major.
+pub const COLUMN_MAJOR_SCALE_FORMAT: &str = "ue8m0_column_major";
 const QUANT_GROUP_SIZE: u32 = 128;
 
 #[derive(Clone, Debug)]
@@ -32,6 +34,8 @@ pub struct Glm53Fp8MlpLocalWorkletConfig {
     pub quant_backends: Vec<&'static str>,
     pub fp8_gemm_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
+    /// Activation-scale layout DeepGEMM reads on this GPU generation.
+    pub quant_scale_format: &'static str,
 }
 
 #[derive(Clone, Debug)]
@@ -67,7 +71,7 @@ impl Glm53Fp8MlpLocalWorklet {
             hidden_size,
             group_size: QUANT_GROUP_SIZE,
             input_dtype: cfg.activation_dtype,
-            scale_format: PACKED_SCALE_FORMAT.to_string(),
+            scale_format: cfg.quant_scale_format.to_string(),
         };
         let gemm = |n: Dim, k: Dim| SingleGemmKernelConfig {
             backends: cfg.fp8_gemm_backends.clone(),
@@ -188,6 +192,7 @@ mod tests {
             quant_backends: vec!["vllm_cuda"],
             fp8_gemm_backends: vec!["deepgemm"],
             elementwise_backends: vec!["triton"],
+            quant_scale_format: PACKED_SCALE_FORMAT,
         }
     }
 
