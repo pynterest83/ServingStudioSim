@@ -23,7 +23,8 @@
 //! First-cut placeholders, labeled until their L1 lands (plan M4): the sparse
 //! and dense FlashAttention calls and the combine, and the index remap, are
 //! byte-sized elementwise leaves; the small indexer kernels keep the B200
-//! byte formulas and effective-bandwidth factors (provisional on H200).
+//! byte formulas and effective-bandwidth factors (provisional on H200). The
+//! glue launch counts are H200-measured per forward kind.
 
 use crate::op::Op;
 use crate::timing::bridge::DType;
@@ -43,11 +44,17 @@ use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfA
 
 use super::glm53_common::{atomic, elementwise, push_or_zero, repeated};
 
-/// Small launches of index/mask plumbing present in every iteration (B200).
-const GLUE_LAUNCHES: u32 = 17;
+/// Small copy / fill / index launches per DSA layer, counted in the H200
+/// case-03 capture (logs/20261007_0_glm53_flash_h200_campaign): every
+/// forward runs one after the index remap; an indexer-running forward adds
+/// seven around the indexer (k copy, kpool score, top-k output copies, pool
+/// expansion); a prefill-bearing forward adds twelve more (arange, mask and
+/// gather plumbing of the prefill indexer path). Decode: 1 + 7 = 8,
+/// mixed: 8 + 12 = 20, an index-sharing draft step: 1.
+const GLUE_LAUNCHES: u32 = 1;
+const INDEXER_GLUE_LAUNCHES: u32 = 7;
 const GLUE_BYTES_PER_TOKEN: u32 = 64;
-/// Extra plumbing of a prefill-bearing iteration (B200 capture 20260924_0).
-const PREFILL_GLUE_LAUNCHES: u32 = 8;
+const PREFILL_GLUE_LAUNCHES: u32 = 12;
 /// Hadamard-128 + quant effective-bandwidth factor (B200; provisional here).
 const FWHT_EFFECTIVE_FACTOR: u32 = 5;
 /// `k[idx]` and `gate_score[idx]` gathers ahead of the prefill kpool write.
@@ -122,6 +129,7 @@ pub struct Glm53DsaSpecAttnLocalWorkletResolved {
     pub v_up: BatchedGemmKernelConfig,
     pub o_proj: SingleGemmKernelConfig,
     pub glue: ElementwiseKernelConfig,
+    pub indexer_glue: ElementwiseKernelConfig,
     pub prefill_glue: ElementwiseKernelConfig,
 }
 
@@ -170,6 +178,7 @@ pub struct Glm53DsaSpecAttnLocalWorklet {
     pub v_up: Op<BatchedGemmKernel>,
     pub o_proj: Op<SingleGemmKernel>,
     pub glue: Op<ElementwiseKernel>,
+    pub indexer_glue: Op<ElementwiseKernel>,
     pub prefill_glue: Op<ElementwiseKernel>,
     resolved: Glm53DsaSpecAttnLocalWorkletResolved,
 }
@@ -328,6 +337,7 @@ impl Glm53DsaSpecAttnLocalWorklet {
             ),
             o_proj: gemm(cfg.hidden.get(), (heads * v_dim).into()),
             glue: ew(GLUE_BYTES_PER_TOKEN, GLUE_BYTES_PER_TOKEN),
+            indexer_glue: ew(GLUE_BYTES_PER_TOKEN, GLUE_BYTES_PER_TOKEN),
             prefill_glue: ew(4 * cfg.selected_k, 4 * cfg.selected_k),
             raw_cfg: cfg.clone(),
         }
@@ -415,6 +425,7 @@ impl Glm53DsaSpecAttnLocalWorklet {
             v_up: atomic(n, "v_up", r.v_up, BatchedGemmKernel::build, bridge)?,
             o_proj: gemm("o_proj", r.o_proj)?,
             glue: ew("glue", r.glue)?,
+            indexer_glue: ew("indexer_glue", r.indexer_glue)?,
             prefill_glue: ew("prefill_glue", r.prefill_glue)?,
             name,
             resolved,
@@ -465,6 +476,7 @@ impl Glm53DsaSpecAttnLocalWorklet {
                 self.v_up.compile(builder),
                 self.o_proj.compile(builder),
                 repeated(&self.glue, GLUE_LAUNCHES, builder),
+                repeated(&self.indexer_glue, INDEXER_GLUE_LAUNCHES, builder),
                 repeated(&self.prefill_glue, PREFILL_GLUE_LAUNCHES, builder),
             ])),
         }
@@ -599,7 +611,8 @@ impl Glm53DsaSpecAttnLocalWorklet {
         push_or_zero(&self.v_up, BatchedGemmKernelInput { m: mqa }, mqa == 0, ev);
         push_or_zero(&self.o_proj, rows, false, ev);
         push_or_zero(&self.glue, all.clone(), false, ev);
-        push_or_zero(&self.prefill_glue, all, no_prefill, ev);
+        push_or_zero(&self.indexer_glue, all.clone(), skip, ev);
+        push_or_zero(&self.prefill_glue, all, skip || no_prefill, ev);
     }
 }
 
