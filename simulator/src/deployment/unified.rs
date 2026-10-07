@@ -40,9 +40,10 @@ use crate::orchestrator::{
 use crate::timing::PerfApiBridge;
 use crate::worker::{
     build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
-    build_hybrid_chunked_prefill_worker, build_qwen36_hybrid_worker, build_speculative_worker,
-    resolve_prefix_cache_config, BatchPolicy, IterWorker, IterWorkerSel, KvAdmissionConfig,
-    PendingOrderKind, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
+    build_hybrid_chunked_prefill_worker, build_hybrid_speculative_worker,
+    build_qwen36_hybrid_worker, build_speculative_worker, resolve_prefix_cache_config, BatchPolicy,
+    IterWorker, IterWorkerSel, KvAdmissionConfig, PendingOrderKind, PrefixCacheMode,
+    PrefixCachePolicy, WorkerConfig,
 };
 
 use super::Deployment;
@@ -281,12 +282,48 @@ impl Deployment for UnifiedDeployment {
                     &g.worker,
                 )
             }
-            // Needs a speculative worker over the hybrid KV store (per-request
-            // KDA state pages); that recipe is not wired yet.
-            IterArchSel::Glm53FlashVllmFp8KdaDsaMoeSpeculative { .. } => bail!(
-                "glm53_flash_vllm_fp8_kda_dsa_moe_speculative has no worker yet: it needs the \
-                 hybrid speculative worker (timing-predict works through arch.speculative_iter)"
-            ),
+            // Hybrid KV as for the B200 arch above, under speculation: the
+            // per-request KDA state (one page per draft position per group)
+            // shares the attention budget with the MLA latent, so the
+            // speculative lifecycle runs over `HybridGdnKv`.
+            IterArchSel::Glm53FlashVllmFp8KdaDsaMoeSpeculative {
+                tp_size,
+                max_model_len,
+                routing,
+                routing_seed,
+                draft_tokens,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                ..
+            } => {
+                ensure_speculative(&g.worker, *draft_tokens)?;
+                let model = Arc::new(
+                    arch_build::glm53_flash_vllm_fp8_kda_dsa_moe_speculative_model(
+                        model_spec,
+                        *tp_size,
+                        *max_model_len,
+                        *routing,
+                        *routing_seed,
+                        expert_popularity_file.as_deref(),
+                        token_corpus_file.as_deref(),
+                        cudagraph_capture_sizes,
+                        *draft_tokens,
+                        &gpu_name,
+                        MODEL_NAME,
+                        bridge,
+                    )?,
+                );
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_hybrid_speculative_worker,
+                ))
+            }
             IterArchSel::Llama3Dense { .. } => {
                 ensure_barebone(&g.worker)?;
                 let model = Arc::new(arch_build::dense(

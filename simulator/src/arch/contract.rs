@@ -395,6 +395,21 @@ pub trait SpeculativeUnifiedModel: Send + Sync + 'static {
     fn drafting_slots_per_request(&self) -> u32 {
         0
     }
+
+    /// See [`IterwiseUnifiedModel::recurrent_state_bytes_per_request`]: the
+    /// fixed per-request recurrent state of a hybrid model, whole model. A
+    /// speculating hybrid also pins one state copy per draft position, so the
+    /// figure depends on the draft depth the model was built for. 0 (the
+    /// default) keeps pure-attention speculative archs on the full-attention
+    /// store.
+    fn recurrent_state_bytes_per_request(&self) -> u64 {
+        0
+    }
+
+    /// See [`IterwiseUnifiedModel::recurrent_checkpoint_interval_tokens`].
+    fn recurrent_checkpoint_interval_tokens(&self) -> u32 {
+        0
+    }
 }
 
 #[cfg(test)]

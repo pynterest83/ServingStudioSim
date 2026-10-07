@@ -85,6 +85,14 @@ pub type Qwen36HybridWorker<M> = IterBatchWorker<
 /// request's recurrent state against the attention capacity.
 pub type HybridChunkedPrefillWorker<M> =
     IterBatchWorker<HybridGdnKv, ChunkedPrefillAdmission<PendingOrder>, UnifiedIterExecution<M>>;
+/// `SpeculativeWorker` on every axis but KV: a hybrid speculating arch's
+/// per-request recurrent state (one copy per draft position) shares the
+/// attention capacity with its per-token KV.
+pub type HybridSpeculativeWorker<M> = IterBatchWorker<
+    HybridGdnKv,
+    ChunkedPrefillAdmission<PendingOrder, SpeculativeDecodeCompletion>,
+    SpeculativeIterExecution<M>,
+>;
 pub type PdPrefillWorker<M> =
     IterBatchWorker<FullAttnKv, PrefillHandoffAdmission<PendingOrder>, UnifiedIterExecution<M>>;
 

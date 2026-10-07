@@ -1104,16 +1104,6 @@ impl Glm53FlashSpecModel {
         builder.finish(root)
     }
 
-    /// Per-request recurrent state pinned for the whole request, all ranks.
-    pub fn recurrent_state_bytes_per_request(&self) -> u64 {
-        self.recurrent_state_bytes_per_request
-    }
-
-    /// The KDA checkpoint interval and prefix-cache reuse quantum.
-    pub fn recurrent_checkpoint_interval_tokens(&self) -> u32 {
-        HYBRID_BLOCK_SIZE
-    }
-
     fn eval_into(&self, input: &SpeculativeArchInput, ev: &mut Evaluator) {
         let batch = normalize_speculative_input(input, self.draft_tokens, self.max_model_len)
             .unwrap_or_else(|reason| panic!("invalid Glm53FlashSpecModel input: {reason}"));
@@ -1246,6 +1236,16 @@ impl SpeculativeUnifiedModel for Glm53FlashSpecModel {
 
     fn num_attn_shards(&self) -> u16 {
         self.tp_size
+    }
+
+    /// The 22 pinned state pages (all ranks): KDA groups x (2 + K) + tail.
+    fn recurrent_state_bytes_per_request(&self) -> u64 {
+        self.recurrent_state_bytes_per_request
+    }
+
+    /// The hybrid page: KDA checkpoint interval and prefix-reuse quantum.
+    fn recurrent_checkpoint_interval_tokens(&self) -> u32 {
+        HYBRID_BLOCK_SIZE
     }
 }
 

@@ -45,8 +45,10 @@ different timelines and should not be hidden behind one giant FSM abstraction.
 | `disagg_ffn` | none | none; L6 sends complete tasks | `FfnSectionExecutionAdapter` | `BufferedFfnWorker` |
 
 Hybrid recurrent + attention archs (Qwen3.6 local, GLM-5.3-Flash) swap in
-`HybridGdnKv` under `barebone` (`Qwen36HybridWorker`) and `chunked_prefill`
-(`HybridChunkedPrefillWorker`).
+`HybridGdnKv` under `barebone` (`Qwen36HybridWorker`), `chunked_prefill`
+(`HybridChunkedPrefillWorker`) and `speculative` (`HybridSpeculativeWorker`, the
+H200 GLM-5.3-Flash MTP arch, whose per-request state counts one page per draft
+position).
 
 Aliases such as `BareboneWorker<M>` and `DisaggAttnWorker<M>` name these concrete
 generic compositions. They are not wrapper runtimes.
@@ -291,7 +293,8 @@ Deployments and pool controllers only call those recipes:
 
 - unified → `build_barebone_worker` / `build_hp_worker` /
   `build_chunked_prefill_worker` / `build_speculative_worker` /
-  `build_qwen36_hybrid_worker` / `build_hybrid_chunked_prefill_worker`
+  `build_qwen36_hybrid_worker` / `build_hybrid_chunked_prefill_worker` /
+  `build_hybrid_speculative_worker`
 - PD → `build_pd_prefill_worker` / `build_pd_decode_worker`
 - AFD attention → `build_afd_attention_worker`
 - AFD FFN → `build_afd_ffn_worker`
