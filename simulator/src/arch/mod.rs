@@ -13,6 +13,7 @@ pub mod glm52_model_cfg;
 pub mod glm52_sglang_nvfp4_tp_dsa_moe;
 pub mod glm52_vllm_dsa_moe;
 pub mod glm52_vllm_nvfp4_dsa_moe;
+pub mod glm53_flash_common;
 pub mod glm53_flash_vllm_fp8_kda_dsa_moe;
 pub mod glm53_vllm_nvfp4_dsa_moe_dflash2;
 pub mod llama3_dense;
