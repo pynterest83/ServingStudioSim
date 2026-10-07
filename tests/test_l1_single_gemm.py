@@ -1556,6 +1556,32 @@ def test_documented_profile_env_registry_complete():
     assert fork_env.python_executable.parents[2] in fork_env.additional_python_paths
 
 
+@pytest.mark.parametrize(
+    ("mode", "expected_type"),
+    [(None, ContainerProfileEnv), ("container", ContainerProfileEnv), ("host", ProfileEnv)],
+)
+def test_vllm_profile_env_mode(monkeypatch, mode, expected_type):
+    from profiling.exec import env as env_module
+
+    if mode is None:
+        monkeypatch.delenv("VIBESIM_VLLM_PROFILE_ENV", raising=False)
+    else:
+        monkeypatch.setenv("VIBESIM_VLLM_PROFILE_ENV", mode)
+    profile_env = env_module._vllm_profile_env()
+    assert isinstance(profile_env, expected_type)
+    assert profile_env.name == "vllm_env"
+    if mode == "host":
+        assert profile_env.python_executable == env_module._VLLM_FORK_PYTHON
+
+
+def test_vllm_profile_env_rejects_unknown_mode(monkeypatch):
+    from profiling.exec import env as env_module
+
+    monkeypatch.setenv("VIBESIM_VLLM_PROFILE_ENV", "docker")
+    with pytest.raises(ValueError, match="'container' or 'host'"):
+        env_module._vllm_profile_env()
+
+
 def test_comm_launcher_interfaces_exist():
     assert issubclass(TorchMpLauncher, MultiGpuLauncher)
     assert issubclass(NvshmemLauncher, MultiGpuLauncher)

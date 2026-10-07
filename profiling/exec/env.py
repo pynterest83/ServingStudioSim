@@ -101,6 +101,29 @@ _VLLM_FORK_TORCH_LIB = (
 )
 _SGLANG_PYTHON_ROOT = _SGLANG_CHECKOUT / "python"
 _SGLANG_PYTHON = _SGLANG_PYTHON_ROOT / ".venv-sglang" / "bin" / "python"
+_VLLM_FORK_PYTHON = _PROJECT_ROOT / "alignment" / "profiler" / "vllm" / ".venv" / "bin" / "python"
+_VLLM_PROFILE_IMAGE = "vibesim-profiler-vllm:cu130-3f667d7e"
+
+
+def _vllm_profile_env() -> ProfileEnv | ContainerProfileEnv:
+    """The vLLM runners' environment: the pinned image unless the host is chosen.
+
+    ``VIBESIM_VLLM_PROFILE_ENV=host`` runs the same environment the image
+    bakes -- the alignment fork checkout and its ``.venv`` -- as a host
+    subprocess, for machines that cannot run Docker (an unprivileged
+    Kubernetes pod). The image stays the default because it freezes the
+    environment; a host run is only as reproducible as that checkout.
+    """
+    mode = os.environ.get("VIBESIM_VLLM_PROFILE_ENV", "container")
+    if mode == "host":
+        return ProfileEnv("vllm_env", _VLLM_FORK_PYTHON)
+    if mode != "container":
+        raise ValueError(
+            f"VIBESIM_VLLM_PROFILE_ENV must be 'container' or 'host', got {mode!r}"
+        )
+    return ContainerProfileEnv(
+        "vllm_env", os.environ.get("VIBESIM_VLLM_PROFILE_IMAGE", _VLLM_PROFILE_IMAGE)
+    )
 
 
 def _profile_env_python(name: str) -> Path:
@@ -157,11 +180,9 @@ ENV_REGISTRY: dict[str, ProfileEnv | ContainerProfileEnv] = {
     ),
     # vLLM runners execute in the pinned image (the alignment fork's vLLM
     # commit, profiling/container/build.sh); host source and Python packages
-    # are deliberately outside this environment boundary.
-    "vllm_env": ContainerProfileEnv(
-        "vllm_env",
-        os.environ.get("VIBESIM_VLLM_PROFILE_IMAGE", "vibesim-profiler-vllm:cu130-3f667d7e"),
-    ),
+    # are deliberately outside this environment boundary. See
+    # _vllm_profile_env for the host fallback.
+    "vllm_env": _vllm_profile_env(),
 }
 
 
