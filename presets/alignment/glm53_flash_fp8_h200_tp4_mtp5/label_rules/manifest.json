@@ -1,0 +1,8 @@
+{
+ "schema_version": 2,
+ "rule_files": [
+  "target_rules.json"
+ ],
+ "provenance": "Copied unchanged from glm53_flash_fp8_b200_tp4_ep4 (B200 TP4/EP4 capture, MTP off) as a starting set. Rules naming sm100-only kernels (nvjet_sm100, TRT-LLM fused MoE / sparse MLA, MNNVL all-reduce) will not fire on H200; re-derive from this pack's own profile_nsys inventory before kernel-align.",
+ "note": "Not yet validated against any H200 capture."
+}
