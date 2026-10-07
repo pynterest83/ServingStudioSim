@@ -1,7 +1,7 @@
 [submodule "alignment/profiler/vllm"]
 	path = alignment/profiler/vllm
-	url = https://github.com/serendipity-zk/vllm.git
-	branch = servingstudio-alignment
+	url = https://github.com/pynterest83/vllm.git
+	branch = servingstudio-alignment-v0.31.0
 [submodule "alignment/profiler/sglang"]
 	path = alignment/profiler/sglang
 	url = https://github.com/serendipity-zk/sglang.git
