@@ -281,6 +281,12 @@ impl Deployment for UnifiedDeployment {
                     &g.worker,
                 )
             }
+            // Needs a speculative worker over the hybrid KV store (per-request
+            // KDA state pages); that recipe is not wired yet.
+            IterArchSel::Glm53FlashVllmFp8KdaDsaMoeSpeculative { .. } => bail!(
+                "glm53_flash_vllm_fp8_kda_dsa_moe_speculative has no worker yet: it needs the \
+                 hybrid speculative worker (timing-predict works through arch.speculative_iter)"
+            ),
             IterArchSel::Llama3Dense { .. } => {
                 ensure_barebone(&g.worker)?;
                 let model = Arc::new(arch_build::dense(

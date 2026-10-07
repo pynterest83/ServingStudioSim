@@ -22,8 +22,9 @@ use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
     deepseek_v41_vllm, deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
-    glm52_vllm_nvfp4_dsa_moe, glm53_flash_vllm_fp8_kda_dsa_moe, glm53_vllm_nvfp4_dsa_moe_dflash2,
-    llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen36_local, qwen3_attn_layerwise,
+    glm52_vllm_nvfp4_dsa_moe, glm53_flash_vllm_fp8_kda_dsa_moe,
+    glm53_flash_vllm_fp8_kda_dsa_moe_speculative, glm53_vllm_nvfp4_dsa_moe_dflash2, llama3_dense,
+    llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen36_local, qwen3_attn_layerwise,
     qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
     qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, AttnLayerwiseModel,
     DeepseekV41ModelCfg, DeepseekV41VllmModel, DeepseekV41VllmParallel, DeepseekV4ModelCfg,
@@ -31,13 +32,14 @@ use crate::arch::{
     Dflash2DraftResolved, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52ModelCfg, Glm52MtpMode,
     Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel, Glm52VllmDsaMoeModel,
     Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel,
-    Glm52VllmNvfp4DsaMoeSpeculativeModel, Glm53FlashModelCfg, Glm53FlashVllmModel,
-    Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model, IterwiseUnifiedModel,
-    Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel, Qwen36LocalModel,
-    Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel, Qwen3AttnParallel,
-    Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel,
-    Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel, Qwen3MoeFp8DpAttnEpFfnModel,
-    Qwen3MoeFp8Parallel, Qwen3MoeParallel, Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
+    Glm52VllmNvfp4DsaMoeSpeculativeModel, Glm53FlashModelCfg, Glm53FlashSpecDemand,
+    Glm53FlashSpecModel, Glm53FlashSpecParallel, Glm53FlashVllmModel, Glm53FlashVllmParallel,
+    Glm53VllmNvfp4DsaMoeDflash2Model, IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel,
+    Llama3DpAttnTpFfnModel, Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg,
+    Qwen3AttnLayerwiseModel, Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel,
+    Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
+    Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
+    Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
 };
 use crate::common::Fabric;
 use crate::timing::bridge::DType;
@@ -1269,6 +1271,73 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
         .context("building GLM-5.3-Flash model (often a missing profile.db row)")
 }
 
+/// Build the H200 GLM-5.3-Flash FP8 production graph (vLLM v0.31, TP only,
+/// BF16 KV) with its MTP drafter.
+///
+/// Routing is resolved over the 42 routed body layers at the verify width,
+/// and over the MTP layer (the corpus's 43rd routed layer) at the verify width
+/// for draft step 0 and at width 1 for the later steps.
+#[allow(clippy::too_many_arguments)]
+pub fn glm53_flash_vllm_fp8_kda_dsa_moe_speculative_model(
+    model_spec: &ModelSpec,
+    tp_size: u16,
+    max_model_len: u32,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    cudagraph_capture_sizes: &[u32],
+    draft_tokens: u32,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Glm53FlashSpecModel> {
+    if model_spec.num_layers.is_some() || model_spec.sim_num_layers.is_some() {
+        bail!(
+            "GLM-5.3-Flash architecture rejects num_layers/sim_num_layers overrides; the exact hybrid 45-layer schedule is required"
+        );
+    }
+    anyhow::ensure!(
+        model_spec.fp8,
+        "GLM-5.3-Flash is modeled for its FP8 block checkpoint; set fp8: true"
+    );
+    let model_cfg = Glm53FlashModelCfg::from_json(Path::new(&model_spec.model_config))
+        .context("loading GLM-5.3-Flash config")?;
+    let routed_layers = model_cfg.num_moe_layers();
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.n_routed_experts,
+        experts_per_token: model_cfg.num_experts_per_tok,
+        ep_size: tp_size,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: routed_layers,
+    };
+    let verify_width = draft_tokens
+        .checked_add(1)
+        .context("speculative draft_tokens + 1 overflows u32")?;
+    let body = routed_layers as usize;
+    let demand = Glm53FlashSpecDemand {
+        body: source.demand(0..body, verify_width)?,
+        mtp_step0: source.demand(body..body + 1, verify_width)?,
+        mtp_recurrent: source.demand(body..body + 1, 1)?,
+    };
+    let parallel = Glm53FlashSpecParallel {
+        tp_size,
+        max_model_len,
+        gpu_name: gpu.to_string(),
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+        draft_tokens,
+    };
+    let configs =
+        glm53_flash_vllm_fp8_kda_dsa_moe_speculative::build_configs(&model_cfg, &parallel, &demand)
+            .context("expanding H200 GLM-5.3-Flash MTP architecture configs")?;
+    let resolved = glm53_flash_vllm_fp8_kda_dsa_moe_speculative::resolve_configs(&configs);
+    glm53_flash_vllm_fp8_kda_dsa_moe_speculative::build(name.to_string(), resolved, bridge)
+        .context("building H200 GLM-5.3-Flash MTP model (often a missing profile.db row)")
+}
+
 /// Build the GLM target graph driven by a DFlash2 block-parallel proposer.
 ///
 /// The draft is a separate dense checkpoint, so its dimensions come from that
@@ -1818,7 +1887,8 @@ pub fn build_iter_model(
             bridge,
         )?),
         IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
-        | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. } => {
+        | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. }
+        | IterArchSel::Glm53FlashVllmFp8KdaDsaMoeSpeculative { .. } => {
             bail!("timing-predict: use arch.speculative_iter for a speculative model")
         }
     })
@@ -1884,6 +1954,33 @@ pub fn build_speculative_iter_model(
                 token_corpus_file.as_deref(),
                 *draft_tokens,
                 *draft_sliding_window,
+                gpu,
+                name,
+                bridge,
+            )?),
+            *draft_tokens,
+        )),
+        IterArchSel::Glm53FlashVllmFp8KdaDsaMoeSpeculative {
+            model,
+            tp_size,
+            max_model_len,
+            routing,
+            routing_seed,
+            draft_tokens,
+            expert_popularity_file,
+            token_corpus_file,
+            cudagraph_capture_sizes,
+        } => Ok((
+            Box::new(glm53_flash_vllm_fp8_kda_dsa_moe_speculative_model(
+                model,
+                *tp_size,
+                *max_model_len,
+                *routing,
+                *routing_seed,
+                expert_popularity_file.as_deref(),
+                token_corpus_file.as_deref(),
+                cudagraph_capture_sizes,
+                *draft_tokens,
                 gpu,
                 name,
                 bridge,
@@ -2129,7 +2226,8 @@ fn build_arch(
                 // own tree: the verify pass plus its draft passes.
                 let (gpus, shape, manifest) = match selector {
                     IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
-                    | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. } => {
+                    | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. }
+                    | IterArchSel::Glm53FlashVllmFp8KdaDsaMoeSpeculative { .. } => {
                         let (model, draft_tokens) = build_speculative_iter_model(
                             selector,
                             gpu,

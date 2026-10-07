@@ -15,6 +15,7 @@ pub mod glm52_vllm_dsa_moe;
 pub mod glm52_vllm_nvfp4_dsa_moe;
 pub mod glm53_flash_common;
 pub mod glm53_flash_vllm_fp8_kda_dsa_moe;
+pub mod glm53_flash_vllm_fp8_kda_dsa_moe_speculative;
 pub mod glm53_vllm_nvfp4_dsa_moe_dflash2;
 pub mod llama3_dense;
 pub mod llama3_dense_tp;
@@ -57,6 +58,9 @@ pub use glm52_vllm_nvfp4_dsa_moe::{
 };
 pub use glm53_flash_vllm_fp8_kda_dsa_moe::{
     Glm53FlashModelCfg, Glm53FlashVllmModel, Glm53FlashVllmParallel,
+};
+pub use glm53_flash_vllm_fp8_kda_dsa_moe_speculative::{
+    Glm53FlashSpecDemand, Glm53FlashSpecModel, Glm53FlashSpecParallel,
 };
 pub use glm53_vllm_nvfp4_dsa_moe_dflash2::{
     Dflash2DraftResolved, Glm53VllmNvfp4DsaMoeDflash2Model,

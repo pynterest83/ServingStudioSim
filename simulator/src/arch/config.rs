@@ -577,6 +577,49 @@ pub enum IterArchSel {
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
     },
+    /// GLM-5.3-Flash FP8 on H200 as upstream vLLM v0.31 serves it in
+    /// production: one TP group with every expert on every rank (Triton FP8
+    /// MoE), a BF16 KV cache through `FLASH_ATTN_MLA_SPARSE`, and the MTP layer
+    /// drafting `draft_tokens` candidates per request. A separate selector
+    /// from [`Self::Glm53FlashVllmFp8KdaDsaMoe`] because it builds a different
+    /// model type (verify pass + draft passes); it pairs only with a
+    /// speculative worker.
+    Glm53FlashVllmFp8KdaDsaMoeSpeculative {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Tensor-parallel rank count; experts are not sharded.
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        tp_size: u16,
+        /// Configured context cap: the indexer's logits row stride and the
+        /// sparse-index page-table extent.
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        /// Candidate positions the MTP layer drafts per request. Fixes the
+        /// verify width at `draft_tokens + 1` and the per-request state pages.
+        #[serde(default = "default_glm52_draft_tokens")]
+        #[param(default = 5, cache_key)]
+        draft_tokens: u32,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`; the body MoE reads its
+        /// 42 routed layers and the MTP MoE the 43rd.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM's captured CUDA-graph sizes (padding as in the B200 arch).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by
     /// TP, so there is no expert-parallel or NVLink-domain selector.
@@ -630,6 +673,7 @@ impl IterArchSel {
             | Self::Glm52VllmNvfp4DsaMoeSpeculative { model, .. }
             | Self::Glm53VllmNvfp4DsaMoeDflash2 { model, .. }
             | Self::Glm53FlashVllmFp8KdaDsaMoe { model, .. }
+            | Self::Glm53FlashVllmFp8KdaDsaMoeSpeculative { model, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { model, .. } => model,
         }
     }
@@ -644,6 +688,7 @@ impl IterArchSel {
             | Self::Glm52VllmNvfp4DsaMoeSpeculative { max_model_len, .. }
             | Self::Glm53VllmNvfp4DsaMoeDflash2 { max_model_len, .. }
             | Self::Glm53FlashVllmFp8KdaDsaMoe { max_model_len, .. }
+            | Self::Glm53FlashVllmFp8KdaDsaMoeSpeculative { max_model_len, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { max_model_len, .. } => Ok(*max_model_len),
             Self::DeepseekV41Vllm {
                 model,
