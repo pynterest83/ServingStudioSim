@@ -56,6 +56,12 @@ tree includes target verification and draft passes. Offline prediction selects
 deployment; its cases contain `decode_requests: [[final_kv_len, query_len], ...]`.
 `build_speculative_iter_model` constructs this contract without a worker.
 
+`graph_mode` states how the engine launches a batch (`FullGraph`, `Piecewise`,
+`Eager`), or `None` (the default) when the arch does not model it. It is the
+one source of the arch's capture rule: the GLM-5.3-Flash H200 MTP arch also
+derives its DSA `full_cuda_graph` input from it. The worker's host-time model
+keys its floors by it, and `cost_log` records it in `graph_mode`.
+
 ### Layer-wise AFD
 
 `AttnLayerwiseModel` consumes `AttnArchInput` and costs one attention layer.

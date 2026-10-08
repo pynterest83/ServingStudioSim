@@ -216,6 +216,11 @@ Execution owns the model, reusable input buffer shape, and `CostBuffers`:
   constant because it selects a profiled kernel shape; how far a request actually
   advances after the verify belongs to the lifecycle's `DecodeCompletion`, not
   here.
+  Its cost path (`CostBuffers::run_speculative_iter`) is also where the
+  optional host-time model (`WorkerConfig::host_time`) enters the clock: once
+  per engine step, over the verify pass and every draft step together,
+  `max(kernel × multiplier + fixed, floor[model.graph_mode])`. Unset, the clock
+  is the multiplier-only one.
   The complete verify window must fit within `max_model_len`. A boundary batch
   that requires fewer query rows fails explicitly; clipping only the context
   would discard resident keys and invalidate necessary-work conservation.

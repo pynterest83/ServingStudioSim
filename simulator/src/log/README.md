@@ -154,6 +154,12 @@ for the manifest shape. The worker fills the per-slot buffers during its CostTre
 eval pass and hands them to `CostLogger::record` (slot-aligned, one input list per
 row).
 
+A whole-iteration row also records `graph_mode` (`full_graph` / `piecewise` /
+`eager`) when the arch reports one; it is null otherwise and on AFD section
+rows. Like the rest of the row it is pre-host-time: `total_time_ms` is kernel
+time, and any multiplier or host-time floor shows up as the gap to the next
+row's `wall_start_ms`.
+
 The captured `slot_input` values are handed over as inline enums and **serialized to
 JSON strings on the writer thread** (`*_to_record_batch`, off the sim's critical
 path), with a `"null"` fallback if serialization fails — never panicking the run.
