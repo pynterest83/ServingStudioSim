@@ -23,6 +23,10 @@ and records the fastest, because fa2's default KV-split is load-imbalanced for
 long-kv ragged calls; fa3 self-tunes and keeps the single default plan. The split
 set is internal to profiling, not a wire/cache axis.
 
+The **vllm_fa3** backend (both kinds) is not FlashInfer: it times vLLM v0.31's
+own FA3 varlen call from MLA dense-MHA prefill (``_run_vllm_fa3``) and runs in
+``vllm_env``.
+
 Shared op-agnostic mechanics (tensor/indptr/fp8 construction, dtype/backend
 helpers, do_bench + metrics) live in ``_common``. The heavy libs (``flashinfer`` /
 ``torch``) are imported lazily inside the functions; this module is only loaded
@@ -34,7 +38,7 @@ from __future__ import annotations
 from profiling.db.args import DType
 from profiling.profilers.timer import Timer
 from profiling.runners.attention import _common
-from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
+from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
 # fa2's KV-split heuristic is load-imbalanced for long-kv ragged calls (the
@@ -44,6 +48,19 @@ from profiling.runners.metrics import ComputeMetrics
 # agent-trace/attention_cache_fidelity.md). fa3 self-tunes — it keeps the single
 # default plan. The split set is NOT a wire/cache axis; it stays internal here.
 _FA2_SPLIT_SIZES: tuple[int, ...] = (1024, 2048, 4096, 8192, 16384)
+
+_VLLM_FA3_LABEL = "vllm_fa3"
+# BF16 output against an FP32 softmax reference: about 3 BF16 ulps relative,
+# plus an absolute floor for outputs near zero.
+_VLLM_FA3_ATOL = 4e-3
+_VLLM_FA3_RTOL = 3.01 / 128
+_VLLM_FA3_COSINE_LIMIT = 1e-5
+# Query rows checked against the reference: the first and last rows plus an
+# evenly spaced middle sample, so the causal diagonal and the full-width rows
+# are both covered without an O(q_len * kv_len) FP32 score matrix.
+_VLLM_FA3_CHECK_ROWS = 64
+# Bound one FP32 reference score block to about 1 GiB.
+_VLLM_FA3_REFERENCE_SCORE_ELEMENTS = 1 << 28
 
 
 def _run_cudnn_attention(
@@ -95,6 +112,191 @@ def _run_cudnn_attention(
         causal=causal,
     )
     return _common.measure(benchmark_fn, flops=flops, bytes_accessed=bytes_accessed)
+
+
+def _vllm_fa3_check_rows(q_len: int) -> list[int]:
+    """Query rows the vllm_fa3 correctness check compares (sorted, unique)."""
+    edge = _VLLM_FA3_CHECK_ROWS // 4
+    rows = set(range(min(edge, q_len))) | set(range(max(0, q_len - edge), q_len))
+    step = max(1, q_len // _VLLM_FA3_CHECK_ROWS)
+    rows |= set(range(0, q_len, step))
+    return sorted(rows)
+
+
+def _vllm_fa3_reference_rows(torch, q, k, v, rows: list[int], *, causal: bool, scale: float):
+    """FP32 softmax attention for the selected query rows of one request.
+
+    The causal mask is FlashAttention's bottom-right alignment: query row ``i``
+    sees keys ``j <= i + kv_len - q_len``. K/V heads are repeated for GQA.
+    """
+    q_len, num_qo_heads, _ = q.shape
+    kv_len, num_kv_heads, _ = k.shape
+    group = num_qo_heads // num_kv_heads
+    k32 = k.float().repeat_interleave(group, dim=1)
+    v32 = v.float().repeat_interleave(group, dim=1)
+    row_index = torch.tensor(rows, dtype=torch.long, device=q.device)
+    chunk = max(1, _VLLM_FA3_REFERENCE_SCORE_ELEMENTS // (num_qo_heads * kv_len))
+    outputs = []
+    for start in range(0, len(rows), chunk):
+        sub = row_index[start : start + chunk]
+        scores = torch.einsum("rhd,khd->hrk", q.index_select(0, sub).float(), k32) * scale
+        if causal:
+            limit = sub + (kv_len - q_len)
+            keys = torch.arange(kv_len, device=q.device)
+            scores.masked_fill_(keys.view(1, 1, -1) > limit.view(1, -1, 1), float("-inf"))
+        outputs.append(torch.einsum("hrk,khd->rhd", torch.softmax(scores, dim=-1), v32))
+    return torch.cat(outputs, dim=0)
+
+
+def _check_vllm_fa3(torch, launch, q, k, v, *, causal: bool, scale: float) -> None:
+    """Compare the production FA3 call with the FP32 reference before timing."""
+    snapshots = (q.clone(), k.clone(), v.clone())
+    output = launch()
+    torch.cuda.synchronize()
+    expected_shape = (q.shape[0], q.shape[1], v.shape[2])
+    if tuple(output.shape) != expected_shape or output.dtype is not torch.bfloat16:
+        raise KernelLaunchFailed(
+            f"{_VLLM_FA3_LABEL} output must be BF16 {expected_shape}, "
+            f"got {output.dtype} {tuple(output.shape)}"
+        )
+    rows = _vllm_fa3_check_rows(q.shape[0])
+    actual = output.index_select(0, torch.tensor(rows, device=q.device)).float()
+    expected = _vllm_fa3_reference_rows(torch, q, k, v, rows, causal=causal, scale=scale)
+    if not torch.isfinite(actual).all():
+        raise KernelLaunchFailed(f"{_VLLM_FA3_LABEL} output is not finite")
+    torch.testing.assert_close(actual, expected, atol=_VLLM_FA3_ATOL, rtol=_VLLM_FA3_RTOL)
+    numerator = 2.0 * torch.sum(actual * expected).item()
+    denominator = torch.sum(actual.square()).item() + torch.sum(expected.square()).item()
+    cosine_difference = 0.0 if denominator == 0.0 else 1.0 - numerator / denominator
+    if abs(cosine_difference) > _VLLM_FA3_COSINE_LIMIT:
+        raise KernelLaunchFailed(
+            f"{_VLLM_FA3_LABEL} cosine difference {cosine_difference} exceeds "
+            f"{_VLLM_FA3_COSINE_LIMIT}"
+        )
+    for name, tensor, snapshot in zip(("q", "k", "v"), (q, k, v), snapshots, strict=True):
+        if not torch.equal(tensor, snapshot):
+            raise KernelLaunchFailed(f"{_VLLM_FA3_LABEL} mutated {name}")
+
+
+def _run_vllm_fa3(
+    *,
+    causal: bool,
+    q_len: int,
+    kv_len: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    q_dtype: DType | str,
+    kv_dtype: DType | str,
+    o_dtype: DType | str,
+) -> ComputeMetrics:
+    """vLLM v0.31's FA3 varlen call from MLA dense-MHA prefill, for one request.
+
+    Causal is ``FlashAttnPrefillBackend.run_prefill_new_tokens``
+    (``vllm/v1/attention/backends/mla/prefill/flash_attn.py``): the new tokens
+    attend to themselves, ``cu_seqlens_k = cu_seqlens_q``, so only
+    ``q_len == kv_len`` (``prefix_len == 0``) is that call. Non-causal is
+    ``run_prefill_context_chunk``: the new tokens over one cached context chunk,
+    returning the LSE that ``merge_attn_states`` (not timed) consumes.
+
+    ``MLACommonBaseImpl.forward_mha`` passes K and V as the two halves of the
+    ``kv_b_proj`` output viewed ``[tokens, heads, 2 * head_dim]`` (NoPE MLA
+    returns ``k_nope`` without a copy), so K and V are strided views here too.
+    One call launches FA3's ``prepare_varlen_num_blocks``, ``FlashAttnFwdSm90``
+    and, when FA3 splits KV, ``FlashAttnFwdCombine``; all are timed.
+    """
+    q_len = int(q_len)
+    kv_len = int(kv_len)
+    for name, dtype in (("q_dtype", q_dtype), ("kv_dtype", kv_dtype), ("o_dtype", o_dtype)):
+        if DType.from_value(dtype) is not DType.BF16:
+            raise ProfilerNotImplemented(
+                f"{_VLLM_FA3_LABEL} measures vLLM's BF16 MLA prefill only, got {name}={dtype}"
+            )
+    if min(q_len, kv_len, num_qo_heads, num_kv_heads, head_dim) <= 0:
+        raise ValueError(f"{_VLLM_FA3_LABEL} requires positive lengths, heads and head_dim")
+    if num_qo_heads % num_kv_heads:
+        raise ValueError(
+            f"{_VLLM_FA3_LABEL} requires num_qo_heads to be a multiple of num_kv_heads"
+        )
+    if causal and q_len != kv_len:
+        raise ProfilerNotImplemented(
+            f"{_VLLM_FA3_LABEL} causal is vLLM's new-token call (cu_seqlens_k = cu_seqlens_q); "
+            "it requires prefix_len == 0, and cached context is the non-causal rect call"
+        )
+
+    try:
+        import torch
+        from vllm.v1.attention.backends.fa_utils import (
+            flash_attn_varlen_func,
+            get_flash_attn_version,
+        )
+    except (ImportError, OSError) as exc:
+        raise ProfilerNotImplemented(f"{_VLLM_FA3_LABEL} requires vllm_env") from exc
+
+    # The version FlashAttnPrefillBackend selects for these head dims on this
+    # device: FA3 on SM90 up to head_dim 256, FA4 above it.
+    fa_version = get_flash_attn_version(head_size=head_dim, head_size_v=head_dim)
+    if fa_version != 3:
+        raise ProfilerNotImplemented(
+            f"{_VLLM_FA3_LABEL}: vLLM selects FA{fa_version} for head_dim {head_dim} here"
+        )
+
+    scale = head_dim**-0.5
+    try:
+        device = torch.device("cuda", torch.cuda.current_device())
+        generator = torch.Generator(device=device).manual_seed(0)
+        q = torch.randn(
+            (q_len, num_qo_heads, head_dim),
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        )
+        kv = torch.randn(
+            (kv_len, num_kv_heads, 2 * head_dim),
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        )
+        k, v = kv.split([head_dim, head_dim], dim=-1)
+        cu_seqlens_q = torch.tensor([0, q_len], dtype=torch.int32, device=device)
+        cu_seqlens_k = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
+
+        def launch():
+            result = flash_attn_varlen_func(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=q_len,
+                max_seqlen_k=kv_len,
+                softmax_scale=scale,
+                causal=causal,
+                return_softmax_lse=not causal,
+                fa_version=3,
+            )
+            return result if causal else result[0]
+
+        _check_vllm_fa3(torch, launch, q, k, v, causal=causal, scale=scale)
+        flops = _common.attention_flops(
+            q_len=q_len,
+            kv_len=kv_len,
+            num_qo_heads=num_qo_heads,
+            head_dim=head_dim,
+            causal=causal,
+        )
+        # Logical bytes: Q and O, the K and V halves read, and the FP32 LSE.
+        bytes_accessed = 2 * (2 * q_len * num_qo_heads * head_dim) + 2 * (
+            2 * kv_len * num_kv_heads * head_dim
+        )
+        bytes_accessed += 4 * q_len * num_qo_heads
+        return _common.measure(launch, flops=flops, bytes_accessed=bytes_accessed)
+    except (KernelLaunchFailed, ProfilerNotImplemented):
+        raise
+    except torch.OutOfMemoryError as exc:
+        raise OOMError(f"{_VLLM_FA3_LABEL} ran out of GPU memory") from exc
+    except (AssertionError, RuntimeError) as exc:
+        raise KernelLaunchFailed(f"{_VLLM_FA3_LABEL} failed: {exc}") from exc
 
 
 def _run_ragged(
@@ -320,6 +522,17 @@ def profile_flashinfer_attn_prefill_cudnn(**kwargs) -> ComputeMetrics:
     return _run_prefill(backend="cudnn", **kwargs)
 
 
+def profile_flashinfer_attn_prefill_vllm_fa3(
+    *, prefix_len: int, append_len: int, **kwargs
+) -> ComputeMetrics:
+    return _run_vllm_fa3(
+        causal=True,
+        q_len=int(append_len),
+        kv_len=int(prefix_len) + int(append_len),
+        **kwargs,
+    )
+
+
 # --- flashinfer_attn_rect (non-causal) entry points, one per backend ---------
 # rect is parametrized by (q_len, kv_len) directly, so kwargs already carry the
 # kernel params; pass them straight through with causal=False.
@@ -339,3 +552,7 @@ def profile_flashinfer_attn_rect_trt(**kwargs) -> ComputeMetrics:
 
 def profile_flashinfer_attn_rect_cudnn(**kwargs) -> ComputeMetrics:
     return _run_ragged(backend="cudnn", causal=False, **kwargs)
+
+
+def profile_flashinfer_attn_rect_vllm_fa3(**kwargs) -> ComputeMetrics:
+    return _run_vllm_fa3(causal=False, **kwargs)

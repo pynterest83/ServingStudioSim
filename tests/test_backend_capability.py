@@ -93,7 +93,16 @@ def test_supported_backends_filters_options_by_dtype():
         "fa2",
         "fa3",
         "cudnn",
+        "vllm_fa3",
     }
+
+
+def test_vllm_fa3_attention_is_hopper_gated():
+    # vLLM builds its FA3 extension for SM90 only; Blackwell runs FA4 instead.
+    for kind in ("flashinfer_attn_prefill", "flashinfer_attn_rect"):
+        assert backend_supports(kind, "vllm_fa3", DType.BF16, DType.BF16, gpu="NVIDIA H200")
+        assert not backend_supports(kind, "vllm_fa3", DType.BF16, DType.BF16, gpu="NVIDIA B200")
+        assert not backend_supports(kind, "vllm_fa3", DType.FP8_E4M3, DType.FP8_E4M3)
 
 
 def test_trt_attention_is_blackwell_gated():
