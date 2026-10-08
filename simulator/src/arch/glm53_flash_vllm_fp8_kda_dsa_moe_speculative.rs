@@ -127,7 +127,11 @@ const QKV_NORM_BACKENDS: &[&str] = &["vllm_triton"];
 const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb_no_rope"];
 const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up_unpadded"];
 const MQA_LOGITS_BACKENDS: &[&str] = &["deepgemm_fp8"];
-const TOPK_BACKENDS: &[&str] = &["vllm_cuda"];
+/// vLLM v0.31's own `persistent_topk` op (host `vllm_env`): above 32 rows it
+/// launches the filtered/sampled kernels the H200 capture shows. vLLM's "auto"
+/// decode top-k takes `cooperative_topk` at <= 64 rows instead; no L1 backend
+/// times that path yet. `vllm_cuda` is a v0.23 build pinned to Torch 2.11.
+const TOPK_BACKENDS: &[&str] = &["vllm_fork_cuda"];
 const MQA_LOGITS_PREFILL_BACKENDS: &[&str] = &["deepgemm_fp8"];
 const TOPK_PREFILL_BACKENDS: &[&str] = &["vllm_cuda"];
 const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
