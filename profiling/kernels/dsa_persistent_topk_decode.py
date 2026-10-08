@@ -62,8 +62,9 @@ DOC = KernelDoc(
         "back-to-back calls, taking the median of three runs. vllm_cuda and "
         "vllm_fork_cuda use CUPTI kernel time with the L2 cache flushed before "
         "each call and count every launch of the call, the workspace memset and"
-        " the persistent kernel. Operand construction and the output checks "
-        "run before timing."
+        " the persistent kernel. vllm_auto times the public dispatcher the same "
+        "way, counting whichever kernels it resolves to. Operand construction "
+        "and the output checks run before timing."
     ),
     caveats=(
         "Neither the increasing uniform logits nor the random max_ragged "
@@ -150,6 +151,36 @@ register(
                 "length, with a filtered top-k kernel above batch 32."
             ),
             url="https://github.com/vllm-project/vllm/blob/main/csrc/libtorch_stable/persistent_topk.cuh",
+        ),
+    )
+)
+
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_auto",
+        # SparseIndexerTopk("auto") runs on any CUDA device: cooperative_topk
+        # needs SM90+ outside the SM12x family and otherwise resolves to
+        # persistent_topk, which every CUDA build has.
+        supports=BackendSupport(
+            compute=frozenset({DType.FP32}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.dsa_persistent_topk_decode_auto",
+            function_name="profile_dsa_persistent_topk_decode_vllm_auto",
+        ),
+        table_name=KIND,
+        args_schema=DsaPersistentTopkDecodeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM v0.31's SparseIndexerTopk('auto'): cooperative_topk up to 64 rows, "
+                "else persistent_topk's sampled, filtered or persistent kernel."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/indexer_topk.py",
         ),
     )
 )
