@@ -572,6 +572,21 @@ which then applies to decode-only iterations. It is a calibration like the
 main multiplier; the kernel-align pass does not recommend it, so record its
 source with the value (see the GLM-5.3-Flash pack's variant `worker`).
 
+A host-bound engine is not a multiple of its kernel time: an eager vLLM forward
+is bounded by Python launching every kernel. The `speculative` worker takes an
+opt-in host-time model for that, five knobs set together or not at all:
+`host_fixed_ms` and `host_floor_{full_graph,piecewise,eager_prefill,eager_decode}_ms`.
+Each engine step then lasts
+`max(kernel × multiplier + host_fixed_ms, floor[graph mode])`, with the graph
+mode reported by the arch (`cost_log` column `graph_mode`) and eager split by
+whether the step schedules prefill. It needs an arch that reports its graph mode
+(today the GLM-5.3-Flash H200 MTP arch). Fit the knobs from one kernel-align case
+with
+`uv run python tools/host-time-fit/fit_host_time.py --report <case>/analysis_kernel/reports/alignment_iteration_report.json --predict <timing_predict log_dir>`;
+the timing-predict run must come from a simulator that writes `graph_mode`. The
+tool reports how many iterations each floor binds on: a floor that binds on few
+or none is not identified by that case.
+
 Standalone NSYS normalization remains available as:
 
 ```bash
