@@ -294,7 +294,10 @@ impl Glm53DsaSpecAttnLocalWorklet {
                 logits_row_stride: max_model_len,
                 logits_dtype: DType::Fp32,
                 index_dtype: "int32".into(),
-                context_mode: "uniform".into(),
+                // The v0.31 `persistent_topk` backend is measured on max-ragged
+                // rows (request b holds `context_len - b` logits); the decode
+                // rows here end within one pool of the longest context.
+                context_mode: "max_ragged".into(),
             },
             flatten_decode_indexer,
             mqa_logits_prefill: DsaMqaLogitsPrefillKernelConfig {
