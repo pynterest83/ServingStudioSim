@@ -704,7 +704,7 @@ fn pool_prefix_sum(n: u32, kpool: u32) -> u64 {
     kpool * q * q.saturating_sub(1) / 2 + q * (r + 1)
 }
 
-fn integer_sqrt(value: u32) -> u32 {
+pub(super) fn integer_sqrt(value: u32) -> u32 {
     let root = f64::from(value).sqrt().round() as u32;
     assert_eq!(root * root, value, "softmax scale needs a square head dim");
     root

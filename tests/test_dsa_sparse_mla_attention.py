@@ -96,6 +96,7 @@ def test_registration_support_family_environment_and_facades() -> None:
         "torch",
         "flashinfer_trtllm_fp8",
         "vllm_flashmla_bf16",
+        "vllm_fa3_sparse_bf16",
     ]
     for spec in (torch_spec, flashmla_spec):
         assert spec.kernel_kind == spec.table_name == KIND
@@ -1084,3 +1085,154 @@ def test_trtllm_fp8_rope_free_operands_and_launch_match_vllm() -> None:
     assert calls[0]["qk_rope_head_dim"] == 0
     assert calls[0]["max_seq_len"] == calls[0]["sparse_mla_top_k"] == 8
     assert calls[0]["sparse_mla_top_k_lens"] is operands.top_k_lens
+
+
+_FA3_SPEC = _BASE_SPEC | {
+    "num_queries": 2,
+    "num_cache_tokens": 8192,
+    "num_heads": 16,
+    "selected_k": 2176,
+    "rope_dim": 0,
+    "valid_counts": "g:(2051,2176)x1",
+    "cache_layout": "token_major_mqa_bf16_latent",
+}
+
+
+def test_fa3_sparse_registration_is_sm90_bf16_in_vllm_env() -> None:
+    # vLLM gates FLASH_ATTN_MLA_SPARSE to capability major 9 and a BF16/FP16 cache.
+    spec = find_kernel_profiler_spec(KIND, "vllm_fa3_sparse_bf16")
+    assert spec.args_schema is DsaSparseMlaAttentionArgs
+    assert spec.supports.sm_targets == frozenset({"sm_90a"})
+    assert spec.supports.allows(DType.BF16, DType.BF16, gpu="NVIDIA H200")
+    assert not spec.supports.allows(DType.BF16, DType.BF16, gpu="NVIDIA B200")
+    assert not spec.supports.allows(DType.FP8_E4M3, DType.FP8_E4M3, gpu="NVIDIA H200")
+    assert spec.subprocess_env == "vllm_env"
+    assert spec.runner_ref.function_name == (
+        "profile_dsa_sparse_mla_attention_vllm_fa3_sparse_bf16"
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({}, "reached the launch"),
+        ({"num_queries": 1, "valid_counts": "u:0x1"}, "reached the launch"),
+        ({"selected_k": 2048, "valid_counts": "u:2048x2"}, "reached the launch"),
+        ({"num_heads": 64}, "reached the launch"),
+        ({"rope_dim": 64}, "rope_dim must be 0"),
+        ({"cache_layout": "token_major_mqa_bf16_latent_rope"}, "cache_layout must be"),
+        ({"q_dtype": "fp8_e4m3"}, "q_dtype must be bf16"),
+        ({"cache_dtype": "fp8_e4m3"}, "cache_dtype must be bf16"),
+        ({"latent_dim": 256}, "latent_dim must be 512"),
+        ({"num_kv_heads": 2}, "num_kv_heads must be 1"),
+    ],
+)
+def test_fa3_sparse_accepts_only_the_rope_free_bf16_latent_layout(
+    monkeypatch, overrides, match
+) -> None:
+    from profiling.runners.attention import dsa_sparse_mla_attention as runner
+
+    def reached(*_args, **_kwargs):
+        raise ProfilerNotImplemented("reached the launch")
+
+    monkeypatch.setattr(runner, "_load_fa3_varlen_func", lambda: object())
+    monkeypatch.setattr(runner, "_build_fa3_sparse_operands", reached)
+    monkeypatch.setattr("torch.cuda.current_device", lambda: 0)
+    with pytest.raises(ProfilerNotImplemented, match=match):
+        runner.profile_dsa_sparse_mla_attention_vllm_fa3_sparse_bf16(**(_FA3_SPEC | overrides))
+
+
+def test_fa3_sparse_operands_and_launch_match_vllm_run_mqa_kernel() -> None:
+    """Catches a drift from vLLM's rope-free FA3 call: wrong q/q_v roles, a k
+    that is not the first 64 latent columns of the same rows, or a block table
+    and seqused_k that do not carry the selected rows and valid counts."""
+    from profiling.runners.attention import dsa_sparse_mla_attention as runner
+
+    validated = runner._ValidatedArgs(
+        num_queries=3,
+        num_cache_tokens=40,
+        valid_counts=(0, 5, 8),
+        index_distribution="unique_scattered_pages",
+    )
+    operands = runner._build_fa3_sparse_operands(
+        torch, validated, num_heads=4, selected_k=8, device=torch.device("cpu")
+    )
+    assert operands.q.shape == (3, 4, 512)
+    assert operands.cache.shape == (40, 1, 512)
+    assert operands.q_rope.shape == (3, 4, 64)
+    assert operands.q_rope.dtype is torch.bfloat16
+    assert torch.count_nonzero(operands.q_rope) == 0
+    assert operands.seqused_k.dtype is operands.cu_seqlens_q.dtype is torch.int32
+    assert operands.seqused_k.tolist() == [0, 5, 8]
+    assert operands.cu_seqlens_q.tolist() == [0, 1, 2, 3]
+    assert operands.selected_indices[1, 0, 5:].tolist() == [-1] * 3
+
+    calls = []
+
+    def fake_varlen(**kwargs):
+        calls.append(kwargs)
+        return "output"
+
+    assert runner._launch_fa3_sparse(fake_varlen, operands, softmax_scale=0.0625) == "output"
+    (call,) = calls
+    k, v, block_table = call.pop("k"), call.pop("v"), call.pop("block_table")
+    assert call == {
+        "q": operands.q_rope,
+        "q_v": operands.q,
+        "max_seqlen_q": 1,
+        "cu_seqlens_q": operands.cu_seqlens_q,
+        "max_seqlen_k": 8,
+        "seqused_k": operands.seqused_k,
+        "softmax_scale": 0.0625,
+        "causal": True,
+        "fa_version": 3,
+    }
+    assert v.shape == (40, 1, 1, 512) and k.shape == (40, 1, 1, 64)
+    assert k.data_ptr() == v.data_ptr() == operands.cache.data_ptr()
+    assert k.stride() == v.stride() and k.stride(-1) == 1
+    assert torch.equal(k[:, 0, 0], operands.cache[:, 0, :64])
+    assert block_table.shape == (3, 8) and block_table.stride(-1) == 1
+    assert torch.equal(block_table, operands.selected_indices[:, 0, :])
+
+
+def test_fa3_sparse_profile_times_every_launch_with_rope_free_accounting(monkeypatch) -> None:
+    """Catches a single-kernel filter that would drop FA3's scheduler and
+    combine launches, and score accounting that still counts 576 dimensions."""
+    from profiling.runners.attention import dsa_sparse_mla_attention as runner
+
+    operands = object()
+    calls: list[object] = []
+
+    def fake_launch(callable_, value, *, softmax_scale):
+        calls.append(("launch", callable_, value, softmax_scale))
+        return "output"
+
+    monkeypatch.setattr(runner, "_load_fa3_varlen_func", lambda: "varlen")
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        runner,
+        "_build_fa3_sparse_operands",
+        lambda *_args, **kwargs: calls.append(("build", kwargs["selected_k"])) or operands,
+    )
+    monkeypatch.setattr(
+        runner, "_check_fa3_sparse_correctness", lambda *_a, **_k: calls.append("correctness")
+    )
+    monkeypatch.setattr(runner, "_launch_fa3_sparse", fake_launch)
+
+    def fake_timer(callable_, *, kernel_name):
+        calls.append(("timer", kernel_name))
+        assert callable_() == "output"
+        return 2.0
+
+    monkeypatch.setattr(runner.Timer, "cupti", fake_timer)
+    monkeypatch.setattr(runner.Energy, "perf", lambda *_a, **_k: 0.5)
+    metrics = runner.profile_dsa_sparse_mla_attention_vllm_fa3_sparse_bf16(**_FA3_SPEC)
+
+    assert calls[:3] == [("build", 2176), "correctness", ("timer", None)]
+    assert calls[3] == ("launch", "varlen", operands, 0.0625)
+    flops = 2 * 2 * 16 * 2176 * (512 + 512)
+    logical_bytes = 2 * 2 * 16 * 512 + 4 * 2 * 2176 + 2 * (2051 + 2176) * 512
+    logical_bytes += 2 * 2 * 16 * 512 + 8 * 2 * 16
+    assert metrics.time_ms == 2.0
+    assert metrics.tflops == pytest.approx(flops / 0.002 / 1e12)
+    assert metrics.memory_bandwidth_gbps == pytest.approx(logical_bytes / 0.002 / 1e9)

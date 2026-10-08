@@ -61,7 +61,7 @@ use crate::timing::kernels::{
     MhcFusedPostPreRmsNormKernel, MhcPreRmsNormKernel, MhcRmsNormKernelConfig,
     MhcRmsNormKernelInput, ResidualRmsNormKernel, ResidualRmsNormKernelConfig,
     ResidualRmsNormKernelInput, RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput,
-    SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
+    SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput, FA3_SPARSE_BACKEND,
 };
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Dim, Evaluator, FlatCostNode,
@@ -135,6 +135,8 @@ const TOPK_BACKENDS: &[&str] = &["vllm_fork_cuda"];
 const MQA_LOGITS_PREFILL_BACKENDS: &[&str] = &["deepgemm_fp8"];
 const TOPK_PREFILL_BACKENDS: &[&str] = &["vllm_cuda"];
 const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
+/// vLLM `FLASH_ATTN_MLA_SPARSE` on H200 (BF16 cache, rope-free latent).
+const SPARSE_ATTENTION_BACKENDS: &[&str] = &[FA3_SPARSE_BACKEND];
 const FUSED_MOE_BACKENDS: &[&str] = &["vllm_triton"];
 const MOE_ALIGN_BACKENDS: &[&str] = &["vllm_cuda"];
 const MOE_SUM_BACKENDS: &[&str] = &["vllm_cuda"];
@@ -301,6 +303,7 @@ pub fn build_configs(
             mqa_logits_prefill_backends: MQA_LOGITS_PREFILL_BACKENDS.to_vec(),
             topk_prefill_backends: TOPK_PREFILL_BACKENDS.to_vec(),
             mla_cache_append_backends: MLA_APPEND_BACKENDS.to_vec(),
+            sparse_attention_backends: SPARSE_ATTENTION_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
         },
         dense_ffn: mlp(divide("intermediate_size", model.intermediate_size)?),
