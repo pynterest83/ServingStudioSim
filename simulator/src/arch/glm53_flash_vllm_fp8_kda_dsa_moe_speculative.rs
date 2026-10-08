@@ -129,16 +129,17 @@ const QKV_NORM_BACKENDS: &[&str] = &["vllm_triton"];
 const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb_no_rope"];
 const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up_unpadded"];
 const MQA_LOGITS_BACKENDS: &[&str] = &["deepgemm_fp8"];
-/// vLLM v0.31's own `persistent_topk` op (host `vllm_env`): above 32 rows it
-/// launches the filtered/sampled kernels the H200 capture shows. vLLM's "auto"
-/// decode top-k takes `cooperative_topk` at <= 64 rows instead; no L1 backend
-/// times that path yet. `vllm_cuda` is a v0.23 build pinned to Torch 2.11.
-const TOPK_BACKENDS: &[&str] = &["vllm_fork_cuda"];
+/// vLLM v0.31's `SparseIndexerTopk("auto")`, the deployment's default
+/// `sparse_indexer_topk_backend`: `cooperative_topk` up to 64 rows, then
+/// `persistent_topk`'s FilteredTopK, as the H200 capture shows.
+const TOPK_BACKENDS: &[&str] = &["vllm_auto"];
 const MQA_LOGITS_PREFILL_BACKENDS: &[&str] = &["deepgemm_fp8"];
 const TOPK_PREFILL_BACKENDS: &[&str] = &["vllm_cuda"];
 const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
 /// vLLM `FLASH_ATTN_MLA_SPARSE` on H200 (BF16 cache, rope-free latent).
 const SPARSE_ATTENTION_BACKENDS: &[&str] = &[FA3_SPARSE_BACKEND];
+/// vLLM's `FlashAttnPrefillBackend` FA3 varlen calls of dense-MHA prefill.
+const DENSE_PREFILL_ATTENTION_BACKENDS: &[&str] = &["vllm_fa3"];
 const FUSED_MOE_BACKENDS: &[&str] = &["vllm_triton"];
 const MOE_ALIGN_BACKENDS: &[&str] = &["vllm_cuda"];
 const MOE_SUM_BACKENDS: &[&str] = &["vllm_cuda"];
@@ -307,6 +308,7 @@ pub fn build_configs(
             topk_prefill_backends: TOPK_PREFILL_BACKENDS.to_vec(),
             mla_cache_append_backends: MLA_APPEND_BACKENDS.to_vec(),
             sparse_attention_backends: SPARSE_ATTENTION_BACKENDS.to_vec(),
+            dense_prefill_attention_backends: DENSE_PREFILL_ATTENTION_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
         },
         dense_ffn: mlp(divide("intermediate_size", model.intermediate_size)?),
@@ -1121,9 +1123,16 @@ impl Glm53FlashSpecModel {
     }
 
     fn eval_into(&self, input: &SpeculativeArchInput, ev: &mut Evaluator) {
-        let batch = normalize_speculative_input(input, self.draft_tokens, self.max_model_len)
+        let mut batch = normalize_speculative_input(input, self.draft_tokens, self.max_model_len)
             .unwrap_or_else(|reason| panic!("invalid Glm53FlashSpecModel input: {reason}"));
         let tokens = graph_padded_tokens(&self.cudagraph_capture_sizes, batch.total_tokens);
+        // vLLM replays a FULL CUDA graph for a uniform pure-decode batch within
+        // the capture sizes; mixed batches run attention eagerly (piecewise).
+        batch.dsa.full_cuda_graph = batch.dsa.prefill_chunk_pairs.is_empty()
+            && self
+                .cudagraph_capture_sizes
+                .last()
+                .is_some_and(|&largest| batch.total_tokens <= largest);
         let ew = |num_tokens| ElementwiseKernelInput { num_tokens };
         push(&self.embedding, ew(tokens), ev);
         self.embedding_all_reduce.eval(tokens, ev);
@@ -1167,6 +1176,7 @@ impl Glm53FlashSpecModel {
                 decode_kv_lens: contexts,
                 decode_width: 1,
                 skip_indexer: true,
+                full_cuda_graph: batch.dsa.full_cuda_graph,
             };
             let rows = graph_padded_tokens(&self.cudagraph_capture_sizes, batch.request_count);
             recurrent.eval(
@@ -1381,6 +1391,8 @@ fn normalize_speculative_input(
             decode_kv_lens,
             decode_width: verify_width,
             skip_indexer: false,
+            // Set by the caller, which knows the CUDA-graph capture sizes.
+            full_cuda_graph: false,
         },
     })
 }
