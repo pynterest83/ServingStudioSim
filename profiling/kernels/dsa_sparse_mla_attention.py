@@ -67,7 +67,9 @@ DOC = KernelDoc(
         f"{CUPTI_METHOD} "
         "torch counts every launch of its composite; flashinfer_trtllm_fp8 "
         "counts only fmhaSm100, and vllm_flashmla_bf16 only "
-        "sparse_attn_fwd_kernel. Setup and output checks run before timing."
+        "sparse_attn_fwd_kernel. vllm_fa3_sparse_bf16 counts every launch of "
+        "one FA3 call: prepare_varlen_num_blocks, FlashAttnFwdSm90 and, when FA3 "
+        "splits the keys, FlashAttnFwdCombine. Setup and output checks run before timing."
     ),
     caveats=(
         "Selected positions and tensor values are constructed, not taken from "
@@ -75,11 +77,14 @@ DOC = KernelDoc(
         "TFLOPS counts all selected_k slots even when fewer are valid.",
         "torch and vllm_flashmla_bf16 accept only rope_dim = 64; "
         "flashinfer_trtllm_fp8 also accepts rope_dim = 0, with its own cache "
-        "layout. vllm_flashmla_bf16 needs selected_k to be a multiple of "
-        "FlashMLA's top-k tile: 128 on SM90, and 64 at 64 heads or 128 otherwise "
-        "on SM10x.",
+        "layout; vllm_fa3_sparse_bf16 accepts only rope_dim = 0, with the "
+        "token_major_mqa_bf16_latent layout. vllm_flashmla_bf16 needs "
+        "selected_k to be a multiple of FlashMLA's top-k tile: 128 on SM90, "
+        "and 64 at 64 heads or 128 otherwise on SM10x.",
         "GB/s includes 8 bytes per query head for the max-logit and log-sum-exp"
         " outputs, even for backends that return only the attention output.",
+        "vllm_fa3_sparse_bf16 excludes vLLM's per-call zero fill of the 64-wide "
+        "query that FA3's rope-free path takes in place of a RoPE query.",
     ),
     reference="profiling.runners.attention.dsa_sparse_mla_attention_reference",
 )
@@ -160,6 +165,41 @@ register(
         doc=BackendDoc(
             summary=("vLLM's flash_mla_sparse_fwd on BF16 selected KV tokens."),
             url="https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/ops/flashmla.py",
+        ),
+    )
+)
+
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_fa3_sparse_bf16",
+        # vLLM FlashAttnMLASparseBackend.supports_compute_capability: major == 9,
+        # and flash_attn_supports_mla() needs FA3 on the SM90 family. Its
+        # supports_combination admits only FP16/BF16 KV caches.
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            kv=frozenset({DType.BF16}),
+            sm_targets=frozenset({"sm_90a"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.dsa_sparse_mla_attention",
+            function_name="profile_dsa_sparse_mla_attention_vllm_fa3_sparse_bf16",
+        ),
+        table_name=KIND,
+        args_schema=DsaSparseMlaAttentionArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's FLASH_ATTN_MLA_SPARSE FA3 varlen call on rope-free BF16 "
+                "latent rows, with the selected rows as a page-size-1 block table, on H200."
+            ),
+            url=(
+                "https://github.com/vllm-project/vllm/blob/main/"
+                "vllm/v1/attention/backends/mla/flashattn_mla_sparse.py"
+            ),
         ),
     )
 )
