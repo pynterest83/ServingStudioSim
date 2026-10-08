@@ -35,9 +35,19 @@ tolerances:
     # A floor, not a bound: mapping coverage below this means a large measured
     # kernel has no simulated counterpart, which invalidates the timing above it.
     map_coverage_pct: 97.0
-    # Check 2 — duty cycle. A ceiling: a large multiplier means big host bubbles
-    # that deserve an explanation rather than silent absorption.
-    gpu_time_multiplier: 1.5
+    # Check 2 — duty cycle. This pack's simulated side has no GPU-time multiplier:
+    # the worker's host-time model (cycle = max(kernel + host_fixed,
+    # host_floor[graph mode]), fitted by tools/host-time-fit) turns kernel time
+    # into iteration time, so the duty cycle is judged on the simulated vs
+    # measured iteration cycle it produces. kernel-align's
+    # recommended_gpu_time_multiplier stays in the iteration report as a
+    # diagnostic only; it pools host-bound eager and graph-replayed iterations
+    # (case 03: decode 1.06, mixed 1.93), which is what a multiplier cannot model.
+    # Its ceiling is therefore a sanity bound, not the duty-cycle gate: 2.5 flags
+    # host bubbles beyond the eager host floor the model is fitted to (a stall or
+    # a contended host), while the iteration-cycle error below is what passes or
+    # fails the duty cycle. (Was 1.5, the multiplier-model bound.)
+    gpu_time_multiplier: 2.5
     iteration_cycle_mean_pct: 8.0
     # Workload structure. These compare the two sides' scheduler behaviour on the
     # same trace. Where scheduling agrees they are near-exact (cases 11-15 are at
