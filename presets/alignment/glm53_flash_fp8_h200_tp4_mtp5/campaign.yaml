@@ -5,10 +5,10 @@ description: >-
   expert parallelism, BF16 KV cache, MTP with 5 speculative tokens; https://recipes.vllm.ai/zai-org/GLM-5.3-Flash
   adapted to Hopper). Cases 01-13 reuse the B200 TP4/EP4 matrix's shapes, repeats and concurrency so the two
   GPUs stay comparable. Cases 14/15 are left out until their pinned KV pools are re-derived for the BF16 KV
-  footprint. The measured side (profile passes) is the production engine. The simulated side is a placeholder
-  until the H200 arch exists (Triton fused MoE without EP, FLASH_ATTN_MLA_SPARSE, MTP 5); it uses the B200
-  arch with the B200 routing corpus and a non-speculative worker, so timing-predict / simulation of this pack are not
-  yet meaningful.
+  footprint. The measured side (profile passes) is the production engine; the simulated side is the H200
+  speculative arch (Triton fused MoE without EP, FLASH_ATTN_MLA_SPARSE FA3, FlashKDA, MTP 5) with the
+  host-time worker model. Measurements taken before the 2026-10-08 node tuning (see recorded_on.host_conditions)
+  are not comparable with measurements taken after it.
 recorded_on:
   host: h200
   gpu: NVIDIA H200
@@ -16,6 +16,21 @@ recorded_on:
   checkpoint_snapshots: {glm53_flash: GLM-5.3-Flash@eb9eb208eb0d988989d07a6a12d0fdeb5f52574a}
   nsys_version: 2025.5.2
   device_roles: {primary: '4,5,6,7'}
+  # Measurement contract since 2026-10-08 (node hgx45 tuned by the admins; lost on node reboot). Every
+  # profile pass logs these before it starts and stops if they no longer hold. Baselines measured before
+  # this (logs/20261007_0_glm53_flash_h200_campaign, untuned: default governor, C-states on, unlocked
+  # GPU clocks) are not comparable with baselines measured under it.
+  host_conditions:
+    since: '2026-10-08'
+    gpu_sm_clock_lock_mhz: 1980        # GPUs 4-7, application clock mode 1 (nvidia-smi clocks.sm = 1980)
+    cpu_governor: performance          # CPUs 48-95 and 144-191 (NUMA 2-3, the GPU 4-7 side)
+    cpu_cstates_disabled: [C1E, C6]
+    smt_contention: about 40% remaining (admin micro-benchmark; launch time 1.5-3.3x faster than before)
+    # Server environment for the re-measurement (exported by the workspace .env; the vLLM server inherits it):
+    # VLLM_DEEP_GEMM_WARMUP=full (default "relax" is a heuristic; the untuned case-03 workload pass had two
+    # ~2.7 s mid-replay stalls with no Triton JIT warning), and persistent VLLM_CACHE_ROOT / TRITON_CACHE_DIR /
+    # TORCHINDUCTOR_CACHE_DIR outside any worktree so JIT/compile work is reused across runs.
+    server_env: {VLLM_DEEP_GEMM_WARMUP: full}
 variants:
   tp4_dp1_mtp5:
     deployment: unified
