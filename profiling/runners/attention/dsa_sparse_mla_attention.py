@@ -23,7 +23,8 @@ from profiling.runners.metrics import ComputeMetrics
 # The MQA latent+rope layout every backend here consumes: one KV head, a
 # 512-wide latent that doubles as the value, and a 64-wide RoPE tail (FlashMLA
 # sparse_fwd.h checks d_qk in {576, 512} and d_v == 512; the cache_layout tag
-# names this layout). rope_dim 0 is the separate TRT-LLM nope layout.
+# names this layout). rope_dim 0 is a separate rope-free layout per backend:
+# TRT-LLM's FP8 nope pages, or FA3's BF16 latent rows.
 _NUM_KV_HEADS = 1
 _LATENT_DIM = 512
 _ROPE_DIM = 64
@@ -55,6 +56,22 @@ _TRTLLM_PAGE_SIZE = 64
 # `selected_k` wide (2048, or vLLM's kpool buffer 2176); FlashInfer only checks
 # that the page table matches sparse_mla_top_k, so any positive width is valid.
 _TRTLLM_FP8_NOPE_CACHE_LAYOUT = "hnd_paged_mqa_fp8_latent"
+_FA3_BACKEND = "dsa_sparse_mla_attention:vllm_fa3_sparse_bf16"
+# GLM-5.3-Flash's rope-free BF16 cache on H200 (FLASH_ATTN_MLA_SPARSE): one
+# 512-wide BF16 latent row per token, read as both key and value through vLLM's
+# flat_kv_row_view of the paged cache (kv_lora_rank 512, qk_rope_head_dim 0).
+_FA3_CACHE_LAYOUT = "token_major_mqa_bf16_latent"
+# flashattn_mla_sparse.py `_run_mqa_kernel`: FA3's q_v path needs the 64-wide
+# Q/K specialization, so a rope-free model passes a zero [Q, H, 64] q and the
+# first 64 latent columns as k; the scores are then q_v . v alone.
+_FA3_QK_HEAD_DIM = 64
+# FA3 rounds P to BF16 before PV and merges split partials, so near-zero outputs
+# of peaked rows sit up to ~2^-9 from the FP32 reference (measured on H200:
+# max 2.2e-3 off a near-zero value at Q 1200 over 300k random-normal rows); BF16
+# ulp errors on large values stay under the shared relative bound.
+_FA3_ATOL = 4e-3
+_FA3_RTOL = _FLASHMLA_RTOL
+_FA3_COSINE_LIMIT = _FLASHMLA_COSINE_LIMIT
 
 _UINT = r"(?:0|[1-9][0-9]*)"
 _UNIFORM_RE = re.compile(rf"u:({_UINT})x({_UINT})\Z")
@@ -85,6 +102,18 @@ class _Operands:
     q: Any
     cache: Any
     selected_indices: Any
+
+
+@dataclass(frozen=True)
+class _Fa3SparseOperands:
+    """FLASH_ATTN_MLA_SPARSE operands; q/cache/selected_indices feed the reference."""
+
+    q: Any  # [Q, H, 512] q_nope, passed as FA3 q_v
+    cache: Any  # [N, 1, 512] latent rows
+    selected_indices: Any  # [Q, 1, K] global rows, -1 after each valid prefix
+    q_rope: Any  # [Q, H, 64] zeros, allocated outside the timed call as vLLM does
+    seqused_k: Any  # [Q] int32 valid_counts
+    cu_seqlens_q: Any  # [Q + 1] int32, one query per sequence
 
 
 @dataclass(frozen=True)
@@ -392,14 +421,15 @@ def _build_operands(
     num_heads: int,
     selected_k: int,
     device: Any,
+    score_dim: int = _SCORE_DIM,
 ) -> _Operands:
     q = torch.empty(
-        (validated.num_queries, num_heads, _SCORE_DIM),
+        (validated.num_queries, num_heads, score_dim),
         dtype=torch.bfloat16,
         device=device,
     )
     cache = torch.empty(
-        (validated.num_cache_tokens, _NUM_KV_HEADS, _SCORE_DIM),
+        (validated.num_cache_tokens, _NUM_KV_HEADS, score_dim),
         dtype=torch.bfloat16,
         device=device,
     )
@@ -410,7 +440,7 @@ def _build_operands(
         device=device,
     )
 
-    feature = torch.linspace(-0.875, 0.875, _SCORE_DIM, device=device)
+    feature = torch.linspace(-0.875, 0.875, score_dim, device=device)
     heads = (
         torch.arange(num_heads, dtype=torch.float32, device=device) - (num_heads - 1) / 2.0
     ) / 256.0
@@ -1090,6 +1120,248 @@ def profile_dsa_sparse_mla_attention_vllm_flashmla_bf16(
     return ComputeMetrics(
         time_ms=time_ms,
         energy_j=energy_j,
+        tflops=flops / seconds / 1e12,
+        memory_bandwidth_gbps=logical_bytes / seconds / 1e9,
+    )
+
+
+def _load_fa3_varlen_func() -> Any:
+    """Load vLLM's FA3 varlen entry only inside a vllm_env worker."""
+    try:
+        module = importlib.import_module("vllm.vllm_flash_attn.flash_attn_interface")
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise ProfilerNotImplemented(
+            f"{_FA3_BACKEND} requires vllm_env with vllm.vllm_flash_attn"
+        ) from exc
+    callable_ = getattr(module, "flash_attn_varlen_func", None)
+    if not callable(callable_):
+        raise ProfilerNotImplemented(
+            f"{_FA3_BACKEND} requires vllm.vllm_flash_attn.flash_attn_interface"
+            ".flash_attn_varlen_func"
+        )
+    return callable_
+
+
+def _build_fa3_sparse_operands(
+    torch: Any,
+    validated: _ValidatedArgs,
+    *,
+    num_heads: int,
+    selected_k: int,
+    device: Any,
+) -> _Fa3SparseOperands:
+    base = _build_operands(
+        torch,
+        validated,
+        num_heads=num_heads,
+        selected_k=selected_k,
+        device=device,
+        score_dim=_LATENT_DIM,
+    )
+    num_queries = validated.num_queries
+    return _Fa3SparseOperands(
+        q=base.q,
+        cache=base.cache,
+        selected_indices=base.selected_indices,
+        q_rope=torch.zeros(
+            (num_queries, num_heads, _FA3_QK_HEAD_DIM), dtype=torch.bfloat16, device=device
+        ),
+        seqused_k=torch.tensor(validated.valid_counts, dtype=torch.int32, device=device),
+        cu_seqlens_q=torch.arange(num_queries + 1, dtype=torch.int32, device=device),
+    )
+
+
+def _launch_fa3_sparse(
+    flash_attn_varlen_func: Any,
+    operands: _Fa3SparseOperands,
+    *,
+    softmax_scale: float,
+) -> Any:
+    """vLLM v0.31 FlashAttnMLASparseImpl._run_mqa_kernel at qk_rope_head_dim 0.
+
+    The cache is a page-size-1 paged KV ([rows, 1, 1, D]) and the selected
+    global rows are its block table, read up to each query's seqused_k.
+    """
+    v_cache = operands.cache.unsqueeze(1)
+    k_cache = v_cache[..., :_FA3_QK_HEAD_DIM]
+    block_table = operands.selected_indices[:, 0, :]
+    return flash_attn_varlen_func(
+        q=operands.q_rope,
+        k=k_cache,
+        v=v_cache,
+        q_v=operands.q,
+        max_seqlen_q=1,
+        cu_seqlens_q=operands.cu_seqlens_q,
+        max_seqlen_k=block_table.shape[1],
+        seqused_k=operands.seqused_k,
+        block_table=block_table,
+        softmax_scale=softmax_scale,
+        causal=True,
+        fa_version=3,
+    )
+
+
+def _check_fa3_sparse_correctness(
+    torch: Any,
+    flash_attn_varlen_func: Any,
+    operands: _Fa3SparseOperands,
+    *,
+    softmax_scale: float,
+) -> None:
+    """Validate the production FA3 call against the Torch reference before timing."""
+    from profiling.runners.attention.dsa_sparse_mla_attention_reference import (
+        dsa_sparse_mla_attention_reference,
+    )
+
+    inputs = (
+        ("q", operands.q),
+        ("cache", operands.cache),
+        ("selected_indices", operands.selected_indices),
+        ("q_rope", operands.q_rope),
+        ("seqused_k", operands.seqused_k),
+    )
+    snapshots = tuple(tensor.clone() for _, tensor in inputs)
+
+    def invoke() -> Any:
+        returned = _launch_fa3_sparse(flash_attn_varlen_func, operands, softmax_scale=softmax_scale)
+        torch.cuda.synchronize()
+        return returned
+
+    output = invoke()
+    expected = dsa_sparse_mla_attention_reference(
+        operands.q,
+        operands.cache,
+        operands.selected_indices,
+        softmax_scale=softmax_scale,
+    )
+    expected_shape = (operands.q.shape[0], operands.q.shape[1], _VALUE_DIM)
+    if tuple(output.shape) != expected_shape or output.dtype is not torch.bfloat16:
+        raise AssertionError(
+            f"FA3 sparse output must be BF16 {expected_shape}, "
+            f"got {output.dtype} {tuple(output.shape)}"
+        )
+    if not torch.isfinite(output).all():
+        raise AssertionError("FA3 sparse output must be finite for supported finite operands")
+    torch.testing.assert_close(output.float(), expected.float(), atol=_FA3_ATOL, rtol=_FA3_RTOL)
+    numerator = 2.0 * torch.sum(output.float() * expected.float()).item()
+    denominator = (
+        torch.sum(output.float().square()).item() + torch.sum(expected.float().square()).item()
+    )
+    cosine_difference = 0.0 if denominator == 0.0 else 1.0 - numerator / denominator
+    if abs(cosine_difference) > _FA3_COSINE_LIMIT:
+        raise AssertionError(
+            f"FA3 sparse cosine difference {cosine_difference} exceeds {_FA3_COSINE_LIMIT}"
+        )
+    empty = operands.seqused_k == 0
+    if empty.any() and torch.count_nonzero(output[empty]).item() != 0:
+        raise AssertionError("FA3 sparse rows with no valid index must return zero output")
+
+    if not torch.equal(invoke(), output):
+        raise AssertionError("FA3 sparse repeated calls must be deterministic")
+    for (name, tensor), snapshot in zip(inputs, snapshots, strict=True):
+        if not torch.equal(tensor, snapshot):
+            raise AssertionError(f"FA3 sparse mutated {name}")
+    input_pointers = {tensor.untyped_storage().data_ptr() for _, tensor in inputs}
+    if output.untyped_storage().data_ptr() in input_pointers:
+        raise AssertionError("FA3 sparse output aliases an input")
+
+
+def profile_dsa_sparse_mla_attention_vllm_fa3_sparse_bf16(
+    *,
+    num_queries: int,
+    num_cache_tokens: int,
+    num_heads: int,
+    num_kv_heads: int,
+    selected_k: int,
+    latent_dim: int,
+    rope_dim: int,
+    value_dim: int,
+    softmax_scale: float,
+    q_dtype: DType | str,
+    cache_dtype: DType | str,
+    index_dtype: str,
+    output_dtype: DType | str,
+    valid_counts: str,
+    index_distribution: str,
+    cache_layout: str,
+) -> ComputeMetrics:
+    """Profile vLLM's FLASH_ATTN_MLA_SPARSE FA3 call for rope-free BF16 MLA.
+
+    One call is FA3's `prepare_varlen_num_blocks` scheduler kernel, the
+    `FlashAttnFwdSm90` main kernel, and `FlashAttnFwdCombine` when FA3 splits
+    the selected keys; all of them are timed. vLLM's per-call zero-fill of the
+    64-wide q is a separate launch before this call and stays outside.
+    """
+    validated = _validate_args(
+        num_queries=num_queries,
+        num_cache_tokens=num_cache_tokens,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        selected_k=selected_k,
+        latent_dim=latent_dim,
+        rope_dim=rope_dim,
+        value_dim=value_dim,
+        softmax_scale=softmax_scale,
+        q_dtype=q_dtype,
+        cache_dtype=cache_dtype,
+        index_dtype=index_dtype,
+        output_dtype=output_dtype,
+        valid_counts=valid_counts,
+        index_distribution=index_distribution,
+        cache_layout=cache_layout,
+        # num_heads is the per-rank q-head count (16 at GLM-5.3-Flash TP4);
+        # FA3 packs any multiple of the single KV head, and selected_k is any
+        # block-table width (page size 1).
+        expected_cache_layout=_FA3_CACHE_LAYOUT,
+        expected_rope_dim=0,
+    )
+
+    try:
+        import torch
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise ProfilerNotImplemented(f"{_FA3_BACKEND} requires PyTorch in vllm_env") from exc
+
+    try:
+        flash_attn_varlen_func = _load_fa3_varlen_func()
+        device = torch.device("cuda", torch.cuda.current_device())
+        operands = _build_fa3_sparse_operands(
+            torch, validated, num_heads=num_heads, selected_k=selected_k, device=device
+        )
+        _check_fa3_sparse_correctness(
+            torch, flash_attn_varlen_func, operands, softmax_scale=float(softmax_scale)
+        )
+
+        def kernel() -> Any:
+            return _launch_fa3_sparse(
+                flash_attn_varlen_func, operands, softmax_scale=float(softmax_scale)
+            )
+
+        time_ms = Timer.cupti(kernel, kernel_name=None)
+        energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
+    except (KernelLaunchFailed, ProfilerNotImplemented):
+        raise
+    except torch.OutOfMemoryError as exc:
+        raise OOMError(f"{_FA3_BACKEND} ran out of GPU memory") from exc
+    except Exception as exc:
+        raise KernelLaunchFailed(f"{_FA3_BACKEND} native callable failed") from exc
+
+    flops = _logical_flops(
+        num_queries=num_queries,
+        num_heads=num_heads,
+        selected_k=selected_k,
+        score_dim=_LATENT_DIM,
+    )
+    logical_bytes = _logical_bytes(
+        num_queries=num_queries,
+        num_heads=num_heads,
+        selected_k=selected_k,
+        valid_counts=validated.valid_counts,
+        score_dim=_LATENT_DIM,
+    )
+    seconds = time_ms / 1000.0
+    return ComputeMetrics(
+        time_ms=float(time_ms),
+        energy_j=float(energy_j),
         tflops=flops / seconds / 1e12,
         memory_bandwidth_gbps=logical_bytes / seconds / 1e9,
     )

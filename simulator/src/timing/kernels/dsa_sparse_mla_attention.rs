@@ -21,6 +21,13 @@
 //! (`selected_k`). `ValidCountsPattern::PooledUniformFull` carries the pooling
 //! so decode derives `u:min(ctx, index_topk + index_kpool - 1)` instead of
 //! clipping at the page-table width, and sweeps its own smaller grid.
+//!
+//! On H200 the same model runs vLLM's `FLASH_ATTN_MLA_SPARSE`
+//! (`vllm_fa3_sparse_bf16`): one FA3 call is `prepare_varlen_num_blocks`,
+//! `FlashAttnFwdSm90` and, at 992 query rows or fewer, `FlashAttnFwdCombine`
+//! (measured on H200 at 1/256/2176 valid slots: 3 launches through Q 992, 2 from
+//! Q 993). Its pooled grid carries 992 and 993 as adjacent query points, so the
+//! linear cache never interpolates across that drop.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};
@@ -67,6 +74,25 @@ const POOLED_QUERY_AXIS: [u32; 21] = [
 const POOLED_CACHE_AXIS: [u32; 21] = [
     1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 1536, 4096, 8192, 16384, 32768, 65536,
     131072, 262144, 1048576,
+];
+
+/// The H200 FA3 backend (vLLM `FLASH_ATTN_MLA_SPARSE`).
+pub const FA3_SPARSE_BACKEND: &str = "vllm_fa3_sparse_bf16";
+/// Largest FA3 call that still splits the keys and launches
+/// `FlashAttnFwdCombine` (FA3's dynamic split runs only at batch <= 992).
+pub const FA3_COMBINE_MAX_QUERIES: u32 = 992;
+/// FA3 pooled query axis. 992 / 993 bracket the Combine drop as adjacent
+/// integer points; the rest is dense at small decode batches and
+/// log-spaced above.
+const FA3_POOLED_QUERY_AXIS: [u32; 23] = [
+    1, 2, 4, 8, 16, 32, 64, 96, 128, 192, 256, 384, 512, 768, 992, 993, 1024, 1536, 2048, 4096,
+    8192, 16384, 32768,
+];
+/// FA3 pooled context points; `pooled_cache_axis` adds `index_topk` and the
+/// cap. Sparser than `POOLED_CACHE_AXIS` past the cap, where only the gather
+/// footprint grows, to stay within 500 coordinates.
+const FA3_POOLED_CACHE_AXIS: [u32; 18] = [
+    1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 1536, 4096, 16384, 65536, 262144, 1048576,
 ];
 
 /// Which valid-slot-count shape a config sweeps.
@@ -175,6 +201,9 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
     const KIND: KernelKind = "dsa_sparse_mla_attention";
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        if config.backends.contains(&FA3_SPARSE_BACKEND) {
+            return fa3_sweep_grid(config);
+        }
         let (query_axis, cache_axis): (Vec<u32>, Vec<u32>) = match config.valid_counts_pattern {
             ValidCountsPattern::UniformFull => {
                 (UNIFORM_QUERY_AXIS.to_vec(), UNIFORM_CACHE_AXIS.to_vec())
@@ -469,6 +498,36 @@ fn canonical_speculative_counts(q: u32, s: u32, k: u32, group_size: u32) -> Stri
     format!("g:({counts})x{}", q / group_size)
 }
 
+/// The FA3 grid. It differs from the other backends' (the Combine breakpoint),
+/// so FA3 sweeps alone, and only the pooled pattern its H200 worklet uses.
+fn fa3_sweep_grid(config: &DsaSparseMlaAttentionKernelConfig) -> SweepGrid {
+    assert!(
+        config.backends == [FA3_SPARSE_BACKEND],
+        "{FA3_SPARSE_BACKEND} has its own grid and cannot share a config with {:?}",
+        config.backends
+    );
+    let ValidCountsPattern::PooledUniformFull { index_topk, .. } = config.valid_counts_pattern
+    else {
+        panic!(
+            "{FA3_SPARSE_BACKEND} sweeps only PooledUniformFull, got {:?}",
+            config.valid_counts_pattern
+        );
+    };
+    let mut cache_axis = FA3_POOLED_CACHE_AXIS.to_vec();
+    cache_axis.extend([
+        index_topk,
+        config
+            .valid_counts_pattern
+            .valid_count_cap(config.selected_k),
+    ]);
+    cache_axis.sort_unstable();
+    cache_axis.dedup();
+    SweepGrid::new(vec![
+        Axis::values(FA3_POOLED_QUERY_AXIS.iter().copied()),
+        Axis::values(cache_axis),
+    ])
+}
+
 /// Pooled context axis: the fixed points plus `index_topk` (last unsaturated
 /// power-of-two anchor) and the saturating cap, so the linear cache never
 /// interpolates across the point where the count stops growing.
@@ -492,8 +551,9 @@ mod tests {
     use super::{
         canonical_valid_counts, speculative_cache_axis, speculative_query_axis,
         DsaSparseMlaAttentionKernelConfig, DsaSparseMlaAttentionKernelInput,
-        DsaSparseMlaAttentionSpec, CAUSAL_CACHE_AXIS, CAUSAL_QUERY_AXIS, SPECULATIVE_CACHE_AXIS,
-        SPECULATIVE_QUERY_AXIS, UNIFORM_CACHE_AXIS, UNIFORM_QUERY_AXIS,
+        DsaSparseMlaAttentionSpec, CAUSAL_CACHE_AXIS, CAUSAL_QUERY_AXIS, FA3_COMBINE_MAX_QUERIES,
+        FA3_SPARSE_BACKEND, SPECULATIVE_CACHE_AXIS, SPECULATIVE_QUERY_AXIS, UNIFORM_CACHE_AXIS,
+        UNIFORM_QUERY_AXIS,
     };
     use crate::timing::bridge::{ArgsPayload, DType};
     use crate::timing::cache::{CacheKind, Extrapolation};
@@ -820,6 +880,81 @@ mod tests {
             DsaSparseMlaAttentionSpec::infeasible_mask(&pooled, &synthetic),
             vec![false, true]
         );
+    }
+
+    /// GLM-5.3-Flash TP4 on H200 under vLLM v0.31 (`FLASH_ATTN_MLA_SPARSE`).
+    fn fa3_config() -> DsaSparseMlaAttentionKernelConfig {
+        DsaSparseMlaAttentionKernelConfig {
+            backends: vec![FA3_SPARSE_BACKEND],
+            gpu_name: "NVIDIA H200".to_string(),
+            q_dtype: DType::Bf16,
+            cache_dtype: DType::Bf16,
+            cache_layout: "token_major_mqa_bf16_latent".to_string(),
+            ..pooled_config()
+        }
+    }
+
+    /// Catches the FA3 grid losing the measured Combine breakpoint (a cache
+    /// point on each side of Q 992 | 993, so no integer Q interpolates across
+    /// it) or growing past the 500-coordinate ceiling.
+    #[test]
+    fn fa3_grid_pins_the_combine_breakpoint_within_the_ceiling() {
+        let cfg = fa3_config();
+        let grid = DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
+        assert_eq!(FA3_COMBINE_MAX_QUERIES, 992);
+        assert_contiguous(&grid.axes()[0], &[768, 992, 993, 1024]);
+        assert_contiguous(&grid.axes()[1], &[1536, 2048, 2051, 4096]);
+        assert_eq!(grid.axes()[0].last(), Some(&32768.0));
+        assert_eq!(grid.axes()[1].last(), Some(&1_048_576.0));
+        let mask = DsaSparseMlaAttentionSpec::infeasible_mask(&cfg, &grid);
+        assert_mask_split(&mask, 23 * 20, 0);
+    }
+
+    /// Catches an FA3 payload that drifts from the Python runner's accepted
+    /// rope-free BF16 latent layout.
+    #[test]
+    fn fa3_payloads_are_rope_free_bf16_latent_rows() {
+        let cfg = fa3_config();
+        let grid = DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
+        let payloads = DsaSparseMlaAttentionSpec::enumerate(&cfg, &grid, FA3_SPARSE_BACKEND);
+        assert_eq!(payloads.len(), 460);
+        let mut fields =
+            serde_json::to_value(payload_for(&payloads, &grid, 992, 65536).fields()).unwrap();
+        // 992 rows spread evenly over the four kpool tail phases.
+        assert_eq!(fields["valid_counts"], "g:(2048,2049,2050,2051)x248");
+        fields["valid_counts"] = Value::from("checked above");
+        assert_eq!(
+            fields,
+            serde_json::json!({
+                "backend": FA3_SPARSE_BACKEND,
+                "num_queries": 992,
+                "num_cache_tokens": 65536,
+                "num_heads": 16,
+                "num_kv_heads": 1,
+                "selected_k": 2176,
+                "latent_dim": 512,
+                "rope_dim": 0,
+                "value_dim": 512,
+                "softmax_scale": 0.0625,
+                "q_dtype": "bf16",
+                "cache_dtype": "bf16",
+                "index_dtype": "int32",
+                "output_dtype": "bf16",
+                "valid_counts": "checked above",
+                "index_distribution": "unique_scattered_pages",
+                "cache_layout": "token_major_mqa_bf16_latent",
+            })
+        );
+        assert_eq!(cfg.compute_dtype(), Some(DType::Bf16));
+        assert_eq!(cfg.kv_dtype(), Some(DType::Bf16));
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot share a config")]
+    fn fa3_does_not_share_a_grid_with_another_backend() {
+        let mut cfg = fa3_config();
+        cfg.backends = vec![FA3_SPARSE_BACKEND, TRTLLM_BACKEND];
+        DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
     }
 
     #[test]

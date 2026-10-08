@@ -58,7 +58,8 @@ DOC = KernelDoc(
     method=(
         f"{CUPTI_METHOD} Only the quantization kernel is counted: "
         "per_token_group_quant_8bit_packed_register_kernel for "
-        "ue8m0_packed_int32, per_token_group_quant_8bit_kernel otherwise."
+        "ue8m0_packed_int32, per_token_group_quant_8bit_kernel (vLLM v0.31: "
+        "per_token_group_quant_8bit_register_kernel) otherwise."
     ),
     caveats=(
         "ue8m0_packed_int32 needs group_size = 128: vLLM compiles its packed "

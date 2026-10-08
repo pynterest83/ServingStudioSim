@@ -12,6 +12,9 @@ _LATENT_DIM = 512
 _ROPE_DIM = 64
 _SCORE_DIM = _LATENT_DIM + _ROPE_DIM
 _VALUE_DIM = _LATENT_DIM
+# Score widths: latent + 64 RoPE (GLM-5.2), or the bare latent of a rope-free
+# MLA (GLM-5.3-Flash, rope_dim 0).
+_SCORE_DIMS = (_SCORE_DIM, _LATENT_DIM)
 _QUERY_CHUNK_SIZE = 8
 
 
@@ -24,9 +27,10 @@ def dsa_sparse_mla_attention_reference(
 ) -> torch.Tensor:
     """Return BF16 selected MLA attention in a fresh ``[Q, H, 512]`` tensor.
 
-    The score and value paths use FP32: QK consumes all 576 dimensions (the
-    512-dimensional latent part followed by 64 RoPE dimensions), while PV uses
-    the first 512 cache dimensions as values. Every negative index and every
+    The score and value paths use FP32: QK consumes every score dimension --
+    576 (the 512-dimensional latent part followed by 64 RoPE dimensions), or
+    512 for a rope-free latent (rope_dim 0) -- while PV uses the first 512
+    cache dimensions as values. q and cache share the score width. Every negative index and every
     index outside the cache is masked. Duplicate valid indices deliberately
     retain repeated softmax mass, and rows with no valid index return zeros.
 
@@ -38,7 +42,7 @@ def dsa_sparse_mla_attention_reference(
     imports or calls vLLM, FlashMLA, or custom CUDA.
 
     Query chunking bounds the largest gathered tensor by
-    ``_QUERY_CHUNK_SIZE * K * 576`` and does not change the row-independent
+    ``_QUERY_CHUNK_SIZE * K * score width`` and does not change the row-independent
     result. Invalid entries are zeroed before QK and PV, so an invalid
     placeholder can never expose NaN/Inf from an unrelated cache row.
     """
@@ -50,6 +54,7 @@ def dsa_sparse_mla_attention_reference(
         device=q.device,
     )
     cache_rows = cache[:, 0, :]
+    score_dim = cache.shape[2]
 
     for query_start in range(0, q.shape[0], _QUERY_CHUNK_SIZE):
         query_end = min(query_start + _QUERY_CHUNK_SIZE, q.shape[0])
@@ -61,7 +66,7 @@ def dsa_sparse_mla_attention_reference(
         gathered = cache_rows.index_select(0, safe_indices.reshape(-1)).reshape(
             query_end - query_start,
             selected_indices.shape[2],
-            _SCORE_DIM,
+            score_dim,
         )
         gathered = gathered.float()
         gathered.masked_fill_(~valid.unsqueeze(-1), 0.0)
@@ -136,15 +141,19 @@ def _validate_ranks_and_shapes(
         raise ValueError("q must contain at least one query")
     if q.shape[1] <= 0:
         raise ValueError("q must contain at least one head")
-    if q.shape[2] != _SCORE_DIM:
-        raise ValueError(f"q score width must be {_SCORE_DIM}, got {q.shape[2]}")
+    if q.shape[2] not in _SCORE_DIMS:
+        raise ValueError(f"q score width must be 576 or 512, got {q.shape[2]}")
 
     if cache.shape[0] <= 0:
         raise ValueError("cache must contain at least one token")
     if cache.shape[1] != 1:
         raise ValueError(f"cache must have exactly one MQA head, got {cache.shape[1]}")
-    if cache.shape[2] != _SCORE_DIM:
-        raise ValueError(f"cache score width must be {_SCORE_DIM}, got {cache.shape[2]}")
+    if cache.shape[2] not in _SCORE_DIMS:
+        raise ValueError(f"cache score width must be 576 or 512, got {cache.shape[2]}")
+    if q.shape[2] != cache.shape[2]:
+        raise ValueError(
+            f"q and cache score widths must match, got {q.shape[2]} and {cache.shape[2]}"
+        )
 
     if selected_indices.shape[0] != q.shape[0]:
         raise ValueError(

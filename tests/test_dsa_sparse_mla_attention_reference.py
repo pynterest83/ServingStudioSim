@@ -52,7 +52,7 @@ def _manual_oracle(
             for cache_index in valid_indices:
                 dot = sum(
                     float(q[query_index, head_index, dim]) * float(cache[cache_index, 0, dim])
-                    for dim in range(_SCORE_DIM)
+                    for dim in range(q.shape[2])
                 )
                 scores.append(dot * softmax_scale)
             score_max = max(scores)
@@ -167,6 +167,38 @@ def test_signed_non_tied_values_match_independent_manual_oracle() -> None:
     expected = _manual_oracle(q, cache, indices, _SCALE)
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=torch.finfo(torch.bfloat16).eps)
+
+
+def test_rope_free_latent_scores_match_independent_manual_oracle() -> None:
+    """Catches a reference that still slices or pads to 576 for rope_dim 0."""
+    q = torch.zeros((2, 2, 512), dtype=torch.bfloat16)
+    cache = torch.zeros((4, 1, 512), dtype=torch.bfloat16)
+    q[:, :, 508:] = torch.tensor(
+        [[[1, -2, 3, 1], [-1, 3, 2, -2]], [[2, 1, -3, 2], [3, -1, 1, -2]]],
+        dtype=torch.bfloat16,
+    )
+    cache[:, 0, :4] = torch.tensor(
+        [[1, -2, 3, 4], [4, 3, -2, 1], [-1, 2, 5, -3], [3, -4, 2, 1]],
+        dtype=torch.bfloat16,
+    )
+    cache[:, 0, 508:] = torch.tensor(
+        [[2, -1, 1, 3], [-3, 2, 1, -1], [1, 4, -2, 2], [-2, -3, 2, 1]],
+        dtype=torch.bfloat16,
+    )
+    indices = torch.tensor([[[3, 1, -1]], [[2, 0, 1]]], dtype=torch.int32)
+
+    actual = dsa_sparse_mla_attention_reference(q, cache, indices, softmax_scale=_SCALE)
+    expected = _manual_oracle(q, cache, indices, _SCALE)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=torch.finfo(torch.bfloat16).eps)
+
+
+def test_q_and_cache_score_widths_must_match() -> None:
+    q = torch.zeros((1, 1, 512), dtype=torch.bfloat16)
+    cache = torch.zeros((2, 1, _SCORE_DIM), dtype=torch.bfloat16)
+    indices = torch.zeros((1, 1, 1), dtype=torch.int32)
+    with pytest.raises(ValueError, match="q and cache score widths must match"):
+        dsa_sparse_mla_attention_reference(q, cache, indices, softmax_scale=_SCALE)
 
 
 def test_output_contract_input_identity_immutability_and_no_aliasing() -> None:

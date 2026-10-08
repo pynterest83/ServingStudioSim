@@ -14,8 +14,9 @@
 //!   and routed experts run on vLLM's auxiliary stream (`Parallel`);
 //! - KDA: verify rows take conv update + recurrent KDA, prefill rows the
 //!   chunked core;
-//! - DSA: the kpool indexer at `next_n = K+1`, dense-MHA prefill or sparse
-//!   MQA through `FLASH_ATTN_MLA_SPARSE`, BF16 latent cache;
+//! - DSA: the kpool indexer over `K+1` rows per request (flattened to
+//!   single-token rows on SM90, where DeepGEMM has no `next_n = 6`),
+//!   dense-MHA prefill or sparse MQA through `FLASH_ATTN_MLA_SPARSE`, BF16 latent cache;
 //! - every TP all-reduce is FlashInfer's up to its sm90 fusion workspace and
 //!   a plain all-reduce above it (vLLM's FLASHINFER > CUSTOM > SYMM_MEM >
 //!   PYNCCL dispatch; custom and symm_mem have no L1 backend yet).
@@ -60,7 +61,7 @@ use crate::timing::kernels::{
     MhcFusedPostPreRmsNormKernel, MhcPreRmsNormKernel, MhcRmsNormKernelConfig,
     MhcRmsNormKernelInput, ResidualRmsNormKernel, ResidualRmsNormKernelConfig,
     ResidualRmsNormKernelInput, RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput,
-    SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
+    SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput, FA3_SPARSE_BACKEND,
 };
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Dim, Evaluator, FlatCostNode,
@@ -126,10 +127,16 @@ const QKV_NORM_BACKENDS: &[&str] = &["vllm_triton"];
 const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb_no_rope"];
 const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up_unpadded"];
 const MQA_LOGITS_BACKENDS: &[&str] = &["deepgemm_fp8"];
-const TOPK_BACKENDS: &[&str] = &["vllm_cuda"];
+/// vLLM v0.31's own `persistent_topk` op (host `vllm_env`): above 32 rows it
+/// launches the filtered/sampled kernels the H200 capture shows. vLLM's "auto"
+/// decode top-k takes `cooperative_topk` at <= 64 rows instead; no L1 backend
+/// times that path yet. `vllm_cuda` is a v0.23 build pinned to Torch 2.11.
+const TOPK_BACKENDS: &[&str] = &["vllm_fork_cuda"];
 const MQA_LOGITS_PREFILL_BACKENDS: &[&str] = &["deepgemm_fp8"];
 const TOPK_PREFILL_BACKENDS: &[&str] = &["vllm_cuda"];
 const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
+/// vLLM `FLASH_ATTN_MLA_SPARSE` on H200 (BF16 cache, rope-free latent).
+const SPARSE_ATTENTION_BACKENDS: &[&str] = &[FA3_SPARSE_BACKEND];
 const FUSED_MOE_BACKENDS: &[&str] = &["vllm_triton"];
 const MOE_ALIGN_BACKENDS: &[&str] = &["vllm_cuda"];
 const MOE_SUM_BACKENDS: &[&str] = &["vllm_cuda"];
@@ -296,6 +303,7 @@ pub fn build_configs(
             mqa_logits_prefill_backends: MQA_LOGITS_PREFILL_BACKENDS.to_vec(),
             topk_prefill_backends: TOPK_PREFILL_BACKENDS.to_vec(),
             mla_cache_append_backends: MLA_APPEND_BACKENDS.to_vec(),
+            sparse_attention_backends: SPARSE_ATTENTION_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
         },
         dense_ffn: mlp(divide("intermediate_size", model.intermediate_size)?),
@@ -376,8 +384,13 @@ pub fn build_configs(
         // Placeholder for `ncclAllGather` of the fp32 vocab shard: each rank
         // contributes its shard and receives the full row.
         mtp_logits_gather: ew(vocab_per_rank * fp32, model.vocab_size * fp32),
-        // Placeholder: argmax over one full fp32 logits row.
-        mtp_argmax: ew(model.vocab_size * fp32, 8),
+        // Placeholder: argmax over one full fp32 logits row (a `reduce_kernel`,
+        // ~16.5 us per call in the H200 case-03 capture). The bytes are split
+        // evenly between read and write: the triton elementwise L1 spreads its
+        // grid over output bytes, so a read-the-row, write-8-bytes shape
+        // measures at ~1 GB/s (28 ms for 32 rows) instead of a reduction's
+        // read bandwidth.
+        mtp_argmax: ew(model.vocab_size * fp32 / 2, model.vocab_size * fp32 / 2),
         mtp_step_glue: ew(DRAFT_STEP_GLUE_BYTES_PER_ROW, DRAFT_STEP_GLUE_BYTES_PER_ROW),
         model: model.clone(),
         parallel: parallel.clone(),
@@ -1440,7 +1453,9 @@ mod tests {
         let r = resolve_configs(&c);
         assert_eq!(r.routed_body.gate_up.num_local_experts.get(), 288);
         assert_eq!(r.routed_body.down.k.get(), 512);
-        assert_eq!(r.dsa.mqa_logits_decode.next_n, 6);
+        // H200 MTP 5: the decode indexer is flattened to next_n = 1.
+        assert!(r.dsa.flatten_decode_indexer);
+        assert_eq!(r.dsa.mqa_logits_decode.next_n, 1);
         assert_eq!(r.dsa.mla_cache_append.kv_dtype, DType::Bf16);
         assert_eq!(
             r.shared_expert.gate_up_quant.scale_format,
