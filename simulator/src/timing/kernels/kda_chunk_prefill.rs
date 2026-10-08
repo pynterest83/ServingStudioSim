@@ -1,9 +1,21 @@
 //! GLM-5.3-Flash Kimi Delta Attention (KDA) chunked prefill as ONE callable.
 //!
-//! Times one `chunk_kda_with_fused_gate` call exactly as the vLLM fork's
-//! prefill branch issues it: the vendored FLA Triton chain of 15 launches
-//! (q/k/v contiguous copies, qk l2norm, fused safe gate + chunk cumsum, K.Kt,
-//! triangular solve, w/u recompute, inter-chunk state scan, output). It is a
+//! Times the prefill core call the vLLM fork's prefill branch issues; the
+//! backend is the call `_resolve_kda_prefill_backend` picks:
+//! - `vllm_triton`: one `chunk_kda_with_fused_gate` call, the vendored FLA
+//!   Triton chain of 15 launches (q/k/v contiguous copies, qk l2norm, fused
+//!   safe gate + chunk cumsum, K.Kt, triangular solve, w/u recompute,
+//!   inter-chunk state scan, output) at a 64-token chunk. Beta arrives
+//!   sigmoided by a separate launch outside the call.
+//! - `vllm_flashkda`: `_flashkda_prefill`, 6 launches on H200 (q/k/v copies,
+//!   FlashKDA's internal beta transpose, `_flash_kda_fwd_prepare`,
+//!   `_flash_kda_fwd_recurrence`) at a 16-token chunk, taking raw beta
+//!   logits. vLLM's "auto" choice on Hopper for bf16 and head_dim 128.
+//!
+//! Both backends share one grid and cache shape below (whose chunk-count
+//! reasoning is written for the 64-token Triton chunk; for FlashKDA the
+//! `[2, 64]` length cell spans chunk counts 1..4 and is linear only on
+//! average). It is a
 //! separate kind from `gdn_chunk_delta_rule` (FlashInfer's single CUTLASS
 //! kernel with a scalar per-head gate) and from the six per-stage `gdn_chunk_*`
 //! kinds: KDA's gate is per channel and produced inside the callable from
@@ -185,6 +197,35 @@ mod tests {
             head_dim: 128.into(),
             dtype: DType::Bf16,
         }
+    }
+
+    /// Catches a FlashKDA backend that gets its own cache shape or grid (the
+    /// two backends of one config share one sweep), or whose payloads do not
+    /// route to the `vllm_flashkda` profiler row.
+    #[test]
+    fn flashkda_backend_shares_the_grid_and_routes_its_payloads() {
+        use crate::timing::cache::CacheKind;
+        let cfg = KdaChunkPrefillKernelConfig {
+            backends: vec!["vllm_flashkda"],
+            gpu_name: "NVIDIA H200".to_string(),
+            ..config()
+        };
+        let grid = KdaChunkPrefillSpec::sweep_grid(&cfg);
+        assert_eq!(
+            grid.axes(),
+            KdaChunkPrefillSpec::sweep_grid(&config()).axes()
+        );
+        for backend in ["vllm_triton", "vllm_flashkda"] {
+            assert_eq!(
+                KdaChunkPrefillSpec::cache_kind(backend),
+                CacheKind::Cache3DLinear
+            );
+        }
+        let payloads = KdaChunkPrefillSpec::enumerate(&cfg, &grid, "vllm_flashkda");
+        assert_eq!(payloads.len(), 720);
+        assert!(payloads
+            .iter()
+            .all(|payload| payload.backend() == Some("vllm_flashkda")));
     }
 
     fn input(

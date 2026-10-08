@@ -198,6 +198,8 @@ impl Qwen36GdnLocalWorklet {
             causal_conv: GdnCausalConvDecodeKernelConfig {
                 backends: cfg.causal_conv_decode_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
+                // Plain decode: one token per request (no speculative decoding).
+                query_len: 1,
                 channels: CONV_CHANNELS.into(),
                 kernel_size: cfg.conv_kernel_size.clone(),
                 dtype: cfg.activation_dtype,

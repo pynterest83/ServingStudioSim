@@ -12,7 +12,8 @@
 //!   all 288 experts on every rank and the intermediate sharded by TP. At
 //!   most 256 tokens the shared expert runs on the main stream while router
 //!   and routed experts run on vLLM's auxiliary stream (`Parallel`);
-//! - KDA: verify rows take conv update + recurrent KDA, prefill rows the
+//! - KDA: verify rows take conv update + recurrent KDA as one call over the
+//!   verifying requests at `query_len = K + 1`, prefill rows FlashKDA's
 //!   chunked core;
 //! - DSA: the kpool indexer over `K+1` rows per request (flattened to
 //!   single-token rows on SM90, where DeepGEMM has no `next_n = 6`),
@@ -119,8 +120,9 @@ const ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
 const MHC_BACKENDS: &[&str] = &["vllm_tilelang"];
 const RMS_NORM_BACKENDS: &[&str] = &["vllm_cuda"];
 const RESIDUAL_NORM_BACKENDS: &[&str] = &["vllm_cuda"];
-/// Stand-ins until FlashKDA and the verify-width axis land (plan M4).
-const KDA_PREFILL_BACKENDS: &[&str] = &["vllm_triton"];
+/// FlashKDA: `_resolve_kda_prefill_backend` "auto" on Hopper (bf16, head_dim
+/// 128, bounded gate); the capture runs `_flash_kda_fwd_*`.
+const KDA_PREFILL_BACKENDS: &[&str] = &["vllm_flashkda"];
 const KDA_DECODE_BACKENDS: &[&str] = &["vllm_triton"];
 const CONV_BACKENDS: &[&str] = &["vllm_triton"];
 const QKV_NORM_BACKENDS: &[&str] = &["vllm_triton"];
@@ -267,6 +269,7 @@ pub fn build_configs(
             head_dim: model.kda_head_dim.into(),
             gate_rank: model.kda_head_dim,
             conv_kernel_size: model.short_conv_kernel_size.into(),
+            verify_width: parallel.draft_tokens + 1,
             activation_dtype: ACTIVATION_DTYPE,
             gpu_name: gpu.clone(),
             bf16_gemm_backends: BF16_GEMM_BACKENDS.to_vec(),
@@ -1453,6 +1456,10 @@ mod tests {
         let r = resolve_configs(&c);
         assert_eq!(r.routed_body.gate_up.num_local_experts.get(), 288);
         assert_eq!(r.routed_body.down.k.get(), 512);
+        // KDA verify leaves run at query_len K + 1 = 6; prefill is FlashKDA.
+        assert_eq!(r.kda.recurrent_verify.query_len, 6);
+        assert_eq!(r.kda.conv_verify.query_len, 6);
+        assert_eq!(r.kda.chunk_prefill.backends, ["vllm_flashkda"]);
         // H200 MTP 5: the decode indexer is flattened to next_n = 1.
         assert!(r.dsa.flatten_decode_indexer);
         assert_eq!(r.dsa.mqa_logits_decode.next_n, 1);

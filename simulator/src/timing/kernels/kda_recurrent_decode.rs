@@ -1,10 +1,18 @@
-//! GLM-5.3-Flash KDA plain-decode `fused_recurrent_kda` call.
+//! GLM-5.3-Flash KDA `fused_recurrent_kda` call: plain decode or MTP verify.
 //!
-//! One semantic call: 4 `.contiguous()` copies of q/k/v/beta plus the KDA-mode
-//! fused recurrent kernel (5 launches) for batch >= 2, and a single launch at
-//! batch 1 where every view is already contiguous. Head geometry and dtype are
-//! static identity; decode batch size is the only runtime interpolation axis.
-//! The fp32 recurrent state is fixed by the model, so it is not a key.
+//! One semantic call. On the vLLM v0.31 fork it is a single
+//! `fused_recurrent_gated_delta_rule_fwd_kernel` launch at every batch: the
+//! kernel reads the row-strided q/k/v/beta views of the merged input
+//! projection in place. (The 3f667d7 image's older call made four
+//! `.contiguous()` copies first; rows it measured carry that image's
+//! `backend_version`.)
+//!
+//! `query_len` is the tokens per request: 1 for a plain decode step, K + 1 for
+//! the draft-verify step of K-draft speculative decoding, where each request
+//! runs its tokens serially and stores a state snapshot per token. It is
+//! static identity like the head geometry and dtype; decode batch size
+//! (requests) is the only runtime interpolation axis. The fp32 recurrent state
+//! is fixed by the model, so it is not a key.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -17,6 +25,8 @@ pub struct KdaRecurrentDecodeKernelConfig {
     #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
     pub gpu_name: String,
+    /// Tokens per request: 1 (plain decode) or K + 1 (verify K drafts).
+    pub query_len: u32,
     pub num_heads: Dim,
     pub head_dim: Dim,
     #[compute_dtype]
@@ -36,13 +46,11 @@ impl KernelSpec for KdaRecurrentDecodeSpec {
 
     const KIND: KernelKind = "kda_recurrent_decode";
 
-    /// Batch 1..512 in powers of two. Batch 1 stays a measured point because
-    /// it has no copy launches and so sits off the batch >= 2 line.
+    /// Batch 1..512 in powers of two plus 12 and 24, for every `query_len`.
     fn sweep_grid(_config: &Self::Config) -> SweepGrid {
-        // Powers of two plus 12 and 24: the batch-8..32 curve is concave (the
-        // four copy launches and the recurrent kernel fill the SMs at different
-        // batch sizes; B200 job 1138), so pow2 alone misses batch 12/24 by
-        // 11-16%.
+        // Powers of two plus 12 and 24: on the 3f667d7 image the batch-8..32
+        // curve was concave (B200 job 1138), so pow2 alone missed batch 12/24
+        // by 11-16%. The grid is kept so existing rows stay on it.
         let mut batches = Axis::pow2(0, 9);
         batches.extend([12.0, 24.0]);
         batches.sort_by(f64::total_cmp);
@@ -62,6 +70,7 @@ impl KernelSpec for KdaRecurrentDecodeSpec {
             ArgsPayload::new()
                 .with("backend", backend)
                 .with("batch_size", batch_size as u32)
+                .with("query_len", config.query_len)
                 .with("num_heads", config.num_heads.get())
                 .with("head_dim", config.head_dim.get())
                 .with("dtype", config.dtype.as_str())
@@ -86,6 +95,7 @@ mod tests {
         KdaRecurrentDecodeKernelConfig {
             backends: vec!["vllm_triton"],
             gpu_name: "NVIDIA B200".to_string(),
+            query_len: 1,
             num_heads: 16.into(),
             head_dim: 128.into(),
             dtype: DType::Bf16,
@@ -134,7 +144,14 @@ mod tests {
             let names: Vec<&str> = payload.fields().keys().map(String::as_str).collect();
             assert_eq!(
                 names,
-                ["backend", "batch_size", "dtype", "head_dim", "num_heads"]
+                [
+                    "backend",
+                    "batch_size",
+                    "dtype",
+                    "head_dim",
+                    "num_heads",
+                    "query_len"
+                ]
             );
             assert_eq!(payload.backend(), Some("vllm_triton"));
         }
@@ -143,7 +160,30 @@ mod tests {
         assert_eq!(first["num_heads"], Value::from(16_u32));
         assert_eq!(first["head_dim"], Value::from(128_u32));
         assert_eq!(first["dtype"], Value::from("bf16"));
+        assert_eq!(first["query_len"], Value::from(1_u32));
         assert_eq!(payloads[11].fields()["batch_size"], Value::from(512_u32));
+    }
+
+    /// Catches a verify width that changes the sweep instead of riding along as
+    /// static identity, or never reaches the Python `query_len` key (a verify
+    /// leaf would then read plain-decode rows).
+    #[test]
+    fn query_len_is_static_identity_forwarded_to_every_payload() {
+        let cfg = KdaRecurrentDecodeKernelConfig {
+            query_len: 6,
+            ..config()
+        };
+        let grid = KdaRecurrentDecodeSpec::sweep_grid(&cfg);
+        assert_eq!(
+            grid.axes(),
+            KdaRecurrentDecodeSpec::sweep_grid(&config()).axes()
+        );
+        let payloads = KdaRecurrentDecodeSpec::enumerate(&cfg, &grid, "vllm_triton");
+        assert_eq!(payloads.len(), 12);
+        for payload in &payloads {
+            assert_eq!(payload.fields()["query_len"], Value::from(6_u32));
+        }
+        assert_ne!(cfg, config());
     }
 
     /// Catches an Input that does not project batch_size onto the cache axis

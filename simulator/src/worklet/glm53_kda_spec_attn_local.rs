@@ -5,20 +5,27 @@
 //! the prefill rows take different cores in the same iteration:
 //!
 //! - spec-verify rows (K+1 tokens per request): `causal_conv1d_update` with
-//!   `query_start_loc`, then `fused_recurrent_kda` with `num_accepted_tokens`;
+//!   `query_start_loc`, then `fused_recurrent_kda` with `num_accepted_tokens`.
+//!   Both are costed as one call over the verifying requests at
+//!   `query_len = K + 1` (`gdn_causal_conv_decode`, `kda_recurrent_decode`);
 //! - prefill rows: `causal_conv1d_fn`, `gather_initial_states`, the FlashKDA
-//!   prefill (`kda_prefill_backend` auto on Hopper), `scatter_states`.
+//!   prefill (`kda_prefill_backend` auto on Hopper: `kda_chunk_prefill`
+//!   backend `vllm_flashkda`), `scatter_states`.
+//!
+//! The FlashKDA leaf's boundary already holds its q/k/v `.contiguous()` copies
+//! and its internal beta transpose (the four copy launches the capture shows
+//! before `_flash_kda_fwd_prepare`), and FlashKDA takes the raw beta logits,
+//! so no `_cast_sigmoid` launch runs: that one belongs to the Triton
+//! `chunk_kda_with_fused_gate` path only. The verify recurrence sigmoids beta
+//! in its kernel too. The verify rows carry no decodes into the prefill call
+//! (they take the spec path), so its `num_decode_sequences` is 0.
 //!
 //! A mixed iteration additionally splits the projections into the two token
 //! groups (`index_select` x6: qkv, g, beta for each group) and scatters the
 //! two core outputs back (two index copies); a pure verify step skips both.
 //!
-//! First-cut approximations, labeled until their L1 lands (plan M4):
-//! - the verify conv and recurrence cost a `batch = requests x (K+1)` launch of
-//!   the single-token kernels (no query-length axis yet);
-//! - the prefill core uses `kda_chunk_prefill` (`chunk_kda`), not FlashKDA;
-//! - split/merge/copy glue and the state gather/scatter are byte-sized
-//!   elementwise leaves, the gated RMSNorm too (as on B200).
+//! Approximations: split/merge glue and the state gather/scatter are
+//! byte-sized elementwise leaves, the gated RMSNorm too (as on B200).
 
 use crate::op::Op;
 use crate::timing::bridge::DType;
@@ -37,8 +44,6 @@ use super::glm53_common::{atomic, elementwise, push_or_zero, repeated};
 const STATE_TRANSFER_UNIT_BYTES: u32 = 4096;
 /// Mixed steps: `index_select` of qkv, g and beta into each token group.
 const SPLIT_SELECT_LAUNCHES: u32 = 6;
-/// Prefill-bearing contiguous copies ahead of the FlashKDA prefill.
-const PREFILL_COPY_LAUNCHES: u32 = 4;
 /// Mixed steps: the two group outputs scattered back into one buffer.
 const MERGE_COPY_LAUNCHES: u32 = 2;
 
@@ -51,6 +56,8 @@ pub struct Glm53KdaSpecAttnLocalWorkletConfig {
     /// Width of the `f_a` / `g_a` low-rank gate factors.
     pub gate_rank: u32,
     pub conv_kernel_size: Dim,
+    /// K + 1 tokens per verifying request (K = draft tokens).
+    pub verify_width: u32,
     pub activation_dtype: DType,
     pub gpu_name: String,
     pub bf16_gemm_backends: Vec<&'static str>,
@@ -71,7 +78,6 @@ pub struct Glm53KdaSpecAttnLocalWorkletResolved {
     pub conv_prefill: GdnCausalConvPrefillKernelConfig,
     pub recurrent_verify: KdaRecurrentDecodeKernelConfig,
     pub state_gather: ElementwiseKernelConfig,
-    pub prefill_copy: ElementwiseKernelConfig,
     pub chunk_prefill: KdaChunkPrefillKernelConfig,
     pub state_scatter: ElementwiseKernelConfig,
     pub merge_copy: ElementwiseKernelConfig,
@@ -79,7 +85,8 @@ pub struct Glm53KdaSpecAttnLocalWorkletResolved {
     pub o_proj: SingleGemmKernelConfig,
     /// fp32 `[H, K, V]` recurrent state of one request on this rank.
     pub ssm_state_bytes_per_request: u32,
-    /// bf16 `(kernel_size - 1)`-token conv window of one request on this rank.
+    /// bf16 conv window of one request on this rank: `kernel_size - 1 + K`
+    /// samples, the `kda_state_shape(num_spec = K)` allocation.
     pub conv_state_bytes_per_request: u32,
 }
 
@@ -90,7 +97,7 @@ pub struct Glm53KdaSpecAttnLocalWorkletInput {
     pub prefill_sequence_lengths: Vec<u32>,
     /// Requests in speculative verify (each contributes `verify_width` rows).
     pub verify_requests: u32,
-    /// K+1 rows per verifying request.
+    /// K+1 rows per verifying request; must equal the config's `verify_width`.
     pub verify_width: u32,
 }
 
@@ -104,7 +111,6 @@ pub struct Glm53KdaSpecAttnLocalWorklet {
     pub conv_prefill: Op<GdnCausalConvPrefillKernel>,
     pub recurrent_verify: Op<KdaRecurrentDecodeKernel>,
     pub state_gather: Op<ElementwiseKernel>,
-    pub prefill_copy: Op<ElementwiseKernel>,
     pub chunk_prefill: Op<KdaChunkPrefillKernel>,
     pub state_scatter: Op<ElementwiseKernel>,
     pub merge_copy: Op<ElementwiseKernel>,
@@ -141,9 +147,11 @@ impl Glm53KdaSpecAttnLocalWorklet {
             0,
             "KDA state must be a whole number of transfer units"
         );
+        assert!(cfg.verify_width >= 1, "verify_width is K + 1 >= 1");
         let conv = |backends: &Vec<&'static str>| GdnCausalConvDecodeKernelConfig {
             backends: backends.clone(),
             gpu_name: cfg.gpu_name.clone(),
+            query_len: cfg.verify_width,
             channels: conv_channels.into(),
             kernel_size: cfg.conv_kernel_size.clone(),
             dtype: cfg.activation_dtype,
@@ -167,12 +175,12 @@ impl Glm53KdaSpecAttnLocalWorklet {
             recurrent_verify: KdaRecurrentDecodeKernelConfig {
                 backends: cfg.decode_core_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
+                query_len: cfg.verify_width,
                 num_heads: cfg.num_heads.clone(),
                 head_dim: cfg.head_dim.clone(),
                 dtype: cfg.activation_dtype,
             },
             state_gather: ew(STATE_TRANSFER_UNIT_BYTES, STATE_TRANSFER_UNIT_BYTES),
-            prefill_copy: ew(per_head_bytes, per_head_bytes),
             chunk_prefill: KdaChunkPrefillKernelConfig {
                 backends: cfg.prefill_core_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
@@ -186,7 +194,9 @@ impl Glm53KdaSpecAttnLocalWorklet {
             gated_norm: ew(2 * per_head_bytes, per_head_bytes),
             o_proj: gemm(cfg.hidden.clone(), value_width.into()),
             ssm_state_bytes_per_request,
-            conv_state_bytes_per_request: conv_channels * (cfg.conv_kernel_size.get() - 1) * bpe,
+            conv_state_bytes_per_request: conv_channels
+                * (cfg.conv_kernel_size.get() - 1 + (cfg.verify_width - 1))
+                * bpe,
             raw_cfg: cfg.clone(),
         }
     }
@@ -234,13 +244,6 @@ impl Glm53KdaSpecAttnLocalWorklet {
                 n,
                 "state_gather",
                 r.state_gather,
-                ElementwiseKernel::build,
-                bridge,
-            )?,
-            prefill_copy: atomic(
-                n,
-                "prefill_copy",
-                r.prefill_copy,
                 ElementwiseKernel::build,
                 bridge,
             )?,
@@ -298,7 +301,6 @@ impl Glm53KdaSpecAttnLocalWorklet {
                 self.conv_prefill.compile(builder),
                 self.recurrent_verify.compile(builder),
                 self.state_gather.compile(builder),
-                repeated(&self.prefill_copy, PREFILL_COPY_LAUNCHES, builder),
                 self.chunk_prefill.compile(builder),
                 self.state_scatter.compile(builder),
                 repeated(&self.merge_copy, MERGE_COPY_LAUNCHES, builder),
@@ -309,8 +311,12 @@ impl Glm53KdaSpecAttnLocalWorklet {
     }
 
     pub fn eval(&self, input: &Glm53KdaSpecAttnLocalWorkletInput, ev: &mut Evaluator) {
-        let w = derive_work(input, self.resolved.ssm_state_bytes_per_request)
-            .unwrap_or_else(|reason| panic!("invalid Glm53KdaSpecAttnLocalWorkletInput: {reason}"));
+        let w = derive_work(
+            input,
+            self.resolved.raw_cfg.verify_width,
+            self.resolved.ssm_state_bytes_per_request,
+        )
+        .unwrap_or_else(|reason| panic!("invalid Glm53KdaSpecAttnLocalWorkletInput: {reason}"));
         let rows = SingleGemmKernelInput { m: w.total_tokens };
         let all_tokens = ElementwiseKernelInput {
             num_tokens: w.total_tokens,
@@ -322,11 +328,11 @@ impl Glm53KdaSpecAttnLocalWorklet {
         push_or_zero(&self.f_b, rows.clone(), false, ev);
         push_or_zero(&self.g_b, rows.clone(), false, ev);
         push_or_zero(&self.split_select, all_tokens.clone(), !mixed, ev);
-        // Approximation: K+1 sequential rows per request as K+1 one-row requests.
+        // One call over the verifying requests; query_len = K + 1 is config.
         push_or_zero(
             &self.conv_verify,
             GdnCausalConvDecodeKernelInput {
-                batch_size: w.verify_rows,
+                batch_size: w.verify_requests,
             },
             no_verify,
             ev,
@@ -343,7 +349,7 @@ impl Glm53KdaSpecAttnLocalWorklet {
         push_or_zero(
             &self.recurrent_verify,
             KdaRecurrentDecodeKernelInput {
-                batch_size: w.verify_rows,
+                batch_size: w.verify_requests,
             },
             no_verify,
             ev,
@@ -352,14 +358,6 @@ impl Glm53KdaSpecAttnLocalWorklet {
             num_tokens: w.prefill_state_units,
         };
         push_or_zero(&self.state_gather, state.clone(), no_prefill, ev);
-        push_or_zero(
-            &self.prefill_copy,
-            ElementwiseKernelInput {
-                num_tokens: w.prefill_tokens,
-            },
-            no_prefill,
-            ev,
-        );
         push_or_zero(
             &self.chunk_prefill,
             KdaChunkPrefillKernelInput {
@@ -380,6 +378,7 @@ impl Glm53KdaSpecAttnLocalWorklet {
 struct Work {
     total_tokens: u32,
     prefill_tokens: u32,
+    verify_requests: u32,
     verify_rows: u32,
     max_prefill_length: u32,
     /// 4-KiB units of every prefill request's state.
@@ -388,6 +387,7 @@ struct Work {
 
 fn derive_work(
     input: &Glm53KdaSpecAttnLocalWorkletInput,
+    verify_width: u32,
     state_bytes: u32,
 ) -> Result<Work, String> {
     let mut prefill_tokens = 0_u32;
@@ -401,8 +401,11 @@ fn derive_work(
             .ok_or("prefill token sum overflows u32")?;
         max_prefill_length = max_prefill_length.max(length);
     }
-    if input.verify_requests > 0 && input.verify_width == 0 {
-        return Err("verify_width must be positive when requests verify".into());
+    if input.verify_requests > 0 && input.verify_width != verify_width {
+        return Err(format!(
+            "verify_width {} must equal the configured K + 1 = {verify_width}",
+            input.verify_width
+        ));
     }
     let verify_rows = input
         .verify_requests
@@ -420,6 +423,7 @@ fn derive_work(
     Ok(Work {
         total_tokens,
         prefill_tokens,
+        verify_requests: input.verify_requests,
         verify_rows,
         max_prefill_length,
         prefill_state_units,
@@ -437,11 +441,12 @@ mod tests {
             head_dim: 128.into(),
             gate_rank: 128,
             conv_kernel_size: 4.into(),
+            verify_width: 6,
             activation_dtype: DType::Bf16,
             gpu_name: "NVIDIA H200".into(),
             bf16_gemm_backends: vec!["torch_linear_vllm"],
             conv_backends: vec!["vllm_triton"],
-            prefill_core_backends: vec!["vllm_triton"],
+            prefill_core_backends: vec!["vllm_flashkda"],
             decode_core_backends: vec!["vllm_triton"],
             elementwise_backends: vec!["triton"],
         }
@@ -455,10 +460,12 @@ mod tests {
                 verify_requests: 15,
                 verify_width: 6,
             },
+            6,
             1 << 20,
         )
         .unwrap();
         assert_eq!((w.prefill_tokens, w.verify_rows), (2304, 90));
+        assert_eq!(w.verify_requests, 15);
         assert_eq!(w.total_tokens, 2394);
         assert_eq!(w.max_prefill_length, 2048);
         // Only prefill requests gather and scatter state.
@@ -469,9 +476,36 @@ mod tests {
                 verify_requests: 3,
                 verify_width: 0,
             },
+            6,
             1 << 20
         )
         .is_err());
+        // A verify width the leaves were not built for is refused, not
+        // silently read off the K+1 = 6 rows.
+        assert!(derive_work(
+            &Glm53KdaSpecAttnLocalWorkletInput {
+                prefill_sequence_lengths: Vec::new(),
+                verify_requests: 3,
+                verify_width: 4,
+            },
+            6,
+            1 << 20
+        )
+        .is_err());
+    }
+
+    /// Catches verify leaves that still cost B*(K+1) single-token rows, a
+    /// prefill core that is not FlashKDA's row, or a conv state without the
+    /// K rollback samples.
+    #[test]
+    fn verify_leaves_carry_query_len_and_the_state_widens_by_k() {
+        let r = Glm53KdaSpecAttnLocalWorklet::resolve_config(&cfg());
+        assert_eq!(r.conv_verify.query_len, 6);
+        assert_eq!(r.recurrent_verify.query_len, 6);
+        assert_eq!(r.chunk_prefill.backends, ["vllm_flashkda"]);
+        // 3 * 16 * 128 channels x (4 - 1 + 5) bf16 samples.
+        assert_eq!(r.conv_state_bytes_per_request, 6144 * 8 * 2);
+        assert_eq!(r.ssm_state_bytes_per_request, 16 * 128 * 128 * 4);
     }
 
     #[test]
@@ -488,7 +522,8 @@ mod tests {
         let root = worklet.compile(&mut builder);
         let tree = builder.finish(root);
         let names: Vec<_> = tree.slots.iter().map(|slot| slot.name.as_str()).collect();
-        assert_eq!(names.len(), 14);
+        assert_eq!(names.len(), 13);
+        assert!(!names.contains(&"m.kda.prefill_copy"));
         assert!(names.contains(&"m.kda.recurrent_verify"));
         assert!(names.contains(&"m.kda.chunk_prefill"));
     }

@@ -1,7 +1,8 @@
 """Torch semantic-composite runner for Qwen GDN causal-convolution decode.
 
-This backend times every launch made by the standalone Torch reference. It is
-not vLLM's fused causal-convolution update kernel, and its logical traffic/FLOP
+This backend times every launch made by the standalone Torch reference on the
+plain decode step (``query_len == 1``) only. It is not vLLM's fused
+causal-convolution update kernel, and its logical traffic/FLOP
 rates do not describe the fused kernel's physical implementation. Production
 simulation must select the fused backend once one is registered.
 """
@@ -48,11 +49,17 @@ class _Operands:
 
 def _validate_args(
     batch_size: int,
+    query_len: int,
     channels: int,
     kernel_size: int,
     dtype: DType | str,
     state_dtype: DType | str,
 ) -> _ValidatedArgs:
+    if int(query_len) != 1:
+        raise ValueError(
+            "torch gdn_causal_conv_decode measures the plain decode step only "
+            f"(query_len=1), got query_len={query_len}"
+        )
     batch_size = int(batch_size)
     channels = int(channels)
     kernel_size = int(kernel_size)
@@ -136,18 +143,20 @@ def _build_operands(torch: Any, args: _ValidatedArgs, *, device: Any) -> _Operan
     )
 
 
-def _semantic_flops(*, batch_size: int, channels: int, kernel_size: int) -> int:
+def _semantic_flops(*, batch_size: int, query_len: int, channels: int, kernel_size: int) -> int:
     """Nominal semantic FLOPs, not physical Torch instruction count.
 
-    Each channel's FP32 dot counts ``W`` multiplies and ``W-1`` additions. SiLU
-    counts one sigmoid and one multiply. Casts and the state shift count as zero.
+    Each token's channel FP32 dot counts ``W`` multiplies and ``W-1``
+    additions. SiLU counts one sigmoid and one multiply. Casts and the state
+    shift count as zero.
     """
-    return batch_size * channels * (2 * kernel_size + 1)
+    return batch_size * query_len * channels * (2 * kernel_size + 1)
 
 
 def _logical_bytes(
     *,
     batch_size: int,
+    query_len: int,
     channels: int,
     kernel_size: int,
     dtype: DType,
@@ -155,21 +164,25 @@ def _logical_bytes(
 ) -> float:
     """Logical boundary traffic, excluding Torch composite intermediates.
 
-    Counts input/weight/state reads, output/state writes, and fixed-int32 slot
-    indices. The shared depthwise weight is counted once rather than per row.
+    Counts input/weight reads, output writes, each request's ``W - 1`` state
+    samples read and ``W - 2 + query_len`` written, and the int32 slot indices
+    (plus, for a verify step, the accepted counts and query offsets). The
+    shared depthwise weight is counted once rather than per row.
     """
-    data_elements = 2 * batch_size * channels + channels * kernel_size
-    state_elements = 2 * batch_size * channels * (kernel_size - 1)
-    slot_index_bytes = batch_size * 4
+    tokens = batch_size * query_len
+    data_elements = 2 * tokens * channels + channels * kernel_size
+    state_elements = batch_size * channels * ((kernel_size - 1) + (kernel_size - 2 + query_len))
+    index_bytes = batch_size * 4
+    if query_len > 1:
+        index_bytes += batch_size * 4 + (batch_size + 1) * 4
     return (
-        data_elements * dtype.size_bytes()
-        + state_elements * state_dtype.size_bytes()
-        + slot_index_bytes
+        data_elements * dtype.size_bytes() + state_elements * state_dtype.size_bytes() + index_bytes
     )
 
 
 def profile_gdn_causal_conv_decode(
     batch_size: int,
+    query_len: int,
     channels: int,
     kernel_size: int,
     dtype: DType | str,
@@ -178,6 +191,7 @@ def profile_gdn_causal_conv_decode(
     """Profile the complete multi-launch Torch causal-conv decode reference."""
     args = _validate_args(
         batch_size=batch_size,
+        query_len=query_len,
         channels=channels,
         kernel_size=kernel_size,
         dtype=dtype,
@@ -218,11 +232,13 @@ def profile_gdn_causal_conv_decode(
         )
         flops = _semantic_flops(
             batch_size=args.batch_size,
+            query_len=1,
             channels=args.channels,
             kernel_size=args.kernel_size,
         )
         logical_bytes = _logical_bytes(
             batch_size=args.batch_size,
+            query_len=1,
             channels=args.channels,
             kernel_size=args.kernel_size,
             dtype=args.dtype,

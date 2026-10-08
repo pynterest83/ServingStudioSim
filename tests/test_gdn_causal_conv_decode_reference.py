@@ -212,3 +212,100 @@ def test_rejects_non_tensor_input() -> None:
 
     with pytest.raises(TypeError, match="weight must be a torch.Tensor"):
         gdn_causal_conv_decode_reference(*inputs)  # type: ignore[arg-type]
+
+
+def _verify_inputs(*, batch_size: int, query_len: int, kernel_size: int = 4, channels: int = 3):
+    generator = torch.Generator().manual_seed(20261008)
+    x = torch.randn(batch_size * query_len, channels, generator=generator).to(torch.bfloat16)
+    weight = torch.randn(channels, kernel_size, generator=generator).to(torch.bfloat16)
+    width = kernel_size - 1 + (query_len - 1)
+    state = torch.randn(batch_size * 2 + 1, channels, width, generator=generator).to(torch.bfloat16)
+    slot_indices = torch.arange(1, 2 * batch_size + 1, 2, dtype=torch.int32)
+    return x, weight, state, slot_indices
+
+
+def _manual_verify(x, weight, state, slot_indices, accepted):
+    """Token-by-token sliding window, written from first principles."""
+    kernel_size = weight.shape[1]
+    batch_size = slot_indices.shape[0]
+    query_len = x.shape[0] // batch_size
+    expected_state = state.clone()
+    outputs = []
+    for b, slot in enumerate(slot_indices.tolist()):
+        offset = int(accepted[b]) - 1
+        window = [state[slot, :, offset + i] for i in range(kernel_size - 1)]
+        for t in range(query_len):
+            window.append(x[b * query_len + t])
+            taps = torch.stack(window[-kernel_size:], dim=-1)
+            outputs.append(F.silu((taps.float() * weight.float()).sum(-1)).to(torch.bfloat16))
+        kept = torch.stack(window[1:], dim=-1)  # W - 2 history + L tokens
+        expected_state[slot, :, : kept.shape[-1]] = kept
+    return torch.stack(outputs), expected_state
+
+
+@pytest.mark.parametrize("accepted", [[1, 1], [3, 6], [6, 2]])
+def test_verify_slides_the_window_from_the_accepted_offset(accepted: list[int]) -> None:
+    # Defect: reading the window at offset 0 whatever was accepted, keeping only
+    # W - 1 samples (no rollback room), or convolving a token with the wrong
+    # history.
+    x, weight, state, slots = _verify_inputs(batch_size=2, query_len=6)
+    accepted_tokens = torch.tensor(accepted, dtype=torch.int32)
+    expected_output, expected_state = _manual_verify(x, weight, state, slots, accepted_tokens)
+
+    output, returned = gdn_causal_conv_decode_reference(
+        x, weight, state, slots, num_accepted_tokens=accepted_tokens
+    )
+
+    assert returned is state
+    torch.testing.assert_close(output, expected_output, rtol=0, atol=0)
+    assert torch.equal(state, expected_state)
+
+
+def test_verify_with_one_token_matches_plain_decode() -> None:
+    # Defect: the two branches disagreeing on the same one-token step.
+    x, weight, state, slots = _verify_inputs(batch_size=3, query_len=1)
+    plain_state = state.clone()
+    plain_output, _ = gdn_causal_conv_decode_reference(x, weight, plain_state, slots)
+
+    output, _ = gdn_causal_conv_decode_reference(
+        x, weight, state, slots, num_accepted_tokens=torch.ones(3, dtype=torch.int32)
+    )
+
+    torch.testing.assert_close(output, plain_output, rtol=0, atol=0)
+    assert torch.equal(state, plain_state)
+
+
+def test_verify_accepts_a_token_major_state_view() -> None:
+    # Defect: rejecting vLLM's default "SD" storage passed as a transpose.
+    x, weight, state, slots = _verify_inputs(batch_size=2, query_len=6)
+    sd_state = state.transpose(-1, -2).contiguous().transpose(-1, -2)
+    accepted = torch.ones(2, dtype=torch.int32)
+    expected_output, expected_state = _manual_verify(x, weight, state, slots, accepted)
+
+    output, _ = gdn_causal_conv_decode_reference(
+        x, weight, sd_state, slots, num_accepted_tokens=accepted
+    )
+
+    torch.testing.assert_close(output, expected_output, rtol=0, atol=0)
+    assert torch.equal(sd_state, expected_state)
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"accepted": [0, 1]}, r"must lie in \[1, 6\]"),
+        ({"accepted": [1, 7]}, r"must lie in \[1, 6\]"),
+        ({"width": 7}, ">= 8"),
+        ({"tokens": 11}, "not a whole number"),
+    ],
+)
+def test_verify_rejects_inconsistent_metadata(override: dict, message: str) -> None:
+    x, weight, state, slots = _verify_inputs(batch_size=2, query_len=6)
+    if "width" in override:
+        state = state[..., : override["width"]]
+    if "tokens" in override:
+        x = x[: override["tokens"]]
+    accepted = torch.tensor(override.get("accepted", [1, 1]), dtype=torch.int32)
+
+    with pytest.raises(ValueError, match=message):
+        gdn_causal_conv_decode_reference(x, weight, state, slots, num_accepted_tokens=accepted)

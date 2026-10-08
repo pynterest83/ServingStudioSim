@@ -1,8 +1,13 @@
-//! Gated DeltaNet fused causal-convolution decode kernel.
+//! Gated DeltaNet / KDA fused causal-convolution decode kernel.
 //!
-//! The convolution geometry and dtypes are static config identity. Decode batch
-//! size is the sole physical runtime interpolation axis. `state_dtype` remains
-//! an explicit profiler/cache key, but is not a standard KV capability axis.
+//! The convolution geometry, dtypes and `query_len` are static config
+//! identity. `query_len` is the tokens per request: 1 for a plain decode step,
+//! K + 1 for the draft-verify step of K-draft speculative decoding (the same
+//! `_causal_conv1d_update_kernel` with `num_accepted_tokens` and
+//! `query_start_loc`, over a state widened by K samples). Decode batch size
+//! (requests) is the sole physical runtime interpolation axis. `state_dtype`
+//! remains an explicit profiler/cache key, but is not a standard KV capability
+//! axis.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -15,6 +20,8 @@ pub struct GdnCausalConvDecodeKernelConfig {
     #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
     pub gpu_name: String,
+    /// Tokens per request: 1 (plain decode) or K + 1 (verify K drafts).
+    pub query_len: u32,
     pub channels: Dim,
     pub kernel_size: Dim,
     #[compute_dtype]
@@ -52,6 +59,7 @@ impl KernelSpec for GdnCausalConvDecodeSpec {
             ArgsPayload::new()
                 .with("backend", backend)
                 .with("batch_size", batch_size as u32)
+                .with("query_len", config.query_len)
                 .with("channels", config.channels.get())
                 .with("kernel_size", config.kernel_size.get())
                 .with("dtype", config.dtype.as_str())
@@ -77,6 +85,7 @@ mod tests {
         GdnCausalConvDecodeKernelConfig {
             backends: vec!["torch", "vllm_triton"],
             gpu_name: "NVIDIA H200".to_string(),
+            query_len: 1,
             channels: 8192.into(),
             kernel_size: 4.into(),
             dtype: DType::Bf16,
@@ -104,6 +113,7 @@ mod tests {
             serde_json::json!({
                 "backends": ["torch", "vllm_triton"],
                 "gpu_name": "NVIDIA H200",
+                "query_len": 1,
                 "channels": {"value": 8192, "expression": null, "bindings": {}},
                 "kernel_size": {"value": 4, "expression": null, "bindings": {}},
                 "dtype": "bf16",
@@ -180,10 +190,11 @@ mod tests {
                     "channels",
                     "dtype",
                     "kernel_size",
+                    "query_len",
                     "state_dtype",
                 ]
             );
-            assert_eq!(payload.fields().len(), 6);
+            assert_eq!(payload.fields().len(), 7);
             assert_eq!(payload.backend(), Some("vllm_triton"));
         }
 
@@ -194,7 +205,29 @@ mod tests {
         assert_eq!(first.get("kernel_size"), Some(&Value::from(4_u32)));
         assert_eq!(first.get("dtype"), Some(&Value::from("bf16")));
         assert_eq!(first.get("state_dtype"), Some(&Value::from("bf16")));
+        assert_eq!(first.get("query_len"), Some(&Value::from(1_u32)));
         assert_eq!(payloads[8].fields()["batch_size"], Value::from(256_u32));
+    }
+
+    /// Catches a verify width that changes the batch sweep instead of riding
+    /// along as static identity, or never reaches the Python `query_len` key
+    /// (a verify leaf would then read plain-decode rows).
+    #[test]
+    fn query_len_is_static_identity_forwarded_to_every_payload() {
+        let cfg = GdnCausalConvDecodeKernelConfig {
+            query_len: 6,
+            ..config()
+        };
+        let grid = GdnCausalConvDecodeSpec::sweep_grid(&cfg);
+        assert_eq!(
+            grid.axes(),
+            GdnCausalConvDecodeSpec::sweep_grid(&config()).axes()
+        );
+        let payloads = GdnCausalConvDecodeSpec::enumerate(&cfg, &grid, "vllm_triton");
+        assert_eq!(payloads.len(), 9);
+        for payload in &payloads {
+            assert_eq!(payload.fields()["query_len"], Value::from(6_u32));
+        }
     }
 
     #[test]

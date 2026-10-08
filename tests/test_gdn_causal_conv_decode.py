@@ -22,6 +22,7 @@ from profiling.runners.metrics import ComputeMetrics
 
 _SPEC = {
     "batch_size": 1,
+    "query_len": 1,
     "channels": 8192,
     "kernel_size": 4,
     "dtype": "bf16",
@@ -32,6 +33,7 @@ _SPEC = {
 def test_args_field_order_and_coercion() -> None:
     assert [field.name for field in fields(GdnCausalConvDecodeArgs)] == [
         "batch_size",
+        "query_len",
         "channels",
         "kernel_size",
         "dtype",
@@ -42,6 +44,7 @@ def test_args_field_order_and_coercion() -> None:
         _SPEC
         | {
             "batch_size": "1",
+            "query_len": "1",
             "channels": "8192",
             "kernel_size": "4",
             "dtype": "bfloat16",
@@ -50,6 +53,7 @@ def test_args_field_order_and_coercion() -> None:
     )
     assert args == GdnCausalConvDecodeArgs(
         batch_size=1,
+        query_len=1,
         channels=8192,
         kernel_size=4,
         dtype=DType.BF16,
@@ -304,7 +308,7 @@ def test_vllm_runner_derived_shapes_slots_and_contiguous_cpu_operands() -> None:
     shapes = _operand_shapes(args)
     assert shapes.x == (3, 8)
     assert shapes.weight == (8, 4)
-    assert shapes.state_storage == (4, 8, 3)
+    assert shapes.state_storage == (4, 3, 8)
     assert shapes.slot_indices == (3,)
     assert shapes.output == (3, 8)
     assert _valid_slot_indices(3) == (1, 2, 3)
@@ -312,12 +316,15 @@ def test_vllm_runner_derived_shapes_slots_and_contiguous_cpu_operands() -> None:
     operands = _build_operands(torch, args, device=torch.device("cpu"))
     assert tuple(operands.x.shape) == shapes.x
     assert tuple(operands.weight.shape) == shapes.weight
-    assert tuple(operands.state.shape) == shapes.state_storage
+    # Defect: timing the dim-first ("DS") layout when vLLM's default is "SD":
+    # the call gets the (-1, -2) transpose of [slots, width, channels] storage.
+    assert tuple(operands.state.shape) == (4, 8, 3)
+    assert operands.state.stride() == (24, 1, 8)
     assert tuple(operands.slot_indices.shape) == shapes.slot_indices
     assert operands.x.is_contiguous()
     assert operands.x.stride(1) == 1
     assert operands.weight.is_contiguous()
-    assert operands.state.is_contiguous()
+    assert operands.num_accepted_tokens is None and operands.query_start_loc is None
     assert operands.slot_indices.dtype is torch.int32
     assert operands.slot_indices.tolist() == [1, 2, 3]
     assert torch.isfinite(operands.x).all()
@@ -339,6 +346,7 @@ def test_vllm_correctness_guard_checks_aliases_and_restores_cpu_operands() -> No
 
     args = _validate_args(
         batch_size=2,
+        query_len=1,
         channels=8,
         kernel_size=4,
         dtype="bf16",
@@ -451,16 +459,31 @@ def test_semantic_metrics_are_explicit_logical_counts() -> None:
         _semantic_flops,
     )
 
-    assert _semantic_flops(batch_size=2, channels=3, kernel_size=4) == 54
+    assert _semantic_flops(batch_size=2, query_len=1, channels=3, kernel_size=4) == 54
     assert (
         _logical_bytes(
             batch_size=2,
+            query_len=1,
             channels=3,
             kernel_size=4,
             dtype=DType.BF16,
             state_dtype=DType.BF16,
         )
         == 128
+    )
+    # Verify: 6 tokens per request, the 3-sample window read and 8 samples
+    # written per request, plus accepted counts and query offsets.
+    assert _semantic_flops(batch_size=2, query_len=6, channels=3, kernel_size=4) == 324
+    assert (
+        _logical_bytes(
+            batch_size=2,
+            query_len=6,
+            channels=3,
+            kernel_size=4,
+            dtype=DType.BF16,
+            state_dtype=DType.BF16,
+        )
+        == (2 * 12 * 3 + 12) * 2 + 2 * 3 * (3 + 8) * 2 + 8 + 8 + 12
     )
 
 
@@ -496,6 +519,7 @@ def test_generated_facades_and_read_only_missing_query(tmp_path, monkeypatch) ->
     table = Table(find_kernel_profiler_spec(KIND, "torch"), perf_api.DB_PATH)
     assert table.args_columns == [
         "batch_size",
+        "query_len",
         "channels",
         "kernel_size",
         "dtype",
@@ -538,3 +562,102 @@ def test_db_round_trip_uses_exact_schema_and_compute_metrics(
         )
         == 0
     )
+
+
+def test_torch_backend_rejects_verify_steps() -> None:
+    # Defect: the plain-decode Torch baseline silently timing a one-token step
+    # for a verify row it does not implement.
+    from profiling.runners.attention.gdn_causal_conv_decode_torch import _validate_args
+
+    with pytest.raises(ValueError, match="plain decode step only"):
+        _validate_args(**(_SPEC | {"query_len": 6}))
+
+
+def test_vllm_verify_operands_follow_the_spec_decode_call() -> None:
+    # Defect: a verify row timed with a state too narrow for the sliding window
+    # (the kernel would read past it), contiguous conv slots instead of column 0
+    # of spec_state_indices, or no accepted counts / query offsets.
+    import torch
+
+    from profiling.runners.attention.gdn_causal_conv_decode_vllm_triton import (
+        _build_operands,
+        _operand_shapes,
+        _valid_slot_indices,
+        _validate_args,
+    )
+
+    args = _validate_args(**(_SPEC | {"batch_size": 3, "query_len": 6, "channels": 8}))
+    shapes = _operand_shapes(args)
+    assert shapes.x == shapes.output == (18, 8)
+    assert shapes.state_storage == (19, 3 + 5, 8)
+    assert _valid_slot_indices(3, 6) == (1, 7, 13)
+
+    operands = _build_operands(torch, args, device=torch.device("cpu"))
+    assert tuple(operands.state.shape) == (19, 8, 8)
+    assert operands.state.stride() == (64, 1, 8)
+    assert operands.spec_state_indices.tolist() == [
+        [1, 2, 3, 4, 5, 6],
+        [7, 8, 9, 10, 11, 12],
+        [13, 14, 15, 16, 17, 18],
+    ]
+    assert operands.slot_indices.tolist() == [1, 7, 13]
+    assert operands.slot_indices.stride() == (6,)
+    assert operands.num_accepted_tokens.tolist() == [1, 1, 1]
+    assert operands.query_start_loc.tolist() == [0, 6, 12, 18]
+    for tensor in (operands.slot_indices, operands.num_accepted_tokens, operands.query_start_loc):
+        assert tensor.dtype is torch.int32
+
+
+def test_vllm_verify_invoke_forwards_the_spec_decode_keywords() -> None:
+    # Defect: a verify row that drops num_accepted_tokens / query_start_loc /
+    # max_query_len and so times the plain-decode branch of the kernel.
+    import torch
+
+    import profiling.runners.attention.gdn_causal_conv_decode_vllm_triton as runner
+
+    args = runner._validate_args(**(_SPEC | {"batch_size": 2, "query_len": 6, "channels": 8}))
+    operands = runner._build_operands(torch, args, device=torch.device("cpu"))
+    seen: dict = {}
+
+    def fake_fused(*positional, **keyword):
+        seen["positional"] = positional
+        seen.update(keyword)
+        return positional[0]
+
+    runner._invoke_fused(fake_fused, operands)
+    assert seen["positional"] == (operands.x, operands.state, operands.weight)
+    assert seen["conv_state_indices"] is operands.slot_indices
+    assert seen["num_accepted_tokens"] is operands.num_accepted_tokens
+    assert seen["query_start_loc"] is operands.query_start_loc
+    assert seen["max_query_len"] == 6
+    assert seen["bias"] is None and seen["activation"] == "silu"
+
+
+def test_vllm_verify_correctness_guard_accepts_the_reference_and_restores() -> None:
+    # Defect: the verify guard comparing against the plain-decode semantics, or
+    # leaving the operands advanced before timing.
+    import torch
+
+    import profiling.runners.attention.gdn_causal_conv_decode_vllm_triton as runner
+    from profiling.runners.attention.gdn_causal_conv_decode_reference import (
+        gdn_causal_conv_decode_reference,
+    )
+
+    args = runner._validate_args(**(_SPEC | {"batch_size": 2, "query_len": 6, "channels": 8}))
+    operands = runner._build_operands(torch, args, device=torch.device("cpu"))
+    x_before, state_before = operands.x.clone(), operands.state.clone()
+
+    def fake_fused(x, state, weight, **keyword):
+        output, _ = gdn_causal_conv_decode_reference(
+            x.clone(),
+            weight,
+            state,
+            keyword["conv_state_indices"],
+            num_accepted_tokens=keyword["num_accepted_tokens"],
+        )
+        x.copy_(output)
+        return x
+
+    runner._check_correctness(torch, fake_fused, operands, args, synchronize=lambda: None)
+    assert torch.equal(operands.x, x_before)
+    assert torch.equal(operands.state, state_before)

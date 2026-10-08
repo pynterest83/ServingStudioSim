@@ -1,6 +1,24 @@
-"""One-launch vLLM Triton runner for Qwen GDN causal-convolution decode.
+"""One-launch vLLM Triton runner for GDN/KDA causal-convolution decode and verify.
 
-The timed callable is exactly vLLM's fused causal-convolution state update.
+The timed callable is exactly vLLM's fused causal-convolution state update,
+``causal_conv1d_update``, on one of the two branches the GDN/KDA layers take:
+
+- ``query_len == 1`` (plain decode): ``x`` is ``[B, channels]`` and the call
+  passes only ``conv_state_indices`` (``[B]``, slots ``1..B``).
+- ``query_len > 1`` (speculative verify, as ``Glm5NextLinearAttention._forward``
+  calls it): ``x`` is ``[B * query_len, channels]``, ``conv_state_indices`` is
+  column 0 of the ``[B, query_len]`` ``spec_state_indices`` (a strided view;
+  slots ``1..B*query_len``), ``num_accepted_tokens`` is ``[B]`` of ones,
+  ``query_start_loc`` is ``arange(0, T + 1, query_len)`` and
+  ``max_query_len = query_len``.
+
+The conv state uses vLLM's default "SD" layout (``VLLM_SSM_CONV_STATE_LAYOUT``
+unset): ``[slots, width, channels]`` storage, passed as its ``(-1, -2)``
+transpose as ``_forward`` does. ``width`` is ``kernel_size - 1 + (query_len -
+1)``, the ``kda_state_shape(num_spec=K)`` allocation. ``x`` is a contiguous
+token-major buffer; production passes a column slice of the input projection,
+which changes only the token stride the kernel is given.
+
 Allocation, the semantic correctness guard, and operand restoration are setup
 work outside CUPTI and energy measurement. Reported FLOPs and bytes are semantic
 logical counts, not physical Triton instructions or device traffic.
@@ -36,21 +54,34 @@ _KERNEL_NAME = "_causal_conv1d_update_kernel"
 _SUPPORTED_KERNEL_SIZES = frozenset(range(2, 7))
 _OUTPUT_ATOL = 1e-2
 _OUTPUT_RTOL = 1e-2
+# The verify step's accepted-token count. It only shifts the window the kernel
+# reads (offset ``accepted - 1``), so it is fixed, not an arg.
+NUM_ACCEPTED_TOKENS = 1
 
 
 @dataclass(frozen=True)
 class _ValidatedArgs:
     batch_size: int
+    query_len: int
     channels: int
     kernel_size: int
     dtype: DType
     state_dtype: DType
+
+    @property
+    def num_tokens(self) -> int:
+        return self.batch_size * self.query_len
+
+    @property
+    def is_verify(self) -> bool:
+        return self.query_len > 1
 
 
 @dataclass(frozen=True)
 class _OperandShapes:
     x: tuple[int, int]
     weight: tuple[int, int]
+    # SD storage: [slots, width, channels]; the call gets its (-1, -2) transpose.
     state_storage: tuple[int, int, int]
     slot_indices: tuple[int]
     output: tuple[int, int]
@@ -60,12 +91,19 @@ class _OperandShapes:
 class _Operands:
     x: Any
     weight: Any
+    # The dim-first [slots, channels, width] view the call receives.
     state: Any
     slot_indices: Any
+    # Verify only: the [B, query_len] spec_state_indices whose column 0 is
+    # slot_indices, the accepted-token counts and the query start offsets.
+    spec_state_indices: Any = None
+    num_accepted_tokens: Any = None
+    query_start_loc: Any = None
 
 
 def _validate_args(
     batch_size: int,
+    query_len: int,
     channels: int,
     kernel_size: int,
     dtype: DType | str,
@@ -73,6 +111,7 @@ def _validate_args(
 ) -> _ValidatedArgs:
     validated = _ValidatedArgs(
         batch_size=int(batch_size),
+        query_len=int(query_len),
         channels=int(channels),
         kernel_size=int(kernel_size),
         dtype=DType.from_value(dtype),
@@ -83,6 +122,8 @@ def _validate_args(
             "batch_size and channels must be > 0, got "
             f"batch_size={validated.batch_size}, channels={validated.channels}"
         )
+    if validated.query_len < 1:
+        raise ValueError(f"query_len must be >= 1, got {validated.query_len}")
     if validated.kernel_size not in _SUPPORTED_KERNEL_SIZES:
         raise ValueError(
             "kernel_size must be supported by the production Triton kernel "
@@ -100,20 +141,21 @@ def _validate_args(
 
 def _operand_shapes(args: _ValidatedArgs) -> _OperandShapes:
     return _OperandShapes(
-        x=(args.batch_size, args.channels),
+        x=(args.num_tokens, args.channels),
         weight=(args.channels, args.kernel_size),
         state_storage=(
-            args.batch_size + 1,
+            args.num_tokens + 1,
+            args.kernel_size - 1 + (args.query_len - 1),
             args.channels,
-            args.kernel_size - 1,
         ),
         slot_indices=(args.batch_size,),
-        output=(args.batch_size, args.channels),
+        output=(args.num_tokens, args.channels),
     )
 
 
-def _valid_slot_indices(batch_size: int) -> tuple[int, ...]:
-    return tuple(range(1, batch_size + 1))
+def _valid_slot_indices(batch_size: int, query_len: int = 1) -> tuple[int, ...]:
+    """Each request's conv slot: column 0 of ``arange(1, B*L + 1).view(B, L)``."""
+    return tuple(range(1, batch_size * query_len + 1, query_len))
 
 
 def _load_fused_callable() -> Any:
@@ -136,21 +178,47 @@ def _build_operands(torch: Any, args: _ValidatedArgs, *, device: Any) -> _Operan
     weight = torch.empty(shapes.weight, dtype=activation_dtype, device=device).uniform_(
         -0.125, 0.125, generator=generator
     )
-    state = torch.empty(
-        shapes.state_storage, dtype=args.state_dtype.torch(), device=device
-    ).uniform_(-0.25, 0.25, generator=generator)
-    slot_indices = torch.tensor(
-        _valid_slot_indices(args.batch_size), dtype=torch.int32, device=device
+    state = (
+        torch.empty(shapes.state_storage, dtype=args.state_dtype.torch(), device=device)
+        .uniform_(-0.25, 0.25, generator=generator)
+        .transpose(-1, -2)
     )
+    if not args.is_verify:
+        slot_indices = torch.tensor(
+            _valid_slot_indices(args.batch_size), dtype=torch.int32, device=device
+        )
+        return _Operands(
+            x=x.contiguous(), weight=weight.contiguous(), state=state, slot_indices=slot_indices
+        )
+    spec_state_indices = torch.arange(
+        1, args.num_tokens + 1, dtype=torch.int32, device=device
+    ).view(args.batch_size, args.query_len)
     return _Operands(
         x=x.contiguous(),
         weight=weight.contiguous(),
-        state=state.contiguous(),
-        slot_indices=slot_indices,
+        state=state,
+        slot_indices=spec_state_indices[:, 0],
+        spec_state_indices=spec_state_indices,
+        num_accepted_tokens=torch.full(
+            (args.batch_size,), NUM_ACCEPTED_TOKENS, dtype=torch.int32, device=device
+        ),
+        query_start_loc=torch.arange(
+            0, args.num_tokens + 1, args.query_len, dtype=torch.int32, device=device
+        ),
     )
 
 
 def _invoke_fused(fused_callable: Any, operands: _Operands) -> Any:
+    if operands.num_accepted_tokens is None:
+        return fused_callable(
+            operands.x,
+            operands.state,
+            operands.weight,
+            bias=None,
+            activation="silu",
+            conv_state_indices=operands.slot_indices,
+            validate_data=False,
+        )
     return fused_callable(
         operands.x,
         operands.state,
@@ -158,6 +226,9 @@ def _invoke_fused(fused_callable: Any, operands: _Operands) -> Any:
         bias=None,
         activation="silu",
         conv_state_indices=operands.slot_indices,
+        num_accepted_tokens=operands.num_accepted_tokens,
+        query_start_loc=operands.query_start_loc,
+        max_query_len=operands.spec_state_indices.shape[1],
         validate_data=False,
     )
 
@@ -194,11 +265,13 @@ def _check_correctness(
         weight_snapshot,
         reference_state,
         indices_snapshot,
+        num_accepted_tokens=operands.num_accepted_tokens,
     )
     try:
         returned = _invoke_fused(fused_callable, operands)
         synchronize()
-        if returned is operands.x:
+        if not args.is_verify and returned is operands.x:
+            # The plain branch unsqueezes x to [B, C, 1] and returns the squeeze.
             raise AssertionError("fused output must be a distinct view of x")
         if not _shares_storage(torch, returned, operands.x):
             raise AssertionError("fused output must alias x storage")
@@ -233,13 +306,14 @@ def _check_correctness(
 
 def profile_gdn_causal_conv_decode_vllm_triton(
     batch_size: int,
+    query_len: int,
     channels: int,
     kernel_size: int,
     dtype: DType | str,
     state_dtype: DType | str,
 ) -> ComputeMetrics:
-    """Profile vLLM's fused causal-convolution decode."""
-    args = _validate_args(batch_size, channels, kernel_size, dtype, state_dtype)
+    """Profile vLLM's fused causal-convolution decode or verify."""
+    args = _validate_args(batch_size, query_len, channels, kernel_size, dtype, state_dtype)
     try:
         import torch
     except ImportError as exc:
@@ -269,11 +343,13 @@ def profile_gdn_causal_conv_decode_vllm_triton(
 
     flops = _semantic_flops(
         batch_size=args.batch_size,
+        query_len=args.query_len,
         channels=args.channels,
         kernel_size=args.kernel_size,
     )
     logical_bytes = _logical_bytes(
         batch_size=args.batch_size,
+        query_len=args.query_len,
         channels=args.channels,
         kernel_size=args.kernel_size,
         dtype=args.dtype,
