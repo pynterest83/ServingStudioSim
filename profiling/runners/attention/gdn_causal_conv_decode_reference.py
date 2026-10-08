@@ -1,4 +1,4 @@
-"""Torch semantics for Qwen3.5/3.6 GDN causal-convolution decode."""
+"""Torch semantics for GDN/KDA causal-convolution decode and speculative verify."""
 
 from __future__ import annotations
 
@@ -15,8 +15,10 @@ def gdn_causal_conv_decode_reference(
     weight: torch.Tensor,
     state: torch.Tensor,
     slot_indices: torch.Tensor,
+    *,
+    num_accepted_tokens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run one non-speculative GDN depthwise-convolution decode step.
+    """Run one GDN depthwise-convolution decode or speculative verify step.
 
     ``x`` is ``[B, C]``, depthwise ``weight`` is ``[C, W]``, dim-first
     slot-indexed ``state`` is ``[S, C, W - 1]``, and ``slot_indices`` is
@@ -29,20 +31,48 @@ def gdn_causal_conv_decode_reference(
     by identity; output is newly allocated, and ``x`` and ``weight`` are not
     mutated. All validation completes before state mutation.
 
-    The first reference intentionally excludes speculative or multi-token
-    decode, varlen metadata, bias, activations other than SiLU, non-BF16 data,
-    duplicate/invalid slots, non-dim-first state, and kernel widths outside the
-    production Triton implementation's supported range of 2 through 6.
-    """
-    _validate(x, weight, state, slot_indices)
+    With ``num_accepted_tokens`` (int32 ``[B]``) this is the speculative verify
+    step that ``causal_conv1d_update`` runs with ``num_accepted_tokens``,
+    ``query_start_loc`` and ``max_query_len``: ``x`` is ``[B * L, C]``, the
+    ``L`` tokens of each request adjacent, and the state is at least ``W - 2 +
+    L`` samples wide (vLLM allocates ``W - 1 + num_spec``). Request ``b`` reads
+    its window at offset ``o = num_accepted_tokens[b] - 1``: the ``W - 1``
+    samples ``state[slot, :, o : o + W - 1]`` precede its first token, and each
+    token convolves the ``W - 1`` samples before it. The state then holds
+    ``state[slot, :, o + 1 : o + W - 1]`` followed by all ``L`` tokens, written
+    from sample 0; samples past ``W - 2 + L`` are left alone.
 
-    selected_state = state.index_select(0, slot_indices.to(torch.int64))
-    window = torch.cat((selected_state, x.unsqueeze(-1)), dim=-1)
-    accumulator = torch.sum(window.float() * weight.float().unsqueeze(0), dim=-1)
-    output = F.silu(accumulator).to(torch.bfloat16)
+    The reference excludes non-uniform query lengths, bias, activations other
+    than SiLU, non-BF16 data, duplicate/invalid slots, non-dim-first state, and
+    kernel widths outside the production Triton implementation's supported
+    range of 2 through 6.
+    """
+    _validate(x, weight, state, slot_indices, num_accepted_tokens)
+
+    slots = slot_indices.to(torch.int64)
+    batch_size, channels = slot_indices.shape[0], x.shape[1]
+    query_len = x.shape[0] // batch_size
+    history = weight.shape[1] - 1
+    selected_state = state.index_select(0, slots)
+    if num_accepted_tokens is None:
+        prior = selected_state
+    else:
+        offsets = num_accepted_tokens.to(torch.int64) - 1
+        positions = offsets.view(-1, 1, 1) + torch.arange(history, device=x.device)
+        prior = selected_state.gather(-1, positions.expand(batch_size, channels, history))
+    tokens = x.reshape(batch_size, query_len, channels).transpose(1, 2)  # [B, C, L]
+    window = torch.cat((prior, tokens), dim=-1)  # [B, C, W - 1 + L]
+    taps = window.unfold(-1, weight.shape[1], 1)  # [B, C, L, W]
+    accumulator = torch.sum(taps.float() * weight.float().view(1, channels, 1, -1), dim=-1)
+    output = F.silu(accumulator).to(torch.bfloat16).transpose(1, 2).reshape(x.shape)
     updated_state = window[..., 1:]
 
-    state.index_copy_(0, slot_indices.to(torch.int64), updated_state)
+    if num_accepted_tokens is None:
+        state.index_copy_(0, slots, updated_state)
+    else:
+        written = selected_state.clone()
+        written[..., : updated_state.shape[-1]] = updated_state
+        state.index_copy_(0, slots, written)
     return output, state
 
 
@@ -51,6 +81,7 @@ def _validate(
     weight: object,
     state: object,
     slot_indices: object,
+    num_accepted_tokens: object,
 ) -> None:
     tensors = {
         "x": x,
@@ -93,11 +124,35 @@ def _validate(
     if x.device.type == "meta":
         raise ValueError("meta tensors are not supported")
 
-    batch_size, channels = x.shape
-    if slot_indices.shape != (batch_size,):
-        raise ValueError(
-            f"slot_indices must have shape ({batch_size},), got {tuple(slot_indices.shape)}"
-        )
+    num_tokens, channels = x.shape
+    batch_size = slot_indices.shape[0]
+    if num_accepted_tokens is None:
+        query_len = 1
+        if slot_indices.shape != (num_tokens,):
+            raise ValueError(
+                f"slot_indices must have shape ({num_tokens},), got {tuple(slot_indices.shape)}"
+            )
+    else:
+        if num_tokens % batch_size:
+            raise ValueError(
+                f"x holds {num_tokens} tokens, not a whole number per {batch_size} requests"
+            )
+        query_len = num_tokens // batch_size
+        if not isinstance(num_accepted_tokens, torch.Tensor):
+            raise TypeError("num_accepted_tokens must be a torch.Tensor")
+        if num_accepted_tokens.dtype is not torch.int32:
+            raise TypeError(
+                f"num_accepted_tokens dtype must be torch.int32, got {num_accepted_tokens.dtype}"
+            )
+        if num_accepted_tokens.shape != (batch_size,):
+            raise ValueError(
+                f"num_accepted_tokens must have shape ({batch_size},), "
+                f"got {tuple(num_accepted_tokens.shape)}"
+            )
+        if num_accepted_tokens.device != x.device:
+            raise ValueError("num_accepted_tokens must be on the same device as x")
+        if torch.any((num_accepted_tokens < 1) | (num_accepted_tokens > query_len)).item():
+            raise ValueError(f"num_accepted_tokens must lie in [1, {query_len}]")
     if weight.shape[0] != channels:
         raise ValueError(f"weight must have {channels} channels, got {weight.shape[0]}")
 
@@ -108,11 +163,19 @@ def _validate(
             f"({min(_SUPPORTED_KERNEL_SIZES)}..{max(_SUPPORTED_KERNEL_SIZES)}), "
             f"got {kernel_size}"
         )
-    expected_state_shape = (state.shape[0], channels, kernel_size - 1)
-    if state.shape != expected_state_shape:
-        raise ValueError(
-            f"state must use dim-first shape {expected_state_shape}, got {tuple(state.shape)}"
-        )
+    if num_accepted_tokens is None:
+        expected_state_shape = (state.shape[0], channels, kernel_size - 1)
+        if state.shape != expected_state_shape:
+            raise ValueError(
+                f"state must use dim-first shape {expected_state_shape}, got {tuple(state.shape)}"
+            )
+    else:
+        min_width = kernel_size - 2 + query_len
+        if state.shape[1] != channels or state.shape[2] < min_width:
+            raise ValueError(
+                f"state must use dim-first shape ({state.shape[0]}, {channels}, >= {min_width}), "
+                f"got {tuple(state.shape)}"
+            )
 
     if torch.any(slot_indices <= 0).item():
         raise ValueError("slot_indices must not select reserved slot zero or negative slots")

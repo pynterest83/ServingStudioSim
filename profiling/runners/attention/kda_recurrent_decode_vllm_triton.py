@@ -1,4 +1,4 @@
-"""vLLM-fork Triton runner for the GLM-5.3-Flash KDA recurrent decode.
+"""vLLM-fork Triton runner for the GLM-5.3-Flash KDA recurrent decode / verify.
 
 This runner only allocates tensors, times one public call, and returns
 metrics. DB writes, subprocess selection and registry routing live in L1b.
@@ -6,36 +6,43 @@ metrics. DB writes, subprocess selection and registry routing live in L1b.
 It times ``fused_recurrent_kda`` from
 ``vllm.models.glm5next.nvidia.ops.third_party.kda``. The operands are laid out
 the way ``Glm5NextLinearAttention.forward`` / ``_forward`` hand them over on a
-plain decode step:
+plain decode step (``query_len == 1``) or a pure MTP verify step
+(``query_len == K + 1``, no non-spec tokens, so the spec tensors are the
+layer's tensors without an ``index_select``):
 
 - ``projected`` is the merged ``in_proj_qkvbfg_a`` output
-  ``[B, 3*H*K + H + 2*K]`` (q | k | v | beta | f_a | g_a). ``causal_conv1d_update``
-  overwrites its q|k|v slice in place (``out = x``), so q/k/v are row-strided
-  ``[1,B,H,K]`` views of that buffer. The raw bf16 beta is the strided
-  ``[1,B,H]`` column slice next to them. The callable's four ``.contiguous()``
-  calls are therefore four real copies, the four ``elementwise_kernel``
-  launches the capture shows before the recurrent kernel.
-- ``g`` is the contiguous bf16 ``f_b_proj`` output ``[1,B,H,K]``. It holds raw
+  ``[T, 3*H*K + H + 2*K]`` (q | k | v | beta | f_a | g_a), ``T = B *
+  query_len``. ``causal_conv1d_update`` overwrites its q|k|v slice in place
+  (``out = x``), so q/k/v are row-strided ``[1,T,H,K]`` views of that buffer.
+  The raw bf16 beta is the strided ``[1,T,H]`` column slice next to them.
+  v0.31's ``fused_recurrent_kda`` passes their token strides to the kernel, so
+  none of them is copied.
+- ``g`` is the contiguous bf16 ``f_b_proj`` output ``[1,T,H,K]``. It holds raw
   logits, and the kernel computes the gate from them (``compute_gate=True``).
 - ``A_log`` is ``[1,1,H,1]`` and ``dt_bias`` is ``[H*K]``, both fp32.
 - ``initial_state`` is the whole fp32 ``[slots,H,V,K]`` pool, updated in place.
-  Slot 0 is the NULL block. ``ssm_state_indices`` is int32 ``[B]``, a fixed
-  permutation of slots ``1..B``. ``cu_seqlens`` is ``arange(B+1)`` int32.
-- ``out`` is the contiguous ``[1,B,H,V]`` layer output buffer.
+  Slot 0 is the NULL block. Plain decode: ``ssm_state_indices`` is int32
+  ``[B]``, a fixed permutation of slots ``1..B``, and ``num_accepted_tokens``
+  is not passed. Verify: ``ssm_state_indices`` is int32 ``[B, query_len]``, a
+  fixed permutation of slots ``1..T``, and ``num_accepted_tokens`` is int32
+  ``[B]`` of ones (it only selects the column the state is read from).
+- ``cu_seqlens`` is ``arange(0, T+1, query_len)`` int32
+  (``spec_query_start_loc[:B+1]`` on the verify branch).
+- ``out`` is the contiguous ``[1,T,H,V]`` layer output buffer.
   ``sigmoid_beta=True``, ``lower_bound=-5.0``, ``use_qk_l2norm_in_kernel=True``.
 
-Timing is the CUPTI sum over the five launches of one call
-(``kernel_name=None``). Every call advances the states in place, as
-production does. The delta rule with unit-norm k and beta in (0, 1) is
-contractive, so repeated timing calls keep the state finite.
+Timing is the CUPTI sum over every launch of one call (``kernel_name=None``),
+which on the v0.31 fork is the single recurrent kernel. Every call advances
+the states in place, as production does. The delta rule with unit-norm k and
+beta in (0, 1) is contractive, so repeated timing calls keep the state finite.
 
 Autotune state. The recurrent kernel on this path is not ``@autotune``d in
 the pinned fork, but the call lives in the same module as the autotuned chunk
 kernels. To keep a future autotuned config from depending on grid order, the
 registry row disables autotune persistence and the runner makes one anchor call
-at batch 32 (the capture's decode batch) per worker and (num_heads, head_dim,
-dtype) before any row, like the chunk-prefill runner. The note in
-``backend_version`` records the anchor and the selected-config digest
+at batch 32, query_len 1 (the capture's decode batch) per worker and
+(num_heads, head_dim, dtype) before any row, like the chunk-prefill runner. The
+note in ``backend_version`` records the anchor and the selected-config digest
 (``configs=0`` while nothing on the path is autotuned).
 
 FLOPs and bytes are semantic logical counts, not physical Triton work.
@@ -71,18 +78,31 @@ LOWER_BOUND = -5.0
 # tests/models/kimi_k3/test_kda.py::test_kda_spec_decode_correctness.
 OUTPUT_RMSE_RATIO_TOL = 1e-3
 STATE_RMSE_RATIO_TOL = 3e-3
-# Autotune anchor batch: the capture's decode batch. Heads, head dim and dtype
+# Autotune anchor: the capture's plain-decode batch. Heads, head dim and dtype
 # come from the spec.
 AUTOTUNE_ANCHOR_BATCH = 32
+AUTOTUNE_ANCHOR_QUERY_LEN = 1
+# The verify step's accepted-token count. It only selects the state column the
+# kernel reads (``state_indices[n, accepted - 1]``), so it is fixed, not an arg.
+NUM_ACCEPTED_TOKENS = 1
 _PIN = AutotunePin((_MODULE, "vllm.third_party.flash_linear_attention"))
 
 
 @dataclass(frozen=True)
 class KdaRecurrentDecodeShape:
     batch_size: int
+    query_len: int
     num_heads: int
     head_dim: int
     dtype: DType
+
+    @property
+    def num_tokens(self) -> int:
+        return self.batch_size * self.query_len
+
+    @property
+    def is_verify(self) -> bool:
+        return self.query_len > 1
 
     @property
     def projection(self) -> int:
@@ -106,24 +126,29 @@ class _Operands:
     dt_bias: Any
     state_pool: Any
     state_indices: Any
+    num_accepted_tokens: Any
     cu_seqlens: Any
     out: Any
 
 
 def validate_args(
     batch_size: int,
+    query_len: int,
     num_heads: int,
     head_dim: int,
     dtype: DType | str,
 ) -> KdaRecurrentDecodeShape:
     shape = KdaRecurrentDecodeShape(
         batch_size=_exact_int("batch_size", batch_size),
+        query_len=_exact_int("query_len", query_len),
         num_heads=_exact_int("num_heads", num_heads),
         head_dim=_exact_int("head_dim", head_dim),
         dtype=DType.from_value(dtype),
     )
     if shape.batch_size < 1:
         raise ValueError("batch_size must be >= 1")
+    if shape.query_len < 1:
+        raise ValueError("query_len must be >= 1")
     if shape.num_heads < 1:
         raise ValueError("num_heads must be >= 1")
     # fused_recurrent_kda_fwd takes BK = next_power_of_2(K) (so NK == 1 for any
@@ -142,8 +167,9 @@ def state_slots(batch_size: int) -> tuple[int, ...]:
 
 
 def build_operands(torch: Any, shape: KdaRecurrentDecodeShape, *, device: Any) -> _Operands:
-    batch, heads, dim, projection = (
+    batch, tokens, heads, dim, projection = (
         shape.batch_size,
+        shape.num_tokens,
         shape.num_heads,
         shape.head_dim,
         shape.projection,
@@ -153,11 +179,11 @@ def build_operands(torch: Any, shape: KdaRecurrentDecodeShape, *, device: Any) -
     def normal(*size: int, dtype: Any) -> Any:
         return torch.randn(*size, generator=generator, dtype=torch.float32, device=device).to(dtype)
 
-    projected = normal(batch, shape.projected_width, dtype=torch.bfloat16)
+    projected = normal(tokens, shape.projected_width, dtype=torch.bfloat16)
     qkv = projected[:, : 3 * projection]
-    q, k, v = (part.reshape(1, batch, heads, dim) for part in qkv.split(projection, dim=-1))
+    q, k, v = (part.reshape(1, tokens, heads, dim) for part in qkv.split(projection, dim=-1))
     beta = projected[:, 3 * projection : 3 * projection + heads].unsqueeze(0)
-    g = normal(batch, projection, dtype=torch.bfloat16).reshape(1, batch, heads, dim)
+    g = normal(tokens, projection, dtype=torch.bfloat16).reshape(1, tokens, heads, dim)
     # Mamba/Kimi-style A init: exp(A_log) uniform in [1, 16].
     a_log = (
         torch.empty(1, 1, heads, 1, dtype=torch.float32, device=device)
@@ -165,10 +191,17 @@ def build_operands(torch: Any, shape: KdaRecurrentDecodeShape, *, device: Any) -
         .log()
     )
     dt_bias = normal(projection, dtype=torch.float32) * 0.1
-    state_pool = normal(batch + 1, heads, dim, dim, dtype=torch.float32)
-    state_indices = torch.tensor(state_slots(batch), dtype=torch.int32, device=device)
-    cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=device)
-    out = torch.empty(1, batch, heads, dim, dtype=torch.bfloat16, device=device)
+    state_pool = normal(tokens + 1, heads, dim, dim, dtype=torch.float32)
+    state_indices = torch.tensor(state_slots(tokens), dtype=torch.int32, device=device)
+    num_accepted_tokens = None
+    if shape.is_verify:
+        # spec_state_indices_tensor: one slot per (request, token).
+        state_indices = state_indices.view(batch, shape.query_len)
+        num_accepted_tokens = torch.full(
+            (batch,), NUM_ACCEPTED_TOKENS, dtype=torch.int32, device=device
+        )
+    cu_seqlens = torch.arange(0, tokens + 1, shape.query_len, dtype=torch.int32, device=device)
+    out = torch.empty(1, tokens, heads, dim, dtype=torch.bfloat16, device=device)
     return _Operands(
         projected=projected,
         q=q,
@@ -180,13 +213,20 @@ def build_operands(torch: Any, shape: KdaRecurrentDecodeShape, *, device: Any) -
         dt_bias=dt_bias,
         state_pool=state_pool,
         state_indices=state_indices,
+        num_accepted_tokens=num_accepted_tokens,
         cu_seqlens=cu_seqlens,
         out=out,
     )
 
 
 def invoke(callable_: Any, operands: _Operands) -> Any:
-    """The exact keyword set kda.py passes on the plain-decode branch."""
+    """The exact keyword set kda.py passes on the plain-decode branch, plus
+    ``num_accepted_tokens`` on the spec-verify branch."""
+    verify = (
+        {}
+        if operands.num_accepted_tokens is None
+        else {"num_accepted_tokens": operands.num_accepted_tokens}
+    )
     return callable_(
         q=operands.q,
         k=operands.k,
@@ -197,6 +237,7 @@ def invoke(callable_: Any, operands: _Operands) -> Any:
         use_qk_l2norm_in_kernel=True,
         cu_seqlens=operands.cu_seqlens,
         ssm_state_indices=operands.state_indices,
+        **verify,
         out=operands.out,
         sigmoid_beta=True,
         a_log=operands.a_log,
@@ -221,6 +262,8 @@ def check_correctness(
         name: getattr(operands, name).clone()
         for name in ("projected", "g", "a_log", "dt_bias", "state_indices", "cu_seqlens")
     }
+    if operands.num_accepted_tokens is not None:
+        immutable["num_accepted_tokens"] = operands.num_accepted_tokens.clone()
     expected_o, expected_pool = kda_recurrent_decode_reference(
         operands.q.squeeze(0),
         operands.k.squeeze(0),
@@ -232,16 +275,17 @@ def check_correctness(
         pool_snapshot,
         operands.state_indices,
         lower_bound=LOWER_BOUND,
+        num_accepted_tokens=operands.num_accepted_tokens,
     )
     try:
         output, final_state = invoke(callable_, operands)
         torch.cuda.synchronize()
         if output is not operands.out or final_state is not operands.state_pool:
             raise AssertionError("fused_recurrent_kda must write out/state in place")
-        batch, heads, dim = shape.batch_size, shape.num_heads, shape.head_dim
-        if tuple(output.shape) != (1, batch, heads, dim) or output.dtype is not torch.bfloat16:
+        tokens, heads, dim = shape.num_tokens, shape.num_heads, shape.head_dim
+        if tuple(output.shape) != (1, tokens, heads, dim) or output.dtype is not torch.bfloat16:
             raise AssertionError(f"unexpected output {tuple(output.shape)} {output.dtype}")
-        slots = operands.state_indices.long()
+        slots = operands.state_indices.long().flatten()
         actual_state = operands.state_pool[slots]
         if not (torch.isfinite(output).all() and torch.isfinite(actual_state).all()):
             raise AssertionError("non-finite KDA output or state")
@@ -265,12 +309,13 @@ def check_correctness(
 
 def profile_kda_recurrent_decode_vllm_triton(
     batch_size: int,
+    query_len: int,
     num_heads: int,
     head_dim: int,
     dtype: DType | str,
 ) -> ComputeMetrics:
-    """Profile one GLM-5.3-Flash KDA recurrent-decode call."""
-    shape = validate_args(batch_size, num_heads, head_dim, dtype)
+    """Profile one GLM-5.3-Flash KDA recurrent decode or verify call."""
+    shape = validate_args(batch_size, query_len, num_heads, head_dim, dtype)
     try:
         import torch
     except ImportError as exc:
@@ -309,11 +354,9 @@ def profile_kda_recurrent_decode_vllm_triton(
     )
 
 
-def pin_autotune(
-    torch: Any, callable_: Any, shape: KdaRecurrentDecodeShape, *, device: Any
-) -> str:
+def pin_autotune(torch: Any, callable_: Any, shape: KdaRecurrentDecodeShape, *, device: Any) -> str:
     """Tune once per worker and state key at the anchor, before any other call."""
-    anchor = replace(shape, batch_size=AUTOTUNE_ANCHOR_BATCH)
+    anchor = replace(shape, batch_size=AUTOTUNE_ANCHOR_BATCH, query_len=AUTOTUNE_ANCHOR_QUERY_LEN)
 
     def tune() -> None:
         invoke(callable_, build_operands(torch, anchor, device=device))
@@ -324,26 +367,28 @@ def pin_autotune(
 
 
 def row_provenance(
-    batch_size: int, num_heads: int, head_dim: int, dtype: DType | str
+    batch_size: int, query_len: int, num_heads: int, head_dim: int, dtype: DType | str
 ) -> str | None:
     """The autotune note for a row this worker just measured (registry hook)."""
-    del batch_size
+    del batch_size, query_len
     return _PIN.note((num_heads, head_dim, DType.from_value(dtype).value))
 
 
 def semantic_flops(shape: KdaRecurrentDecodeShape) -> float:
-    """Logical FLOPs of one step per (sequence, head): the K x V decay, the
+    """Logical FLOPs of one step per (token, head): the K x V decay, the
     k^T.S read, the rank-1 update and the q.S read-out (1 + 3 * 2 = 7 K*V)."""
     k = v = shape.head_dim
-    return float(shape.batch_size * shape.num_heads * 7 * k * v)
+    return float(shape.num_tokens * shape.num_heads * 7 * k * v)
 
 
 def logical_bytes(shape: KdaRecurrentDecodeShape) -> float:
-    """Minimum traffic: q/k/v/g and beta in, o out, the fp32 state in and out."""
-    elements = shape.batch_size * shape.projection
-    state = shape.batch_size * shape.num_heads * shape.head_dim * shape.head_dim * 4
+    """Minimum traffic: q/k/v/g and beta in, o out, the fp32 state read once
+    per request and written once per token (in place at query_len 1)."""
+    elements = shape.num_tokens * shape.projection
+    state = shape.num_heads * shape.head_dim * shape.head_dim * 4
+    state_traffic = shape.batch_size * (1 + shape.query_len) * state
     return float(
-        4 * elements * 2 + shape.batch_size * shape.num_heads * 2 + elements * 2 + 2 * state
+        4 * elements * 2 + shape.num_tokens * shape.num_heads * 2 + elements * 2 + state_traffic
     )
 
 

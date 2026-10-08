@@ -24,13 +24,13 @@ from profiling.runners.attention.kda_recurrent_decode_reference import (
 )
 
 # The in-situ capture: decode iteration 727, 32 requests, TP4.
-_CAPTURE = dict(batch_size=32, num_heads=16, head_dim=128, dtype="bf16")
+_CAPTURE = dict(batch_size=32, query_len=1, num_heads=16, head_dim=128, dtype="bf16")
 
 
 def test_args_fields_are_the_runner_kwargs() -> None:
     # Defect: schema/DB key order drifting from what the worker passes the runner.
     names = [f.name for f in fields(KdaRecurrentDecodeArgs)]
-    assert names == ["batch_size", "num_heads", "head_dim", "dtype"]
+    assert names == ["batch_size", "query_len", "num_heads", "head_dim", "dtype"]
     signature = inspect.signature(runner.profile_kda_recurrent_decode_vllm_triton)
     assert list(signature.parameters) == names
 
@@ -41,6 +41,7 @@ def test_args_fields_are_the_runner_kwargs() -> None:
         {"head_dim": 0},
         {"dtype": "fp16"},
         {"batch_size": 0},
+        {"query_len": 0},
         {"num_heads": 0},
         {"batch_size": True},
     ],
@@ -67,10 +68,10 @@ def test_state_slots_are_distinct_and_never_null(batch: int) -> None:
 
 
 def test_invoke_reproduces_the_production_call() -> None:
-    # Defect: timing contiguous q/k/v/beta (skips the callable's four copy
-    # launches), a pre-sigmoided beta, a precomputed gate, or a
+    # Defect: timing contiguous q/k/v/beta (production hands the kernel strided
+    # views of the projection), a pre-sigmoided beta, a precomputed gate, or a
     # non-in-place state and output.
-    shape = runner.validate_args(batch_size=3, num_heads=2, head_dim=128, dtype="bf16")
+    shape = runner.validate_args(batch_size=3, query_len=1, num_heads=2, head_dim=128, dtype="bf16")
     operands = runner.build_operands(torch, shape, device=torch.device("cpu"))
     seen: dict = {}
 
@@ -100,6 +101,46 @@ def test_invoke_reproduces_the_production_call() -> None:
     assert seen["compute_gate"] is True and seen["sigmoid_beta"] is True
     assert seen["lower_bound"] == -5.0 and seen["use_qk_l2norm_in_kernel"] is True
     assert "inplace_final_state" not in seen  # production relies on the True default
+    assert "num_accepted_tokens" not in seen  # the plain-decode branch passes none
+    assert seen["ssm_state_indices"].shape == (3,)
+
+
+def test_invoke_reproduces_the_spec_verify_call() -> None:
+    # Defect: a verify row timed as B*L independent one-token decodes (1-D
+    # indices, no num_accepted_tokens), or with snapshot slots shared between
+    # tokens or requests.
+    shape = runner.validate_args(batch_size=3, query_len=6, num_heads=2, head_dim=128, dtype="bf16")
+    operands = runner.build_operands(torch, shape, device=torch.device("cpu"))
+    seen: dict = {}
+
+    def fake(**kwargs):
+        seen.update(kwargs)
+        return kwargs["out"], kwargs["initial_state"]
+
+    runner.invoke(fake, operands)
+    width = 3 * 256 + 2 + 2 * 128
+    assert operands.projected.shape == (18, width)
+    for name in ("q", "k", "v"):
+        assert seen[name].shape == (1, 18, 2, 128) and seen[name].stride(1) == width
+    assert seen["beta"].shape == (1, 18, 2) and seen["g"].shape == (1, 18, 2, 128)
+    indices = seen["ssm_state_indices"]
+    assert indices.shape == (3, 6) and indices.dtype is torch.int32
+    assert sorted(indices.flatten().tolist()) == list(range(1, 19))
+    assert seen["num_accepted_tokens"].tolist() == [1, 1, 1]
+    assert seen["num_accepted_tokens"].dtype is torch.int32
+    assert seen["cu_seqlens"].tolist() == [0, 6, 12, 18]
+    assert seen["initial_state"].shape == (19, 2, 128, 128)
+    assert seen["out"].shape == (1, 18, 2, 128) and seen["out"].is_contiguous()
+
+
+def test_logical_counts_scale_with_query_len() -> None:
+    # Defect: a verify row's TFLOPS/GB/s computed for one token per request.
+    one = runner.validate_args(**_CAPTURE)
+    six = runner.validate_args(**{**_CAPTURE, "query_len": 6})
+    assert runner.semantic_flops(six) == 6 * runner.semantic_flops(one)
+    state = 16 * 128 * 128 * 4
+    assert runner.logical_bytes(one) - 32 * 2 * state == 32 * (10 * 16 * 128 + 2 * 16)
+    assert runner.logical_bytes(six) - 32 * 7 * state == 6 * 32 * (10 * 16 * 128 + 2 * 16)
 
 
 def _inputs(batch: int, heads: int = 2, dim: int = 4, seed: int = 0):
@@ -152,3 +193,92 @@ def test_oracle_decays_per_key_channel_and_sigmoids_raw_beta() -> None:
     decay = kda_safe_gate(raw_g, a_log, dt_bias, -5.0).exp()  # [B, H, K]
     for seq, slot in enumerate(slots.tolist()):
         torch.testing.assert_close(updated[slot], pool[slot] * decay[seq][:, None, :])
+
+
+def test_verify_oracle_runs_each_request_from_its_accepted_slot() -> None:
+    # Defect: a verify step that starts every request from column 0, advances
+    # tokens independently instead of serially, or keeps only the final state
+    # instead of one snapshot per token. Each request's L tokens are a length-L
+    # sequence of the independent per-token chunk oracle, whose prefix runs
+    # give the snapshots.
+    batch, query_len, heads, dim = 2, 3, 2, 4
+    tokens = batch * query_len
+    q, k, v, raw_g = _inputs(tokens, heads, dim, seed=5)
+    raw_beta = torch.randn(tokens, heads, generator=torch.Generator().manual_seed(6))
+    a_log = torch.tensor([0.5, 1.5]).log().view(1, 1, 2, 1)
+    dt_bias = torch.randn(heads * dim, generator=torch.Generator().manual_seed(7)) * 0.1
+    pool = torch.randn(tokens + 2, heads, dim, dim, generator=torch.Generator().manual_seed(8))
+    indices = torch.tensor([[3, 1, 6], [2, 7, 4]], dtype=torch.int32)
+    accepted = torch.tensor([2, 3], dtype=torch.int32)
+    o, updated = kda_recurrent_decode_reference(
+        q,
+        k,
+        v,
+        raw_g,
+        raw_beta,
+        a_log,
+        dt_bias,
+        pool,
+        indices,
+        lower_bound=-5.0,
+        num_accepted_tokens=accepted,
+    )
+    for n in range(batch):
+        read = int(indices[n, int(accepted[n]) - 1])
+        span = slice(n * query_len, (n + 1) * query_len)
+        expected_o, _ = kda_chunk_prefill_reference(
+            q[span],
+            k[span],
+            v[span],
+            raw_g[span],
+            raw_beta[span].sigmoid(),
+            a_log,
+            dt_bias,
+            pool[read : read + 1],
+            [0, query_len],
+            lower_bound=-5.0,
+        )
+        torch.testing.assert_close(o[span], expected_o)
+        for t in range(query_len):
+            _, prefix_state = kda_chunk_prefill_reference(
+                q[span][: t + 1],
+                k[span][: t + 1],
+                v[span][: t + 1],
+                raw_g[span][: t + 1],
+                raw_beta[span][: t + 1].sigmoid(),
+                a_log,
+                dt_bias,
+                pool[read : read + 1],
+                [0, t + 1],
+                lower_bound=-5.0,
+            )
+            torch.testing.assert_close(updated[int(indices[n, t])], prefix_state[0])
+    for untouched in (0, 5):
+        assert torch.equal(updated[untouched], pool[untouched])
+
+
+def test_verify_oracle_with_one_token_matches_plain_decode() -> None:
+    # Defect: the two addressing modes disagreeing on the same one-token step.
+    q, k, v, raw_g = _inputs(3, seed=9)
+    raw_beta = torch.randn(3, 2, generator=torch.Generator().manual_seed(10))
+    a_log, dt_bias = torch.zeros(1, 1, 2, 1), torch.zeros(8)
+    pool = torch.randn(5, 2, 4, 4, generator=torch.Generator().manual_seed(11))
+    slots = torch.tensor([4, 1, 3], dtype=torch.int32)
+    plain = kda_recurrent_decode_reference(
+        q, k, v, raw_g, raw_beta, a_log, dt_bias, pool, slots, lower_bound=-5.0
+    )
+    verify = kda_recurrent_decode_reference(
+        q,
+        k,
+        v,
+        raw_g,
+        raw_beta,
+        a_log,
+        dt_bias,
+        pool,
+        slots.view(3, 1),
+        lower_bound=-5.0,
+        num_accepted_tokens=torch.ones(3, dtype=torch.int32),
+    )
+    for left, right in zip(plain, verify, strict=True):
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
