@@ -145,6 +145,7 @@ pub use dsa_sparse_index_remap::{
 pub use dsa_sparse_mla_attention::{
     DsaSparseMlaAttentionKernel, DsaSparseMlaAttentionKernelConfig,
     DsaSparseMlaAttentionKernelInput, DsaSparseMlaAttentionSpec, ValidCountsPattern,
+    FA3_COMBINE_MAX_QUERIES, FA3_SPARSE_BACKEND,
 };
 pub use dsa_sparse_mla_prefill::{
     DsaSparseMlaPrefillKernel, DsaSparseMlaPrefillKernelConfig, DsaSparseMlaPrefillKernelInput,
