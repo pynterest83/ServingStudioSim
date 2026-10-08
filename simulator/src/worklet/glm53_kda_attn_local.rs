@@ -150,6 +150,8 @@ impl Glm53KdaAttnLocalWorklet {
             conv_decode: GdnCausalConvDecodeKernelConfig {
                 backends: cfg.conv_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
+                // MTP off: one token per decode request.
+                query_len: 1,
                 channels: conv_channels.into(),
                 kernel_size: cfg.conv_kernel_size.clone(),
                 dtype: cfg.activation_dtype,
@@ -169,6 +171,7 @@ impl Glm53KdaAttnLocalWorklet {
             recurrent_decode: KdaRecurrentDecodeKernelConfig {
                 backends: cfg.core_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
+                query_len: 1,
                 num_heads: cfg.num_heads.clone(),
                 head_dim: cfg.head_dim.clone(),
                 dtype: cfg.activation_dtype,

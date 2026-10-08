@@ -133,6 +133,7 @@ mod tests {
             causal_conv: GdnCausalConvDecodeKernelConfig {
                 backends: vec!["torch", "vllm_triton"],
                 gpu_name: "NVIDIA H200".to_string(),
+                query_len: 1,
                 channels: 8192.into(),
                 kernel_size: 4.into(),
                 dtype: DType::Bf16,
