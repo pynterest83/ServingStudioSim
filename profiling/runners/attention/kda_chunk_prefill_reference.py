@@ -1,7 +1,8 @@
 """Naive per-token Torch oracle for ``kda_chunk_prefill``.
 
-Recomputes what ``chunk_kda_with_fused_gate`` computes on the GLM-5.3-Flash
-prefill path. It does not use the chunked algorithm or any FLA kernel:
+Recomputes what ``chunk_kda_with_fused_gate`` (and FlashKDA's ``fwd``)
+computes on the GLM-5.3-Flash prefill path. It does not use the chunked
+algorithm or any FLA/FlashKDA kernel:
 
 1. l2-normalize q and k per head (fp32 math, ``eps=1e-6``). The result is
    rounded back to the input dtype because ``l2norm_fwd`` returns the input
@@ -12,6 +13,10 @@ prefill path. It does not use the chunked algorithm or any FLA kernel:
    state ``S[h, k, v]``. This is the recurrence in FLA's ``naive_recurrent_kda``:
    ``S *= exp(g_t)``, ``S += beta_t * k_t (v_t - k_t^T S)``,
    ``o_t = (scale * q_t)^T S``.
+
+``beta`` is the already-sigmoided value the Triton path receives; with
+``beta_is_logits=True`` it is the raw projection logit FlashKDA receives, and
+the oracle applies the sigmoid in fp32 itself.
 
 Production stores recurrent states as ``[N, H, V, K]``, the transpose of the
 math layout, so the oracle takes and returns that layout.
@@ -60,12 +65,14 @@ def kda_chunk_prefill_reference(
     *,
     lower_bound: float,
     scale: float | None = None,
+    beta_is_logits: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return ``(o [T,H,V] in v.dtype, final_state [N,H,V,K] fp32)``.
 
     ``q``/``k``/``raw_g`` are ``[T,H,K]``, ``v`` is ``[T,H,V]``, ``beta`` is the
-    already-sigmoided ``[T,H]``, ``initial_state`` is ``[N,H,V,K]`` and
-    ``boundaries`` holds the N+1 cumulative sequence offsets.
+    ``[T,H]`` write strength (already sigmoided, or raw logits with
+    ``beta_is_logits``), ``initial_state`` is ``[N,H,V,K]`` and ``boundaries``
+    holds the N+1 cumulative sequence offsets.
     """
     head_dim = q.shape[-1]
     if scale is None:
@@ -74,7 +81,7 @@ def kda_chunk_prefill_reference(
     kn = l2norm_like_fla(k).float()
     vf = v.float()
     decay = kda_safe_gate(raw_g, a_log, dt_bias, lower_bound).exp()
-    betaf = beta.float()
+    betaf = beta.float().sigmoid() if beta_is_logits else beta.float()
 
     output = torch.empty(vf.shape, dtype=torch.float32, device=v.device)
     final_states = []
