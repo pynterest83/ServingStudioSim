@@ -71,6 +71,32 @@ impl SweepCoords for FlashinferAttnPrefillKernelInput {
     }
 }
 
+/// vLLM v0.31's own FA3 varlen call for MLA dense-MHA prefill new tokens. It
+/// profiles `prefix_len == 0` only, so it cannot share the (A, B) grid with the
+/// FlashInfer backends and must not share a config with them.
+pub const VLLM_FA3_BACKEND: &str = "vllm_fa3";
+
+/// `append_len` points for `vllm_fa3` (with `prefix_len == 0`). On H200 at
+/// 16 heads x 256 dims, FA3 splits KV and adds a `FlashAttnFwdCombine` launch
+/// exactly for 321..=768 tokens, so 320/321 and 768/769 are adjacent pairs:
+/// no integer query falls between them, and the cache never interpolates across
+/// either cliff. Production's dense path keeps each request within index_topk
+/// (2,048); the equal-work batch mapping can reach 4,096, and 8,192 is headroom.
+const VLLM_FA3_APPEND_AXIS: [u32; 29] = [
+    1, 16, 32, 64, 128, 192, 256, 320, 321, 384, 448, 512, 576, 640, 704, 768, 769, 832, 896, 1024,
+    1280, 1536, 1792, 2048, 2560, 3072, 4096, 6144, 8192,
+];
+
+/// The `vllm_fa3` grid on the (A, B) cache axes: B = append_len, and A = B/2,
+/// the only A a fresh-prefill shape has. Only the diagonal is feasible
+/// (`infeasible_mask`); a query between two diagonal points blends them through
+/// the cache's renormalized-corner path.
+fn vllm_fa3_sweep_grid() -> SweepGrid {
+    let appends = Axis::values(VLLM_FA3_APPEND_AXIS);
+    let effective = appends.iter().map(|append| append / 2.0).collect();
+    SweepGrid::new(vec![effective, appends])
+}
+
 pub struct FlashinferAttnPrefillSpec;
 
 impl KernelSpec for FlashinferAttnPrefillSpec {
@@ -79,7 +105,10 @@ impl KernelSpec for FlashinferAttnPrefillSpec {
 
     const KIND: KernelKind = "flashinfer_attn_prefill";
 
-    fn sweep_grid(_config: &Self::Config) -> SweepGrid {
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        if config.backends.contains(&VLLM_FA3_BACKEND) {
+            return vllm_fa3_sweep_grid();
+        }
         // Cache axes are (A, B), NOT physical (prefix, append):
         //   A = prefix_len + append_len/2 — spans the feasible range (min q/2=64
         //     at k=0, up to k_max + q_max/2) with headroom: pow2(6,16) = 64..65536.
@@ -105,7 +134,22 @@ impl KernelSpec for FlashinferAttnPrefillSpec {
         CacheKind::Cache2DLinear(Extrapolation::Product)
     }
 
-    fn infeasible_mask(_config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
+    fn validate_config(config: &Self::Config) -> anyhow::Result<()> {
+        if config.backends.contains(&VLLM_FA3_BACKEND) && config.backends.len() > 1 {
+            anyhow::bail!(
+                "{VLLM_FA3_BACKEND} profiles prefix_len 0 only and cannot share a config \
+                 with {:?}",
+                config.backends
+            );
+        }
+        Ok(())
+    }
+
+    fn infeasible_mask(config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
+        if config.backends.contains(&VLLM_FA3_BACKEND) {
+            // Fresh prefill only: A == B/2 exactly (prefix_len == 0).
+            return grid.expand_2d(|a, b| a != b / 2.0);
+        }
         // `A = k + q/2 >= q/2 = B/2` for any real shape, so the `A < B/2` corner
         // of the rectangular (A,B) grid is physically unreachable. The build path
         // strips these cells before profiling and slots a non-finite placeholder
@@ -316,5 +360,66 @@ mod tests {
         assert_eq!(fields.get("prefix_len"), Some(&Value::from(0_u32)));
         assert_eq!(fields.get("append_len"), Some(&Value::from(128_u32)));
         assert_eq!(first.backend(), Some("fa2"));
+    }
+
+    fn vllm_fa3_config() -> FlashinferAttnPrefillKernelConfig {
+        FlashinferAttnPrefillKernelConfig {
+            backends: vec![super::VLLM_FA3_BACKEND],
+            gpu_name: "NVIDIA H200".to_string(),
+            num_qo_heads: 16.into(),
+            num_kv_heads: 16.into(),
+            head_dim: 256.into(),
+            ..config()
+        }
+    }
+
+    #[test]
+    fn vllm_fa3_profiles_only_fresh_prefill_and_keeps_the_combine_edges() {
+        // The Python backend rejects prefix_len > 0, so any off-diagonal cell
+        // would be a guaranteed profiling failure; and interpolating across
+        // 320|321 or 768|769 would blend the split and unsplit FA3 kernels.
+        let cfg = vllm_fa3_config();
+        let grid = FlashinferAttnPrefillSpec::sweep_grid(&cfg);
+        let mask = FlashinferAttnPrefillSpec::infeasible_mask(&cfg, &grid);
+        let payloads = FlashinferAttnPrefillSpec::enumerate(&cfg, &grid, "vllm_fa3");
+        let feasible: Vec<_> = payloads
+            .iter()
+            .zip(&mask)
+            .filter(|(_, &masked)| !masked)
+            .map(|(payload, _)| payload.fields())
+            .collect();
+        assert_eq!(feasible.len(), 29);
+        assert!(feasible
+            .iter()
+            .all(|fields| fields.get("prefix_len") == Some(&Value::from(0_u32))));
+        let appends: Vec<u64> = feasible
+            .iter()
+            .map(|fields| fields["append_len"].as_u64().unwrap())
+            .collect();
+        for pair in [[320, 321], [768, 769]] {
+            let at = appends.iter().position(|&a| a == pair[0]).unwrap();
+            assert_eq!(appends[at + 1], pair[1]);
+        }
+        // A fresh-prefill query lands on the diagonal: (k=0, q=321) -> (160.5, 321).
+        let input = FlashinferAttnPrefillKernelInput {
+            prefix_len: 0,
+            append_len: 321,
+        };
+        assert!(grid.axes()[0].contains(&input.coords()[0]));
+    }
+
+    #[test]
+    fn vllm_fa3_cannot_share_a_config_with_flashinfer_backends() {
+        let mixed = FlashinferAttnPrefillKernelConfig {
+            backends: vec!["fa3", super::VLLM_FA3_BACKEND],
+            ..vllm_fa3_config()
+        };
+        assert!(FlashinferAttnPrefillSpec::validate_config(&mixed).is_err());
+        assert!(FlashinferAttnPrefillSpec::validate_config(&vllm_fa3_config()).is_ok());
+        // The FlashInfer grid is untouched.
+        assert_eq!(
+            FlashinferAttnPrefillSpec::sweep_grid(&config()).axes()[1].len(),
+            19
+        );
     }
 }
