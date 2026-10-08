@@ -4,8 +4,16 @@
 //!
 //! The projections and the pooled (kpool) indexer launch as on B200
 //! (`glm53_dsa_attn_local`), with two differences: verify rows reach the
-//! decode indexer `K+1` per request (`next_n = K+1`), and an MTP draft step
-//! after the first shares the step-0 indices and skips the whole indexer.
+//! decode indexer `K+1` per request, and an MTP draft step after the first
+//! shares the step-0 indices and skips the whole indexer.
+//!
+//! The decode indexer takes the `K+1` rows natively (`next_n = K+1`) only where
+//! DeepGEMM's paged MQA logits supports that width (`native_next_n_supported`:
+//! SM90 runs `next_n` in {1, 2, 4}, SM100 any). Elsewhere vLLM flattens the
+//! batch to one single-token row per query (`_use_flattening` in
+//! `v1/attention/backends/mla/indexer.py`): logits and top-k run at
+//! `next_n = 1` over `B * (K+1)` rows. The H200 MTP-5 capture shows exactly
+//! that (`sm90_fp8_paged_mqa_logits<1, ...>`).
 //!
 //! The MLA part follows `sparse_mla_attention.py` / `flashattn_mla_sparse.py`:
 //!
@@ -26,6 +34,7 @@
 //! byte formulas and effective-bandwidth factors (provisional on H200). The
 //! glue launch counts are H200-measured per forward kind.
 
+use crate::common::gpu::compute_capability;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
@@ -116,6 +125,8 @@ pub struct Glm53DsaSpecAttnLocalWorkletResolved {
     pub kpool_tail_seed: ElementwiseKernelConfig,
     pub mqa_logits_decode: DsaPagedMqaLogitsDecodeKernelConfig,
     pub topk_decode: DsaPersistentTopkDecodeKernelConfig,
+    /// The decode indexer runs one single-token row per verify row.
+    pub flatten_decode_indexer: bool,
     pub mqa_logits_prefill: DsaMqaLogitsPrefillKernelConfig,
     pub topk_prefill: DsaTopkPrefillKernelConfig,
     pub expand_pools: ElementwiseKernelConfig,
@@ -218,6 +229,13 @@ impl Glm53DsaSpecAttnLocalWorklet {
         let max_model_len = Dim::param("max_model_len", cfg.max_model_len);
         let latent_q_bytes = heads * latent * bf16.size_bytes();
         let window = cfg.index_topk + kpool - 1;
+        let flatten_decode_indexer =
+            !native_decode_next_n_supported(&cfg.gpu_name, cfg.verify_width);
+        let indexer_next_n = if flatten_decode_indexer {
+            1
+        } else {
+            cfg.verify_width
+        };
         Glm53DsaSpecAttnLocalWorkletResolved {
             fused_qkv_a: gemm(cfg.q_lora_rank.get() + latent, cfg.hidden.clone()),
             q_kv_norm: QKvRmsNormKernelConfig {
@@ -252,7 +270,7 @@ impl Glm53DsaSpecAttnLocalWorklet {
             mqa_logits_decode: DsaPagedMqaLogitsDecodeKernelConfig {
                 backends: cfg.mqa_logits_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                next_n: cfg.verify_width,
+                next_n: indexer_next_n,
                 max_model_len: max_model_len.clone(),
                 num_heads: cfg.index_num_heads.clone(),
                 head_dim: cfg.index_head_dim.clone(),
@@ -270,7 +288,7 @@ impl Glm53DsaSpecAttnLocalWorklet {
             topk_decode: DsaPersistentTopkDecodeKernelConfig {
                 backends: cfg.topk_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                next_n: cfg.verify_width,
+                next_n: indexer_next_n,
                 max_model_len: max_model_len.clone(),
                 top_k: cfg.index_topk / kpool,
                 logits_row_stride: max_model_len,
@@ -278,6 +296,7 @@ impl Glm53DsaSpecAttnLocalWorklet {
                 index_dtype: "int32".into(),
                 context_mode: "uniform".into(),
             },
+            flatten_decode_indexer,
             mqa_logits_prefill: DsaMqaLogitsPrefillKernelConfig {
                 backends: cfg.mqa_logits_prefill_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
@@ -492,6 +511,11 @@ impl Glm53DsaSpecAttnLocalWorklet {
         let no_prefill = w.prefill_tokens == 0;
         let skip = input.skip_indexer;
         let no_decode_indexer = skip || w.decode_requests == 0;
+        let indexer_decode_batch = if self.resolved.flatten_decode_indexer {
+            w.decode_rows
+        } else {
+            w.decode_requests
+        };
         push_or_zero(&self.fused_qkv_a, rows.clone(), false, ev);
         push_or_zero(
             &self.q_kv_norm,
@@ -541,7 +565,7 @@ impl Glm53DsaSpecAttnLocalWorklet {
         push_or_zero(
             &self.mqa_logits_decode,
             DsaPagedMqaLogitsDecodeKernelInput {
-                batch_size: w.decode_requests,
+                batch_size: indexer_decode_batch,
                 context_len: w.decode_pools,
             },
             no_decode_indexer,
@@ -550,7 +574,7 @@ impl Glm53DsaSpecAttnLocalWorklet {
         push_or_zero(
             &self.topk_decode,
             DsaPersistentTopkDecodeKernelInput {
-                batch_size: w.decode_requests,
+                batch_size: indexer_decode_batch,
                 context_len: w.decode_pools,
             },
             no_decode_indexer,
@@ -704,6 +728,16 @@ fn derive_work(
     })
 }
 
+/// Whether DeepGEMM's paged MQA logits takes `next_n` rows per request on
+/// this GPU (vLLM `native_next_n_supported` / `_supports_native_decode`).
+fn native_decode_next_n_supported(gpu_name: &str, next_n: u32) -> bool {
+    match compute_capability(gpu_name) {
+        Some((9, _)) => matches!(next_n, 1 | 2 | 4),
+        Some((10, _)) => true,
+        _ => matches!(next_n, 1 | 2),
+    }
+}
+
 /// `sum over x in 1..=n of x / kpool`: the pools spanned by the rows at
 /// positions `0..n` (as `glm53_dsa_attn_local`).
 fn pool_prefix_sum(n: u32, kpool: u32) -> u64 {
@@ -752,8 +786,24 @@ mod tests {
     #[test]
     fn verify_rows_reach_the_decode_indexer_k_plus_one_per_request() {
         let r = Glm53DsaSpecAttnLocalWorklet::resolve_config(&cfg());
-        assert_eq!(r.mqa_logits_decode.next_n, 6);
-        assert_eq!(r.topk_decode.next_n, 6);
+        // SM90 DeepGEMM has no next_n = 6: one single-token row per query.
+        assert!(r.flatten_decode_indexer);
+        assert_eq!(r.mqa_logits_decode.next_n, 1);
+        assert_eq!(r.topk_decode.next_n, 1);
+        let b200 =
+            Glm53DsaSpecAttnLocalWorklet::resolve_config(&Glm53DsaSpecAttnLocalWorkletConfig {
+                gpu_name: "NVIDIA B200".into(),
+                ..cfg()
+            });
+        assert!(!b200.flatten_decode_indexer);
+        assert_eq!(b200.mqa_logits_decode.next_n, 6);
+        let mtp3 =
+            Glm53DsaSpecAttnLocalWorklet::resolve_config(&Glm53DsaSpecAttnLocalWorkletConfig {
+                verify_width: 4,
+                ..cfg()
+            });
+        assert!(!mtp3.flatten_decode_indexer);
+        assert_eq!(mtp3.topk_decode.next_n, 4);
         assert_eq!(r.mla_cache_append.kv_dtype, DType::Bf16);
         assert_eq!((r.kv_b_proj.n.get(), r.kv_b_proj.k.get()), (8192, 512));
         let w = derive_work(
