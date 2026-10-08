@@ -384,8 +384,13 @@ pub fn build_configs(
         // Placeholder for `ncclAllGather` of the fp32 vocab shard: each rank
         // contributes its shard and receives the full row.
         mtp_logits_gather: ew(vocab_per_rank * fp32, model.vocab_size * fp32),
-        // Placeholder: argmax over one full fp32 logits row.
-        mtp_argmax: ew(model.vocab_size * fp32, 8),
+        // Placeholder: argmax over one full fp32 logits row (a `reduce_kernel`,
+        // ~16.5 us per call in the H200 case-03 capture). The bytes are split
+        // evenly between read and write: the triton elementwise L1 spreads its
+        // grid over output bytes, so a read-the-row, write-8-bytes shape
+        // measures at ~1 GB/s (28 ms for 32 rows) instead of a reduction's
+        // read bandwidth.
+        mtp_argmax: ew(model.vocab_size * fp32 / 2, model.vocab_size * fp32 / 2),
         mtp_step_glue: ew(DRAFT_STEP_GLUE_BYTES_PER_ROW, DRAFT_STEP_GLUE_BYTES_PER_ROW),
         model: model.clone(),
         parallel: parallel.clone(),
