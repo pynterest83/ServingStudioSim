@@ -39,6 +39,22 @@ pub struct FlashinferAttnRectKernelInput {
     pub kv_len: u32,
 }
 
+/// vLLM v0.31's own FA3 varlen call for an MLA prefill context chunk. It must
+/// not share a config with the FlashInfer backends: its grid is its own.
+pub const VLLM_FA3_BACKEND: &str = "vllm_fa3";
+
+/// `q_len` points for `vllm_fa3`. On H200 at 16 heads x 256 dims, FA3 splits KV
+/// (one more `FlashAttnFwdCombine` launch) exactly when q_len <= 768 and
+/// kv_len >= 321, a rectangle in the (q_len, kv_len) plane, so 768/769 here and
+/// 320/321 on the kv axis are adjacent pairs the cache never interpolates across.
+const VLLM_FA3_Q_AXIS: [u32; 19] = [
+    1, 16, 32, 64, 128, 192, 256, 384, 512, 640, 768, 769, 896, 1024, 1536, 2048, 3072, 4096, 8192,
+];
+const VLLM_FA3_KV_AXIS: [u32; 19] = [
+    1, 16, 32, 64, 128, 192, 256, 320, 321, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 8192,
+    16384,
+];
+
 pub struct FlashinferAttnRectSpec;
 
 impl KernelSpec for FlashinferAttnRectSpec {
@@ -47,7 +63,13 @@ impl KernelSpec for FlashinferAttnRectSpec {
 
     const KIND: KernelKind = "flashinfer_attn_rect";
 
-    fn sweep_grid(_config: &Self::Config) -> SweepGrid {
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        if config.backends.contains(&VLLM_FA3_BACKEND) {
+            return SweepGrid::new(vec![
+                Axis::values(VLLM_FA3_Q_AXIS),
+                Axis::values(VLLM_FA3_KV_AXIS),
+            ]);
+        }
         // q_len and kv_len are independent token curves; their cartesian product
         // covers both q_len <= kv_len and q_len > kv_len (wide rectangles).
         SweepGrid::new(vec![Axis::token_axis(), Axis::token_axis()])
@@ -57,6 +79,16 @@ impl KernelSpec for FlashinferAttnRectSpec {
         // Non-causal work is `q_len * kv_len` — every query row reads every key.
         // The axes are the two factors, so the cross term is the work itself.
         CacheKind::Cache2DLinear(Extrapolation::Product)
+    }
+
+    fn validate_config(config: &Self::Config) -> anyhow::Result<()> {
+        if config.backends.contains(&VLLM_FA3_BACKEND) && config.backends.len() > 1 {
+            anyhow::bail!(
+                "{VLLM_FA3_BACKEND} has its own grid and cannot share a config with {:?}",
+                config.backends
+            );
+        }
+        Ok(())
     }
 
     fn enumerate(
@@ -181,5 +213,34 @@ mod tests {
         assert!(fields.get("q_len").and_then(Value::as_u64).is_some());
         assert!(fields.get("kv_len").and_then(Value::as_u64).is_some());
         assert_eq!(first.backend(), Some("fa2"));
+    }
+
+    #[test]
+    fn vllm_fa3_grid_brackets_the_two_dimensional_combine_split() {
+        // FA3 adds FlashAttnFwdCombine iff q_len <= 768 and kv_len >= 321 on
+        // H200; both edges must be adjacent axis points so bilinear lookup never
+        // blends a split and an unsplit measurement.
+        let cfg = FlashinferAttnRectKernelConfig {
+            backends: vec![super::VLLM_FA3_BACKEND],
+            num_qo_heads: 16.into(),
+            num_kv_heads: 16.into(),
+            head_dim: 256.into(),
+            ..config()
+        };
+        let grid = FlashinferAttnRectSpec::sweep_grid(&cfg);
+        let (q, kv) = (&grid.axes()[0], &grid.axes()[1]);
+        assert_eq!(q.len() * kv.len(), 361);
+        let adjacent = |axis: &Vec<f64>, lo: f64| {
+            let at = axis.iter().position(|&v| v == lo).unwrap();
+            axis[at + 1] == lo + 1.0
+        };
+        assert!(adjacent(q, 768.0));
+        assert!(adjacent(kv, 320.0));
+        let mixed = FlashinferAttnRectKernelConfig {
+            backends: vec!["fa2", super::VLLM_FA3_BACKEND],
+            ..cfg.clone()
+        };
+        assert!(FlashinferAttnRectSpec::validate_config(&mixed).is_err());
+        assert!(FlashinferAttnRectSpec::validate_config(&cfg).is_ok());
     }
 }

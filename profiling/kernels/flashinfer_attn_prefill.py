@@ -125,6 +125,9 @@ DOC = KernelDoc(
         "queries over an fp8 cache are not measured.",
         "cudnn measures only prefix_len = 0 and no fp8; trt has no ragged "
         "kernel and records no rows.",
+        "vllm_fa3 measures BF16 with prefix_len = 0 only: vLLM's causal call "
+        "covers the new tokens alone, and cached context is a separate non-causal "
+        "call (flashinfer_attn_rect).",
     ),
     # No separate PyTorch reference implementation exists for this attention kind.
     reference=None,
@@ -160,3 +163,36 @@ for _backend in _BACKENDS:
             doc=_BACKEND_DOCS[_backend],
         )
     )
+
+
+# vLLM's FA3 (vllm.vllm_flash_attn, _vllm_fa3_C) is built for SM90 only, and
+# vLLM selects it there for head_dim <= 256 (fa_utils.get_flash_attn_version).
+# GLM-5.3-Flash on H200 takes this path when every prefill context is within
+# index_topk (sparse_mla_attention._use_dense_mha_prefill). With its BF16 KV
+# cache, MLA prefill keeps Q, K and V in BF16 (determine_prefill_query_data_type).
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_fa3",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            kv=frozenset({DType.BF16}),
+            sm_targets=frozenset({"sm_90a"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name=_RUNNER_MODULE,
+            function_name="profile_flashinfer_attn_prefill_vllm_fa3",
+        ),
+        table_name=KIND,
+        args_schema=FlashinferAttnPrefillArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM v0.31's FA3 varlen call for MLA dense-MHA prefill new tokens (BF16, SM90)."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/prefill/flash_attn.py",
+        ),
+    )
+)

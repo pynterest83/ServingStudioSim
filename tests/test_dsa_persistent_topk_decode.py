@@ -81,9 +81,9 @@ def test_registration_support_policy_and_facades() -> None:
     native_spec = find_kernel_profiler_spec(KIND, _NATIVE_BACKEND)
 
     assert KIND == "dsa_persistent_topk_decode"
-    # The fork build is its own backend; tests/test_dsa_persistent_topk_decode_fork.py
-    # covers its registration.
-    assert known_backends(KIND) == [_TORCH_BACKEND, _NATIVE_BACKEND, _FORK_BACKEND]
+    # The fork build and the public "auto" dispatcher are their own backends;
+    # their runner tests cover them.
+    assert known_backends(KIND) == [_TORCH_BACKEND, _NATIVE_BACKEND, _FORK_BACKEND, "vllm_auto"]
     for spec in (torch_spec, native_spec):
         assert spec.kernel_kind == spec.table_name == KIND
         assert spec.args_schema is DsaPersistentTopkDecodeArgs

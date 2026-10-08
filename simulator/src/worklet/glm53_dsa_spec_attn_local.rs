@@ -19,7 +19,12 @@
 //!
 //! - prefill rows run dense MHA when every prefill context fits in
 //!   `index_topk` (`_use_dense_mha_prefill`; the masked-MHA path is sm100
-//!   only): the `kv_b` up-projection, then FlashAttention varlen causal;
+//!   only): `forward_mha` runs the `kv_b` up-projection, then one FA3 varlen
+//!   causal call over every prefill request's new tokens
+//!   (`run_prefill_new_tokens`). When a prefill request has cached context,
+//!   `_compute_prefill_context` gathers it from the cache, up-projects it with
+//!   `kv_b`, runs one non-causal FA3 varlen call (`run_prefill_context_chunk`),
+//!   and `merge_attn_states` merges the two outputs for every prefill row;
 //! - verify rows (and prefill rows of a longer batch) run sparse MQA:
 //!   `W_UK` absorb, the index remap, the zero fill of FA3's 64-wide rope-free
 //!   query (`q_nope.new_zeros(..., 64)` in `_run_mqa_kernel`), FlashAttention
@@ -38,8 +43,29 @@
 //! The BF16 latent is appended with `concat_and_cache_mla<bf16, bf16>`; there is
 //! no query FP8 quant and no query concat (both FP8-cache artifacts on B200).
 //!
-//! First-cut placeholders, labeled until their L1 lands (plan M4): the dense
-//! FlashAttention call and the index remap are byte-sized elementwise leaves;
+//! Both dense FA3 calls are priced on the `vllm_fa3` backend of
+//! `flashinfer_attn_prefill` / `flashinfer_attn_rect`, which measure ONE
+//! request. A varlen batch maps to the single request of equal work: the
+//! causal call to `append_len = round(sqrt(sum T_i^2))`, the context call to
+//! `q_len = round(sqrt(sum q_i^2))` and `kv_len = round(sum q_i c_i / q_len)`.
+//! Measured on H200 against the batched call this errs by -33%..+51% causal
+//! (4 x 512 -> 1024: -33%; 8 x 256 -> 724, inside the Combine band: +51%;
+//! 2 x 1024 -> 1448: 0%) and +10%..+36% for the context call.
+//!
+//! The decode indexer returns early through `_fill_short_decode_causal_indices`
+//! (`glm5next/nvidia/sparse_indexer.py`) when the batch's token-granular
+//! `max_seq_len` (`common_attn_metadata.max_seq_len`, over every request,
+//! decode and prefill) is at most `index_topk`: paged MQA logits, top-k and
+//! the decode pool expansion do not run, and `_fill_causal_indices` writes
+//! the natural indices instead. That host-side check is frozen inside a FULL
+//! CUDA graph, which vLLM captured above `index_topk`: every pure-decode
+//! forward within the capture sizes runs the indexer whatever its contexts
+//! (H200 captures: 163 such forwards at max_seq_len <= 2048 all ran it, and
+//! all 33 mixed forwards at <= 2048 skipped it).
+//!
+//! First-cut placeholders, labeled until their L1 lands (plan M4): the index
+//! remap, the context gather and the attention-state merge are byte-sized
+//! elementwise leaves;
 //! the small indexer kernels keep the B200 byte formulas and
 //! effective-bandwidth factors (provisional on H200). The glue launch counts
 //! are H200-measured per forward kind.
@@ -55,13 +81,17 @@ use crate::timing::kernels::{
     DsaPersistentTopkDecodeKernelInput, DsaSparseMlaAttentionKernel,
     DsaSparseMlaAttentionKernelConfig, DsaSparseMlaAttentionKernelInput, DsaTopkPrefillKernel,
     DsaTopkPrefillKernelConfig, DsaTopkPrefillKernelInput, ElementwiseKernel,
-    ElementwiseKernelConfig, ElementwiseKernelInput, GemmFp32OutputKernel,
+    ElementwiseKernelConfig, ElementwiseKernelInput, FlashinferAttnPrefillKernel,
+    FlashinferAttnPrefillKernelConfig, FlashinferAttnPrefillKernelInput, FlashinferAttnRectKernel,
+    FlashinferAttnRectKernelConfig, FlashinferAttnRectKernelInput, GemmFp32OutputKernel,
     GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput, MlaCacheAppendKernel,
     MlaCacheAppendKernelConfig, MlaCacheAppendKernelInput, QKvRmsNormKernel,
     QKvRmsNormKernelConfig, QKvRmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
     SingleGemmKernelInput, ValidCountsPattern,
 };
-use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
+use crate::timing::{
+    AttnPrefillLog, BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge,
+};
 
 use super::glm53_common::{atomic, elementwise, push_or_zero, repeated};
 use super::glm53_dsa_attn_local::integer_sqrt;
@@ -81,6 +111,9 @@ const PREFILL_GLUE_LAUNCHES: u32 = 12;
 const FWHT_EFFECTIVE_FACTOR: u32 = 5;
 /// `k[idx]` and `gate_score[idx]` gathers ahead of the prefill kpool write.
 const PREFILL_GATHER_LAUNCHES: u32 = 2;
+/// `_fill_causal_indices`: arange, int64 -> int32 positions, the broadcast row
+/// copy, the causal compare and the masked fill.
+const DECODE_CAUSAL_FILL_LAUNCHES: u32 = 5;
 /// FA3's q/k width on vLLM's rope-free path: `q` is zeros of this width and
 /// `k` the first this-many latent columns (`_FA3_QV_HEAD_DIM`).
 const FA3_QK_HEAD_DIM: u32 = 64;
@@ -121,6 +154,8 @@ pub struct Glm53DsaSpecAttnLocalWorkletConfig {
     pub topk_prefill_backends: Vec<&'static str>,
     pub mla_cache_append_backends: Vec<&'static str>,
     pub sparse_attention_backends: Vec<&'static str>,
+    /// Dense-MHA prefill FA3 calls (`flashinfer_attn_prefill` / `_rect`).
+    pub dense_prefill_attention_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
 }
 
@@ -143,6 +178,7 @@ pub struct Glm53DsaSpecAttnLocalWorkletResolved {
     pub kpool_tail_seed: ElementwiseKernelConfig,
     pub mqa_logits_decode: DsaPagedMqaLogitsDecodeKernelConfig,
     pub topk_decode: DsaPersistentTopkDecodeKernelConfig,
+    pub decode_causal_fill: ElementwiseKernelConfig,
     /// The decode indexer runs one single-token row per verify row.
     pub flatten_decode_indexer: bool,
     pub mqa_logits_prefill: DsaMqaLogitsPrefillKernelConfig,
@@ -150,7 +186,11 @@ pub struct Glm53DsaSpecAttnLocalWorkletResolved {
     pub expand_pools: ElementwiseKernelConfig,
     pub mla_cache_append: MlaCacheAppendKernelConfig,
     pub kv_b_proj: SingleGemmKernelConfig,
-    pub dense_prefill_attention: ElementwiseKernelConfig,
+    pub dense_prefill_attention: FlashinferAttnPrefillKernelConfig,
+    pub context_gather: ElementwiseKernelConfig,
+    pub context_kv_b_proj: SingleGemmKernelConfig,
+    pub context_attention: FlashinferAttnRectKernelConfig,
+    pub merge_attn_states: ElementwiseKernelConfig,
     pub q_absorb: BatchedGemmKernelConfig,
     pub index_remap: ElementwiseKernelConfig,
     pub q_rope_zero_fill: ElementwiseKernelConfig,
@@ -174,6 +214,10 @@ pub struct Glm53DsaSpecAttnLocalWorkletInput {
     pub decode_width: u32,
     /// MTP draft steps after the first reuse the step-0 indices.
     pub skip_indexer: bool,
+    /// The forward replays a FULL CUDA graph (pure decode within the capture
+    /// sizes), which freezes the decode indexer's short-context early return
+    /// to "run": it was captured with `max_seq_len` above `index_topk`.
+    pub full_cuda_graph: bool,
 }
 
 pub struct Glm53DsaSpecAttnLocalWorklet {
@@ -194,12 +238,17 @@ pub struct Glm53DsaSpecAttnLocalWorklet {
     pub kpool_tail_seed: Op<ElementwiseKernel>,
     pub mqa_logits_decode: Op<DsaPagedMqaLogitsDecodeKernel>,
     pub topk_decode: Op<DsaPersistentTopkDecodeKernel>,
+    pub decode_causal_fill: Op<ElementwiseKernel>,
     pub mqa_logits_prefill: Op<DsaMqaLogitsPrefillKernel>,
     pub topk_prefill: Op<DsaTopkPrefillKernel>,
     pub expand_pools: Op<ElementwiseKernel>,
     pub mla_cache_append: Op<MlaCacheAppendKernel>,
     pub kv_b_proj: Op<SingleGemmKernel>,
-    pub dense_prefill_attention: Op<ElementwiseKernel>,
+    pub dense_prefill_attention: Op<FlashinferAttnPrefillKernel>,
+    pub context_gather: Op<ElementwiseKernel>,
+    pub context_kv_b_proj: Op<SingleGemmKernel>,
+    pub context_attention: Op<FlashinferAttnRectKernel>,
+    pub merge_attn_states: Op<ElementwiseKernel>,
     pub q_absorb: Op<BatchedGemmKernel>,
     pub index_remap: Op<ElementwiseKernel>,
     pub q_rope_zero_fill: Op<ElementwiseKernel>,
@@ -243,7 +292,16 @@ impl Glm53DsaSpecAttnLocalWorklet {
             k,
             dtype: bf16,
         };
-        let max_model_len = Dim::param("max_model_len", cfg.max_model_len);
+        assert_eq!(
+            nope, v_dim,
+            "dense-MHA prefill FA3 is priced at one head_dim for q, k and v"
+        );
+        // The kpool indexer's logits are pool-granular: `max_pool_len =
+        // max_model_len // index_kpool` (glm5next/common/attention.py) sizes the
+        // decode logits (`fp8_fp4_paged_mqa_logits(..., max_model_len=max_pool_len)`)
+        // that top-k reads.
+        let max_pool_len =
+            Dim::param("max_model_len", cfg.max_model_len) / Dim::param("index_kpool", kpool);
         let window = cfg.index_topk + kpool - 1;
         let flatten_decode_indexer =
             !native_decode_next_n_supported(&cfg.gpu_name, cfg.verify_width);
@@ -287,7 +345,7 @@ impl Glm53DsaSpecAttnLocalWorklet {
                 backends: cfg.mqa_logits_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 next_n: indexer_next_n,
-                max_model_len: max_model_len.clone(),
+                max_model_len: max_pool_len.clone(),
                 num_heads: cfg.index_num_heads.clone(),
                 head_dim: cfg.index_head_dim.clone(),
                 block_size: cfg.cache_block_size,
@@ -305,16 +363,22 @@ impl Glm53DsaSpecAttnLocalWorklet {
                 backends: cfg.topk_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 next_n: indexer_next_n,
-                max_model_len: max_model_len.clone(),
+                max_model_len: max_pool_len.clone(),
                 top_k: cfg.index_topk / kpool,
-                logits_row_stride: max_model_len,
+                logits_row_stride: max_pool_len,
                 logits_dtype: DType::Fp32,
                 index_dtype: "int32".into(),
-                // The v0.31 `persistent_topk` backend is measured on max-ragged
-                // rows (request b holds `context_len - b` logits); the decode
-                // rows here end within one pool of the longest context.
-                context_mode: "max_ragged".into(),
+                // `SparseIndexerTopk("auto")` sees every flattened verify row at
+                // the batch's longest pool count (rows of one request differ by
+                // under one pool).
+                context_mode: "uniform".into(),
             },
+            // `_fill_causal_indices` over `[rows, index_topk]` int32: the five
+            // launches average this many bytes per decode row.
+            decode_causal_fill: ew(
+                (4 * cfg.index_topk + cfg.index_topk + 12) / DECODE_CAUSAL_FILL_LAUNCHES,
+                (8 * cfg.index_topk + cfg.index_topk + 4) / DECODE_CAUSAL_FILL_LAUNCHES,
+            ),
             flatten_decode_indexer,
             mqa_logits_prefill: DsaMqaLogitsPrefillKernelConfig {
                 backends: cfg.mqa_logits_prefill_backends.clone(),
@@ -352,8 +416,35 @@ impl Glm53DsaSpecAttnLocalWorklet {
             },
             // Dense-MHA prefill: k_nope and v for every prefill row.
             kv_b_proj: gemm(heads * (nope + v_dim), cfg.kv_lora_rank.clone()),
-            // Placeholder: q, k, v in and o out once per prefill row.
-            dense_prefill_attention: ew(heads * (2 * nope + v_dim) * 2, heads * v_dim * 2),
+            dense_prefill_attention: FlashinferAttnPrefillKernelConfig {
+                backends: cfg.dense_prefill_attention_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                num_qo_heads: cfg.num_heads.clone(),
+                num_kv_heads: cfg.num_heads.clone(),
+                head_dim: cfg.qk_nope_head_dim.clone(),
+                q_dtype: bf16,
+                kv_dtype: bf16,
+                o_dtype: bf16,
+            },
+            // `gather_and_maybe_dequant_cache`: one BF16 latent row per context
+            // token, read from the paged cache and written to the workspace.
+            context_gather: ew(latent * bf16.size_bytes(), latent * bf16.size_bytes()),
+            context_kv_b_proj: gemm(heads * (nope + v_dim), cfg.kv_lora_rank.clone()),
+            context_attention: FlashinferAttnRectKernelConfig {
+                backends: cfg.dense_prefill_attention_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                num_qo_heads: cfg.num_heads.clone(),
+                num_kv_heads: cfg.num_heads.clone(),
+                head_dim: cfg.qk_nope_head_dim.clone(),
+                q_dtype: bf16,
+                kv_dtype: bf16,
+                o_dtype: bf16,
+            },
+            // Two BF16 partial outputs and two FP32 LSEs in, one output out.
+            merge_attn_states: ew(
+                2 * heads * v_dim * bf16.size_bytes() + 2 * heads * 4,
+                heads * v_dim * bf16.size_bytes(),
+            ),
             q_absorb: bmm(
                 &cfg.mla_bmm_q_absorb_backends,
                 cfg.kv_lora_rank.clone(),
@@ -448,6 +539,7 @@ impl Glm53DsaSpecAttnLocalWorklet {
                 DsaPersistentTopkDecodeKernel::build,
                 bridge,
             )?,
+            decode_causal_fill: ew("indexer.decode_causal_fill", r.decode_causal_fill)?,
             mqa_logits_prefill: atomic(
                 n,
                 "indexer.mqa_logits_prefill",
@@ -471,7 +563,23 @@ impl Glm53DsaSpecAttnLocalWorklet {
                 bridge,
             )?,
             kv_b_proj: gemm("dense_prefill.kv_b_proj", r.kv_b_proj)?,
-            dense_prefill_attention: ew("dense_prefill.attention", r.dense_prefill_attention)?,
+            dense_prefill_attention: atomic(
+                n,
+                "dense_prefill.attention",
+                r.dense_prefill_attention,
+                FlashinferAttnPrefillKernel::build,
+                bridge,
+            )?,
+            context_gather: ew("dense_prefill.context_gather", r.context_gather)?,
+            context_kv_b_proj: gemm("dense_prefill.context_kv_b_proj", r.context_kv_b_proj)?,
+            context_attention: atomic(
+                n,
+                "dense_prefill.context_attention",
+                r.context_attention,
+                FlashinferAttnRectKernel::build,
+                bridge,
+            )?,
+            merge_attn_states: ew("dense_prefill.merge_attn_states", r.merge_attn_states)?,
             q_absorb: atomic(n, "q_absorb", r.q_absorb, BatchedGemmKernel::build, bridge)?,
             index_remap: ew("sparse_mla.index_remap", r.index_remap)?,
             q_rope_zero_fill: ew("sparse_mla.q_rope_zero_fill", r.q_rope_zero_fill)?,
@@ -523,12 +631,21 @@ impl Glm53DsaSpecAttnLocalWorklet {
                 self.kpool_tail_seed.compile(builder),
                 self.mqa_logits_decode.compile(builder),
                 self.topk_decode.compile(builder),
+                repeated(
+                    &self.decode_causal_fill,
+                    DECODE_CAUSAL_FILL_LAUNCHES,
+                    builder,
+                ),
                 self.mqa_logits_prefill.compile(builder),
                 self.topk_prefill.compile(builder),
                 self.expand_pools.compile(builder),
                 self.mla_cache_append.compile(builder),
                 self.kv_b_proj.compile(builder),
                 self.dense_prefill_attention.compile(builder),
+                self.context_gather.compile(builder),
+                self.context_kv_b_proj.compile(builder),
+                self.context_attention.compile(builder),
+                self.merge_attn_states.compile(builder),
                 self.q_absorb.compile(builder),
                 self.index_remap.compile(builder),
                 self.q_rope_zero_fill.compile(builder),
@@ -552,6 +669,9 @@ impl Glm53DsaSpecAttnLocalWorklet {
         let no_prefill = w.prefill_tokens == 0;
         let skip = input.skip_indexer;
         let no_decode_indexer = skip || w.decode_requests == 0;
+        // The short-context early return replaces logits, top-k and the decode
+        // pool expansion with the causal fill.
+        let short_decode = !no_decode_indexer && w.short_decode_indexer;
         let indexer_decode_batch = if self.resolved.flatten_decode_indexer {
             w.decode_rows
         } else {
@@ -609,7 +729,7 @@ impl Glm53DsaSpecAttnLocalWorklet {
                 batch_size: indexer_decode_batch,
                 context_len: w.decode_pools,
             },
-            no_decode_indexer,
+            no_decode_indexer || short_decode,
             ev,
         );
         push_or_zero(
@@ -618,7 +738,13 @@ impl Glm53DsaSpecAttnLocalWorklet {
                 batch_size: indexer_decode_batch,
                 context_len: w.decode_pools,
             },
-            no_decode_indexer,
+            no_decode_indexer || short_decode,
+            ev,
+        );
+        push_or_zero(
+            &self.decode_causal_fill,
+            tokens(w.decode_rows),
+            !short_decode,
             ev,
         );
         let skip_prefill_indexer = skip || w.prefill_indexer_rows == 0;
@@ -640,7 +766,8 @@ impl Glm53DsaSpecAttnLocalWorklet {
             skip_prefill_indexer,
             ev,
         );
-        let expand_rows = w.decode_rows + w.prefill_indexer_rows;
+        let decode_expand_rows = if short_decode { 0 } else { w.decode_rows };
+        let expand_rows = decode_expand_rows + w.prefill_indexer_rows;
         push_or_zero(
             &self.expand_pools,
             tokens(expand_rows),
@@ -662,7 +789,40 @@ impl Glm53DsaSpecAttnLocalWorklet {
             dense == 0,
             ev,
         );
-        push_or_zero(&self.dense_prefill_attention, tokens(dense), dense == 0, ev);
+        let causal = FlashinferAttnPrefillKernelInput {
+            prefix_len: 0,
+            append_len: w.dense_causal_append,
+        };
+        let causal_metrics = if dense == 0 {
+            crate::timing::LeafMetrics::ZERO
+        } else {
+            self.dense_prefill_attention.kernel.eval(&causal)
+        };
+        // The leaf's input is the equal-work single request it was priced at.
+        ev.push(causal_metrics, || {
+            AttnPrefillLog {
+                prefill_chunk_pairs: vec![(causal.prefix_len, causal.append_len)],
+            }
+            .into()
+        });
+        let context = w.context_tokens;
+        push_or_zero(&self.context_gather, tokens(context), context == 0, ev);
+        push_or_zero(
+            &self.context_kv_b_proj,
+            SingleGemmKernelInput { m: context },
+            context == 0,
+            ev,
+        );
+        push_or_zero(
+            &self.context_attention,
+            FlashinferAttnRectKernelInput {
+                q_len: w.context_q_len,
+                kv_len: w.context_kv_len,
+            },
+            context == 0,
+            ev,
+        );
+        push_or_zero(&self.merge_attn_states, tokens(dense), context == 0, ev);
         let mqa = w.mqa_rows;
         push_or_zero(
             &self.q_absorb,
@@ -694,7 +854,7 @@ struct Work {
     prefill_tokens: u32,
     decode_requests: u32,
     decode_rows: u32,
-    /// `ceil(max decode context / index_kpool)`.
+    /// `floor(max decode context / index_kpool)`.
     decode_pools: u32,
     /// As on B200: every prefill row once any prefill context exceeds
     /// `index_topk`, else 0.
@@ -703,6 +863,19 @@ struct Work {
     /// Prefill rows on the dense-MHA path (every prefill context fits in
     /// `index_topk`), else 0.
     dense_prefill_rows: u32,
+    /// The equal-work single request the dense causal FA3 call is priced at:
+    /// `round(sqrt(sum append_i^2))` over the dense-prefill requests.
+    dense_causal_append: u32,
+    /// Cached context tokens the dense path gathers and up-projects (requests
+    /// with a prefix); 0 when no dense-prefill request has one.
+    context_tokens: u32,
+    /// The context call's equal-work single request:
+    /// `q = round(sqrt(sum q_i^2))`, `kv = round(sum q_i c_i / q)`.
+    context_q_len: u32,
+    context_kv_len: u32,
+    /// The batch's token-granular `max_seq_len` is at most `index_topk` and no
+    /// FULL CUDA graph froze the check: the decode indexer returns early.
+    short_decode_indexer: bool,
     /// Rows on the sparse-MQA path: decode rows, plus the prefill rows of a
     /// batch too long for dense MHA.
     mqa_rows: u32,
@@ -767,6 +940,30 @@ fn derive_work(
         return Err("an iteration must carry at least one token".into());
     }
     let dense_prefill_rows = if long_prefill { 0 } else { prefill_tokens };
+    let dense_pairs = input.prefill_chunk_pairs.iter().filter(|_| !long_prefill);
+    let dense_causal_append = round_sqrt(
+        dense_pairs
+            .clone()
+            .map(|&(_, append)| u64::from(append).pow(2))
+            .sum(),
+    );
+    let (mut context_tokens, mut context_q_sq, mut context_work) = (0_u32, 0_u64, 0_u64);
+    for &(prefix, append) in dense_pairs.filter(|&&(prefix, _)| prefix > 0) {
+        context_tokens += prefix;
+        context_q_sq += u64::from(append).pow(2);
+        context_work += u64::from(append) * u64::from(prefix);
+    }
+    let context_q_len = round_sqrt(context_q_sq);
+    let context_kv_len = if context_q_len == 0 {
+        0
+    } else {
+        u32::try_from(
+            (2 * context_work + u64::from(context_q_len)) / (2 * u64::from(context_q_len)),
+        )
+        .map_err(|_| "dense context kv_len overflows u32")?
+    };
+    let max_seq_len = max_prefill_context.max(max_decode);
+    let short_decode_indexer = !input.full_cuda_graph && max_seq_len <= index_topk;
     // Every MQA row's own context: verify row `i` of a `width`-row request
     // sees `kv_len - (width - 1 - i)` tokens; a long batch's prefill rows walk
     // their causal spans.
@@ -789,10 +986,16 @@ fn derive_work(
         prefill_tokens,
         decode_requests,
         decode_rows,
-        decode_pools: max_decode.div_ceil(index_kpool),
+        // vLLM's flattened decode lengths are `seq_len // index_kpool`.
+        decode_pools: max_decode / index_kpool,
         prefill_indexer_rows,
         prefill_indexer_keys,
         dense_prefill_rows,
+        dense_causal_append,
+        context_tokens,
+        context_q_len,
+        context_kv_len,
+        short_decode_indexer,
         mqa_rows: total_tokens - dense_prefill_rows,
         sparse_cache_tokens,
     })
@@ -828,6 +1031,11 @@ fn sparse_attention_context(
     } else {
         max_context
     }
+}
+
+/// `round(sqrt(x))` for the equal-work single-request mappings.
+fn round_sqrt(x: u64) -> u32 {
+    (x as f64).sqrt().round() as u32
 }
 
 /// Whether DeepGEMM's paged MQA logits takes `next_n` rows per request on
@@ -877,11 +1085,12 @@ mod tests {
             mla_bmm_q_absorb_backends: vec!["torch_mla_q_absorb_no_rope"],
             mla_bmm_v_up_backends: vec!["torch_mla_v_up_unpadded"],
             mqa_logits_backends: vec!["deepgemm_fp8"],
-            topk_backends: vec!["vllm_fork_cuda"],
+            topk_backends: vec!["vllm_auto"],
             mqa_logits_prefill_backends: vec!["deepgemm_fp8"],
             topk_prefill_backends: vec!["vllm_cuda"],
             mla_cache_append_backends: vec!["vllm_cuda"],
             sparse_attention_backends: vec![crate::timing::kernels::FA3_SPARSE_BACKEND],
+            dense_prefill_attention_backends: vec!["vllm_fa3"],
             elementwise_backends: vec!["triton"],
         }
     }
@@ -915,6 +1124,7 @@ mod tests {
                 decode_kv_lens: vec![1006, 4006],
                 decode_width: 6,
                 skip_indexer: false,
+                full_cuda_graph: false,
             },
             &cfg(),
         )
@@ -923,7 +1133,8 @@ mod tests {
             (w.decode_requests, w.decode_rows, w.total_tokens),
             (2, 12, 12)
         );
-        assert_eq!(w.decode_pools, 1002);
+        // vLLM floors each flattened row: 4006 // 4.
+        assert_eq!(w.decode_pools, 1001);
         assert_eq!((w.dense_prefill_rows, w.mqa_rows), (0, 12));
     }
 
@@ -935,6 +1146,7 @@ mod tests {
                 decode_kv_lens: vec![300],
                 decode_width: 6,
                 skip_indexer: false,
+                full_cuda_graph: false,
             },
             &cfg(),
         )
@@ -947,6 +1159,7 @@ mod tests {
                 decode_kv_lens: Vec::new(),
                 decode_width: 6,
                 skip_indexer: false,
+                full_cuda_graph: false,
             },
             &cfg(),
         )
@@ -963,6 +1176,7 @@ mod tests {
                 decode_kv_lens: vec![500],
                 decode_width: 1,
                 skip_indexer: false,
+                full_cuda_graph: false,
             },
             &cfg(),
         )
@@ -973,6 +1187,7 @@ mod tests {
                 decode_kv_lens: vec![500, 700],
                 decode_width: 1,
                 skip_indexer: true,
+                full_cuda_graph: false,
             },
             &cfg(),
         )
@@ -1022,6 +1237,7 @@ mod tests {
                     decode_kv_lens,
                     decode_width: 6,
                     skip_indexer: false,
+                    full_cuda_graph: false,
                 },
                 &cfg(),
             )
@@ -1059,6 +1275,7 @@ mod tests {
                     decode_kv_lens: vec![3000; requests],
                     decode_width: 6,
                     skip_indexer: false,
+                    full_cuda_graph: false,
                 },
                 &cfg(),
             )
@@ -1067,5 +1284,85 @@ mod tests {
         };
         assert!(rows(165) <= FA3_COMBINE_MAX_QUERIES);
         assert!(rows(166) > FA3_COMBINE_MAX_QUERIES);
+    }
+
+    fn work(input: Glm53DsaSpecAttnLocalWorkletInput) -> Work {
+        derive_work(&input, &cfg()).unwrap()
+    }
+
+    fn decode_input(
+        prefill_chunk_pairs: Vec<(u32, u32)>,
+        decode_kv_lens: Vec<u32>,
+        full_cuda_graph: bool,
+    ) -> Glm53DsaSpecAttnLocalWorkletInput {
+        Glm53DsaSpecAttnLocalWorkletInput {
+            prefill_chunk_pairs,
+            decode_kv_lens,
+            decode_width: 6,
+            skip_indexer: false,
+            full_cuda_graph,
+        }
+    }
+
+    /// Catches the decode logits and top-k sized to token rows instead of
+    /// the kpool indexer's `max_model_len // index_kpool` pool rows.
+    #[test]
+    fn decode_indexer_logits_are_pool_granular() {
+        let r = Glm53DsaSpecAttnLocalWorklet::resolve_config(&cfg());
+        assert_eq!(r.mqa_logits_decode.max_model_len.get(), 2048);
+        assert_eq!(r.topk_decode.max_model_len.get(), 2048);
+        assert_eq!(r.topk_decode.logits_row_stride.get(), 2048);
+        assert_eq!(r.topk_decode.backends, vec!["vllm_auto"]);
+        assert_eq!(
+            (r.topk_decode.context_mode.as_str(), r.topk_decode.next_n),
+            ("uniform", 1)
+        );
+    }
+
+    /// Catches the short-context early return applied to graph replays (the
+    /// H200 captures run the indexer in every pure-decode graph) or keyed to
+    /// the decode rows alone instead of the whole batch's `max_seq_len`.
+    #[test]
+    fn decode_indexer_skips_short_batches_outside_full_cuda_graphs() {
+        // Mixed forward at max_seq_len 1024 (case 05 iteration 54): skipped.
+        assert!(work(decode_input(vec![(0, 1024)], vec![300, 600], false)).short_decode_indexer);
+        // A long prefill request lifts the batch max past index_topk.
+        assert!(!work(decode_input(vec![(0, 2049)], vec![300], false)).short_decode_indexer);
+        // Pure decode in a FULL graph: frozen to run.
+        assert!(!work(decode_input(Vec::new(), vec![300], true)).short_decode_indexer);
+        // Eager pure decode follows the live check; 2054 > 2048 runs (case 03 it. 93).
+        assert!(work(decode_input(Vec::new(), vec![2048], false)).short_decode_indexer);
+        assert!(!work(decode_input(Vec::new(), vec![2054], false)).short_decode_indexer);
+    }
+
+    /// Catches a multi-request dense prefill priced as the token sum (one
+    /// long causal triangle) or as a per-request sum of single-request calls.
+    #[test]
+    fn dense_prefill_maps_to_the_equal_work_single_request() {
+        let w = work(decode_input(vec![(0, 512); 4], Vec::new(), false));
+        assert_eq!((w.dense_causal_append, w.context_tokens), (1024, 0));
+        let w = work(decode_input(
+            vec![(1024, 256), (0, 512), (512, 512)],
+            Vec::new(),
+            false,
+        ));
+        // sqrt(256^2 + 512^2 + 512^2) = 768.
+        assert_eq!(w.dense_causal_append, 768);
+        // Context requests only: q = sqrt(256^2 + 512^2) = 572,
+        // kv = (256*1024 + 512*512) / 572 = 917.
+        assert_eq!(
+            (w.context_tokens, w.context_q_len, w.context_kv_len),
+            (1536, 572, 917)
+        );
+        // Long prefill goes sparse: no dense FA3 call at all.
+        let w = work(decode_input(vec![(2048, 256)], Vec::new(), false));
+        assert_eq!(
+            (
+                w.dense_prefill_rows,
+                w.dense_causal_append,
+                w.context_tokens
+            ),
+            (0, 0, 0)
+        );
     }
 }

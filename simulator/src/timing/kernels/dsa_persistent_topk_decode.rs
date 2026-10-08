@@ -60,6 +60,61 @@ const MAX_RAGGED_CONTEXT_AXIS: [u32; 21] = [
     65536, 131072, 262144, 524288, 1048576,
 ];
 
+/// vLLM v0.31's public `SparseIndexerTopk("auto")` dispatcher. It must not share
+/// a config with another backend: its grid brackets that dispatcher's own edges.
+pub const VLLM_AUTO_BACKEND: &str = "vllm_auto";
+
+/// Row counts where `SparseIndexerTopk("auto")` changes kernel on H200, each
+/// paired with its neighbour: cooperative_topk cs8 up to 8 rows, cs4 up to 33,
+/// cs2 up to 64 (`AUTO_COOPERATIVE_MAX_ROWS`), then persistent_topk, whose
+/// FilteredTopK / sampled_topk serve the larger batches.
+const VLLM_AUTO_ROW_AXIS: [u32; 19] = [
+    1, 2, 4, 6, 8, 9, 12, 16, 24, 32, 33, 34, 48, 64, 65, 96, 128, 192, 256,
+];
+
+/// Row-length breakpoints of the kernels behind `SparseIndexerTopk("auto")`:
+/// FilteredTopK's short path ends at 32,768; cooperative_topk's single-pass
+/// block holds 49,152 elements; sampled_topk takes over above 64 rows from
+/// 98,304 (top_k 512) or 65,536 (otherwise). The top_k triplet brackets the
+/// natural-copy short rows. Every axis also carries `max_model_len` itself.
+const VLLM_AUTO_CONTEXT_AXIS: [u32; 17] = [
+    0, 128, 1024, 2048, 4096, 8192, 16384, 32767, 32768, 32769, 49152, 65536, 131072, 196608,
+    262144, 524288, 1048576,
+];
+
+fn vllm_auto_batch_axis(next_n: u32) -> Vec<u32> {
+    // The dispatch reads rows = batch_size * next_n, so map each row edge to the
+    // batch sizes on either side of it.
+    let mut axis: Vec<u32> = VLLM_AUTO_ROW_AXIS
+        .iter()
+        .flat_map(|&rows| [rows / next_n, rows.div_ceil(next_n)])
+        .filter(|&batch| batch >= 1)
+        .collect();
+    axis.sort_unstable();
+    axis.dedup();
+    axis
+}
+
+fn vllm_auto_context_axis(top_k: u32, max_model_len: u32) -> Vec<u32> {
+    let sampled = if top_k == 512 { 98_304 } else { 65_536 };
+    let mut axis: Vec<u32> = VLLM_AUTO_CONTEXT_AXIS
+        .iter()
+        .copied()
+        .chain([
+            top_k - 1,
+            top_k,
+            top_k + 1,
+            sampled - 1,
+            sampled,
+            max_model_len,
+        ])
+        .filter(|&context| context <= max_model_len)
+        .collect();
+    axis.sort_unstable();
+    axis.dedup();
+    axis
+}
+
 pub struct DsaPersistentTopkDecodeSpec;
 
 impl KernelSpec for DsaPersistentTopkDecodeSpec {
@@ -69,6 +124,15 @@ impl KernelSpec for DsaPersistentTopkDecodeSpec {
     const KIND: KernelKind = "dsa_persistent_topk_decode";
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        if config.backends.contains(&VLLM_AUTO_BACKEND) {
+            return SweepGrid::new(vec![
+                Axis::values(vllm_auto_batch_axis(config.next_n)),
+                Axis::values(vllm_auto_context_axis(
+                    config.top_k,
+                    config.max_model_len.get(),
+                )),
+            ]);
+        }
         if config.context_mode == MAX_RAGGED_CONTEXT_MODE {
             return SweepGrid::new(vec![
                 Axis::values(MAX_RAGGED_BATCH_AXIS),
@@ -103,6 +167,17 @@ impl KernelSpec for DsaPersistentTopkDecodeSpec {
         // Top-k runs over `batch_size` rows of `context_len` logits each, so the
         // work is the product of the axes.
         CacheKind::Cache2DLinear(Extrapolation::Product)
+    }
+
+    fn validate_config(config: &Self::Config) -> anyhow::Result<()> {
+        if config.backends.contains(&VLLM_AUTO_BACKEND) && config.backends.len() > 1 {
+            anyhow::bail!(
+                "{VLLM_AUTO_BACKEND} has its own dispatch grid and cannot share a config \
+                 with {:?}",
+                config.backends
+            );
+        }
+        Ok(())
     }
 
     fn infeasible_mask(config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
@@ -553,5 +628,57 @@ mod tests {
 
         assert_eq!(cfg.compute_dtype(), Some(DType::Fp32));
         assert_eq!(cfg.kv_dtype(), None);
+    }
+
+    fn vllm_auto_config(next_n: u32, max_model_len: u32) -> DsaPersistentTopkDecodeKernelConfig {
+        DsaPersistentTopkDecodeKernelConfig {
+            backends: vec![super::VLLM_AUTO_BACKEND],
+            next_n,
+            max_model_len: Dim::param("max_model_len", max_model_len),
+            top_k: 512,
+            logits_row_stride: Dim::param("logits_row_stride", max_model_len),
+            ..config(next_n)
+        }
+    }
+
+    fn feasible(cfg: &DsaPersistentTopkDecodeKernelConfig) -> usize {
+        let grid = DsaPersistentTopkDecodeSpec::sweep_grid(cfg);
+        DsaPersistentTopkDecodeSpec::infeasible_mask(cfg, &grid)
+            .iter()
+            .filter(|&&masked| !masked)
+            .count()
+    }
+
+    #[test]
+    fn vllm_auto_batch_axis_keeps_every_dispatch_edge_in_rows() {
+        // cs8 | cs4 at 8|9 rows, cs4 | cs2 at 33|34, cooperative | persistent at
+        // 64|65: interpolating across one would blend two different kernels.
+        let grid = DsaPersistentTopkDecodeSpec::sweep_grid(&vllm_auto_config(1, 2048));
+        for edge in [8.0, 33.0, 64.0] {
+            let at = grid.axes()[0].iter().position(|&b| b == edge).unwrap();
+            assert_eq!(grid.axes()[0][at + 1], edge + 1.0);
+        }
+        // With next_n rows per request the same row edges land on both sides.
+        let grid = DsaPersistentTopkDecodeSpec::sweep_grid(&vllm_auto_config(6, 2048));
+        for (below, above) in [(1.0, 2.0), (5.0, 6.0), (10.0, 11.0)] {
+            assert!(grid.axes()[0].contains(&below) && grid.axes()[0].contains(&above));
+        }
+    }
+
+    #[test]
+    fn vllm_auto_context_axis_ends_at_the_pool_logits_width() {
+        // GLM-5.3 kpool on H200: max_model_len 8192 / kpool 4 = 2048 pools.
+        let grid = DsaPersistentTopkDecodeSpec::sweep_grid(&vllm_auto_config(1, 2048));
+        assert_eq!(
+            grid.axes()[1],
+            vec![0.0, 128.0, 511.0, 512.0, 513.0, 1024.0, 2048.0]
+        );
+        assert_eq!(feasible(&vllm_auto_config(1, 2048)), 19 * 7);
+        assert!(feasible(&vllm_auto_config(1, 1_048_576)) <= 500);
+        let mixed = DsaPersistentTopkDecodeKernelConfig {
+            backends: vec![VLLM_BACKEND, super::VLLM_AUTO_BACKEND],
+            ..vllm_auto_config(1, 2048)
+        };
+        assert!(DsaPersistentTopkDecodeSpec::validate_config(&mixed).is_err());
     }
 }
