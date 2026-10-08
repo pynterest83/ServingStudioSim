@@ -14,8 +14,9 @@
 //!   and routed experts run on vLLM's auxiliary stream (`Parallel`);
 //! - KDA: verify rows take conv update + recurrent KDA, prefill rows the
 //!   chunked core;
-//! - DSA: the kpool indexer at `next_n = K+1`, dense-MHA prefill or sparse
-//!   MQA through `FLASH_ATTN_MLA_SPARSE`, BF16 latent cache;
+//! - DSA: the kpool indexer over `K+1` rows per request (flattened to
+//!   single-token rows on SM90, where DeepGEMM has no `next_n = 6`),
+//!   dense-MHA prefill or sparse MQA through `FLASH_ATTN_MLA_SPARSE`, BF16 latent cache;
 //! - every TP all-reduce is FlashInfer's up to its sm90 fusion workspace and
 //!   a plain all-reduce above it (vLLM's FLASHINFER > CUSTOM > SYMM_MEM >
 //!   PYNCCL dispatch; custom and symm_mem have no L1 backend yet).
@@ -1440,7 +1441,9 @@ mod tests {
         let r = resolve_configs(&c);
         assert_eq!(r.routed_body.gate_up.num_local_experts.get(), 288);
         assert_eq!(r.routed_body.down.k.get(), 512);
-        assert_eq!(r.dsa.mqa_logits_decode.next_n, 6);
+        // H200 MTP 5: the decode indexer is flattened to next_n = 1.
+        assert!(r.dsa.flatten_decode_indexer);
+        assert_eq!(r.dsa.mqa_logits_decode.next_n, 1);
         assert_eq!(r.dsa.mla_cache_append.kv_dtype, DType::Bf16);
         assert_eq!(
             r.shared_expert.gate_up_quant.scale_format,
