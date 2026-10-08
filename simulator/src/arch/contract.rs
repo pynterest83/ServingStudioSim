@@ -316,6 +316,37 @@ pub struct SpeculativeArchInput {
     pub tokens_per_source_rank: Vec<u32>,
 }
 
+/// How the serving engine launches one iteration's forward: the engine fact
+/// that sets an iteration's host-side cost floor, separate from the kernels
+/// it launches.
+///
+/// It is a property of the deployment (capture sizes, cudagraph mode) and of
+/// the batch's shape, so only the arch can state it. Kernel timing that
+/// depends on the same fact (for example a backend that takes a different
+/// path inside a FULL graph) must read it from the same rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GraphMode {
+    /// One captured graph replays the whole forward, attention included
+    /// (vLLM `CUDAGraphMode.FULL`).
+    FullGraph,
+    /// Captured graphs between eagerly run attention pieces (vLLM
+    /// `CUDAGraphMode.PIECEWISE`).
+    Piecewise,
+    /// Every kernel launched from the host (vLLM `CUDAGraphMode.NONE`).
+    Eager,
+}
+
+impl GraphMode {
+    /// The `cost_log` `graph_mode` spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            GraphMode::FullGraph => "full_graph",
+            GraphMode::Piecewise => "piecewise",
+            GraphMode::Eager => "eager",
+        }
+    }
+}
+
 /// Iter-wise query face for a speculative co-located worker.
 ///
 /// Mirrors [`IterwiseUnifiedModel`]'s reusable-buffer protocol but accepts only
@@ -363,6 +394,18 @@ pub trait SpeculativeUnifiedModel: Send + Sync + 'static {
             nodes: Vec::new(),
             node_labels: Vec::new(),
         }
+    }
+
+    /// How the engine launches this iteration's forward, or `None` when the
+    /// arch does not model it.
+    ///
+    /// `None` is the default and means "unknown", not "eager": a host-time
+    /// floor is fit per deployment and per mode, so guessing the slowest mode
+    /// for an arch that never stated its capture rule would bill a
+    /// graph-replaying engine an eager floor every iteration. A worker that
+    /// configures a host-time model therefore requires a `Some`.
+    fn graph_mode(&self, _batch: &SpeculativeArchInput) -> Option<GraphMode> {
+        None
     }
 
     /// See [`IterwiseUnifiedModel::total_kv_bytes_per_token`].

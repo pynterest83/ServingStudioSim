@@ -44,7 +44,7 @@
 
 use anyhow::Result;
 
-use crate::arch::contract::{SpeculativeArchInput, SpeculativeUnifiedModel};
+use crate::arch::contract::{GraphMode, SpeculativeArchInput, SpeculativeUnifiedModel};
 use crate::arch::glm53_flash_common::{
     atomic, graph_padded_tokens, layer_groups, push, AttnKind, Boundary, FfnKind,
 };
@@ -898,6 +898,7 @@ pub struct Glm53FlashSpecModel {
     pub max_model_len: u32,
     pub draft_tokens: u32,
     cudagraph_capture_sizes: Vec<u32>,
+    graph_dispatch: GraphDispatch,
     embedding: Op<ElementwiseKernel>,
     embedding_all_reduce: TpAllReduce,
     hc_expand: Op<ElementwiseKernel>,
@@ -1068,6 +1069,7 @@ pub fn build(
             sizes.dedup();
             sizes
         },
+        graph_dispatch: GraphDispatch::new(&cfg.parallel.cudagraph_capture_sizes, draft_tokens + 1),
         total_kv_bytes_per_token,
         recurrent_state_bytes_per_request,
         cost_flat: Vec::new(),
@@ -1143,13 +1145,12 @@ impl Glm53FlashSpecModel {
         let mut batch = normalize_speculative_input(input, self.draft_tokens, self.max_model_len)
             .unwrap_or_else(|reason| panic!("invalid Glm53FlashSpecModel input: {reason}"));
         let tokens = graph_padded_tokens(&self.cudagraph_capture_sizes, batch.total_tokens);
-        // vLLM replays a FULL CUDA graph for a uniform pure-decode batch within
-        // the capture sizes; mixed batches run attention eagerly (piecewise).
-        batch.dsa.full_cuda_graph = batch.dsa.prefill_chunk_pairs.is_empty()
-            && self
-                .cudagraph_capture_sizes
-                .last()
-                .is_some_and(|&largest| batch.total_tokens <= largest);
+        // Attention takes the FULL-graph path only when the whole forward
+        // replays one; the same rule sets the iteration's host floor.
+        batch.dsa.full_cuda_graph = self.graph_dispatch.mode(
+            batch.total_tokens,
+            !batch.dsa.prefill_chunk_pairs.is_empty(),
+        ) == GraphMode::FullGraph;
         let ew = |num_tokens| ElementwiseKernelInput { num_tokens };
         push(&self.embedding, ew(tokens), ev);
         self.embedding_all_reduce.eval(tokens, ev);
@@ -1263,6 +1264,15 @@ impl SpeculativeUnifiedModel for Glm53FlashSpecModel {
 
     fn cost_log_manifest(&self) -> CostManifest {
         self.cost_tree().manifest()
+    }
+
+    fn graph_mode(&self, batch: &SpeculativeArchInput) -> Option<GraphMode> {
+        let total_tokens = batch.groups.iter().map(|group| group.batch_tokens).sum();
+        let has_prefill = batch
+            .groups
+            .iter()
+            .any(|group| !group.prefill_chunk_pairs.is_empty());
+        Some(self.graph_dispatch.mode(total_tokens, has_prefill))
     }
 
     fn total_kv_bytes_per_token(&self) -> u64 {
@@ -1414,6 +1424,62 @@ fn normalize_speculative_input(
     })
 }
 
+/// Which [`GraphMode`] vLLM v0.31's model runner V2 dispatches one verify
+/// forward to under `FULL_AND_PIECEWISE` with MTP
+/// (`CudaGraphManager._init_candidates` / `dispatch` in
+/// `vllm/v1/worker/gpu/cudagraph_utils.py`, batch facts from
+/// `GPUModelRunner.execute_model` in `vllm/v1/worker/gpu/model_runner.py`):
+///
+/// - a decode-only batch is uniform (every request submits `K + 1` rows) and
+///   replays a FULL graph when a captured decode size covers it. Those sizes
+///   are the capture sizes rounded up to a multiple of `K + 1` that stay within
+///   the largest capture size: with sizes up to 512 and `K + 1 = 6` the largest
+///   is 498, not 512;
+/// - any other batch within the largest capture size replays PIECEWISE graphs
+///   (attention eager);
+/// - a larger batch, or every batch when nothing is captured, runs eagerly.
+///
+/// The MTP drafter's step 0 dispatches through the same rule on the same rows
+/// (`AutoRegressiveSpeculator`'s prefill manager); its later steps replay FULL
+/// single-row graphs whatever the target did. The host floor this mode keys is
+/// measured over the whole engine step, so one mode describes the iteration.
+///
+/// Not modeled: the `max_num_seqs * (K + 1)` cap on decode graphs (no batch
+/// larger than `max_num_seqs` requests is ever scheduled) and microbatching.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GraphDispatch {
+    /// Largest capture size; 0 when nothing is captured.
+    piecewise_max_tokens: u32,
+    /// Largest FULL decode graph, in tokens; 0 when none is captured.
+    full_graph_max_tokens: u32,
+}
+
+impl GraphDispatch {
+    fn new(capture_sizes: &[u32], verify_width: u32) -> Self {
+        let piecewise_max_tokens = capture_sizes.iter().copied().max().unwrap_or(0);
+        let full_graph_max_tokens = capture_sizes
+            .iter()
+            .map(|&size| size.div_ceil(verify_width) * verify_width)
+            .filter(|&rounded| rounded <= piecewise_max_tokens)
+            .max()
+            .unwrap_or(0);
+        Self {
+            piecewise_max_tokens,
+            full_graph_max_tokens,
+        }
+    }
+
+    fn mode(self, total_tokens: u32, has_prefill: bool) -> GraphMode {
+        if !has_prefill && total_tokens <= self.full_graph_max_tokens {
+            GraphMode::FullGraph
+        } else if total_tokens <= self.piecewise_max_tokens {
+            GraphMode::Piecewise
+        } else {
+            GraphMode::Eager
+        }
+    }
+}
+
 fn fit_failed(reason: impl Into<String>) -> BuildError {
     BuildError::FitFailed {
         kind: ARCH_KIND,
@@ -1499,6 +1565,56 @@ mod tests {
         );
         assert_eq!((c.mtp_eh_proj.n.get(), c.mtp_eh_proj.k.get()), (4096, 8192));
         assert_eq!(c.lm_head.n.get(), 154_880 / 4);
+    }
+
+    /// The case-03 capture sizes: MTP 5 adds 6 and 12 to vLLM's default list.
+    fn h200_capture_sizes() -> Vec<u32> {
+        let mut sizes = vec![1, 2, 4, 6, 8, 12, 16];
+        sizes.extend((24..=256).step_by(8));
+        sizes.extend((272..=512).step_by(16));
+        sizes
+    }
+
+    #[test]
+    fn graph_mode_follows_the_v2_runner_dispatch_at_the_capture_boundaries() {
+        let dispatch = GraphDispatch::new(&h200_capture_sizes(), 6);
+        assert_eq!(h200_capture_sizes().len(), 53, "the 53 PIECEWISE captures");
+        assert_eq!(dispatch.piecewise_max_tokens, 512);
+        // 512 rounds up to 516 > 512, so 496 -> 498 is the largest FULL graph.
+        assert_eq!(dispatch.full_graph_max_tokens, 498);
+
+        // Mixed batches: PIECEWISE through the largest capture size, then eager.
+        assert_eq!(dispatch.mode(512, true), GraphMode::Piecewise);
+        assert_eq!(dispatch.mode(513, true), GraphMode::Eager);
+        assert_eq!(dispatch.mode(6, true), GraphMode::Piecewise);
+        // Decode-only: FULL up to 83 requests, PIECEWISE for 84-85, then eager.
+        assert_eq!(dispatch.mode(6, false), GraphMode::FullGraph);
+        assert_eq!(dispatch.mode(498, false), GraphMode::FullGraph);
+        assert_eq!(dispatch.mode(504, false), GraphMode::Piecewise);
+        assert_eq!(dispatch.mode(510, false), GraphMode::Piecewise);
+        assert_eq!(dispatch.mode(516, false), GraphMode::Eager);
+    }
+
+    #[test]
+    fn the_full_graph_count_matches_the_captured_decode_graphs() {
+        // The H200 server log captured 48 FULL target graphs: one per distinct
+        // capture size rounded up to K + 1 = 6 within 512.
+        let sizes = h200_capture_sizes();
+        let mut full: Vec<u32> = sizes
+            .iter()
+            .map(|size| size.div_ceil(6) * 6)
+            .filter(|&rounded| rounded <= 512)
+            .collect();
+        full.dedup();
+        assert_eq!(full.len(), 48);
+        assert_eq!(full.last(), Some(&498));
+    }
+
+    #[test]
+    fn nothing_captured_runs_every_batch_eagerly() {
+        let dispatch = GraphDispatch::new(&[], 6);
+        assert_eq!(dispatch.mode(6, false), GraphMode::Eager);
+        assert_eq!(dispatch.mode(1, true), GraphMode::Eager);
     }
 
     fn verify_input(decodes: &[u32], prefills: &[(u32, u32)]) -> SpeculativeArchInput {
