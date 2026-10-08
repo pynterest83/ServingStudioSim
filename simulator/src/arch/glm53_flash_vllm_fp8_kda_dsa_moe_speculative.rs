@@ -102,9 +102,15 @@ const KPOOL_TAIL_PAGES: u32 = 1;
 /// vLLM runs the shared expert on an aux stream at or below this batch size.
 const SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: u32 = 256;
 /// `Parallel{overlap}` of the main-stream shared expert against the
-/// aux-stream router + routed experts. B200's measured value (union /
-/// isolated max 1.09-1.13); provisional on H200 until kernel-align.
-const SHARED_EXPERTS_STREAM_OVERLAP: f32 = 0.9;
+/// aux-stream router + routed experts, as H200 case-03 kernel-align implies it
+/// (simulated isolated branch / measured on-path branch + shared expert, per
+/// decode iteration): body layers p10/p50/p90 0.976 / 0.995 / 1.014, so the
+/// visible union is only ~1.025x the routed branch. B200's 0.9 (union 1.09-1.13)
+/// over-charged every H200 decode MoE by 11%
+/// (logs/20261008_3_h200_moe_decode in wt-glm53-h200-kda).
+const SHARED_EXPERTS_STREAM_OVERLAP: f32 = 0.98;
+/// The same for the MTP layer's MoE: p10/p50/p90 0.952 / 0.964 / 0.975.
+const MTP_SHARED_EXPERTS_STREAM_OVERLAP: f32 = 0.965;
 /// Draft-metadata rebuild and input preparation between MTP steps: about
 /// ten small launches per step (`_compute_slot_mappings`, paged-MQA
 /// metadata, token/request maps, `_update_draft_inputs`).
@@ -523,6 +529,8 @@ struct MoeBlock {
     shared_expert: Glm53Fp8MlpLocalWorklet,
     routed: Glm53TritonMoeTpLocalWorklet,
     combine_glue: Op<ElementwiseKernel>,
+    /// `Parallel{overlap}` of the shared expert and the router + routed branch.
+    shared_overlap: f32,
 }
 
 impl MoeBlock {
@@ -530,10 +538,12 @@ impl MoeBlock {
         name: String,
         resolved: &Glm53FlashSpecResolved,
         routed: &Glm53TritonMoeTpLocalWorkletResolved,
+        shared_overlap: f32,
         bridge: &PerfApiBridge,
     ) -> std::result::Result<Self, BuildError> {
         let m = name.as_str();
         Ok(Self {
+            shared_overlap,
             router: Glm53TritonMoeRouterLocalWorklet::build(
                 format!("{m}.router"),
                 resolved.router.clone(),
@@ -580,7 +590,7 @@ impl MoeBlock {
             ),
             child: Box::new(CostNode::Sum(vec![
                 CostNode::Parallel {
-                    overlap: SHARED_EXPERTS_STREAM_OVERLAP,
+                    overlap: self.shared_overlap,
                     children: vec![
                         concurrent_shared,
                         CostNode::Sum(vec![concurrent_router, concurrent_routed]),
@@ -785,7 +795,13 @@ impl MtpPass {
                 ResidualRmsNormKernel::build,
                 bridge,
             )?,
-            moe: MoeBlock::build(format!("{name}.moe"), resolved, routed, bridge)?,
+            moe: MoeBlock::build(
+                format!("{name}.moe"),
+                resolved,
+                routed,
+                MTP_SHARED_EXPERTS_STREAM_OVERLAP,
+                bridge,
+            )?,
             ffn_all_reduce: TpAllReduce::build(name, "ffn_all_reduce", cfg, bridge)?,
             head_norm: atomic(
                 name,
@@ -949,6 +965,7 @@ pub fn build(
                 format!("{p}.moe"),
                 &resolved,
                 &resolved.routed_body,
+                SHARED_EXPERTS_STREAM_OVERLAP,
                 bridge,
             )?),
         };
