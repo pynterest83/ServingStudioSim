@@ -178,6 +178,7 @@ impl Deployment for UnifiedDeployment {
             kv_log_stride: cfg.io.kv_log_stride,
             gpu_time_multiplier,
             prefill_gpu_time_multiplier: prefill_gpu_time_multiplier(&g.worker)?,
+            host_time: host_time_model(&g.worker)?,
             max_batch_tokens,
             pending_order,
             batch_policy,
@@ -858,6 +859,18 @@ fn prefill_gpu_time_multiplier(worker: &IterWorkerSel) -> anyhow::Result<Option<
     Ok(multiplier)
 }
 
+/// Host-time model, carried by the `speculative` selector only: the GLM-5.3
+/// H200 MTP arch is the one that reports its graph mode. Other selectors reject
+/// the knobs through the launcher's unknown-key guard.
+fn host_time_model(
+    worker: &IterWorkerSel,
+) -> anyhow::Result<Option<crate::worker::config::HostTimeModel>> {
+    match worker {
+        IterWorkerSel::Speculative { host_time, .. } => host_time.resolve(),
+        _ => Ok(None),
+    }
+}
+
 /// Draft candidate count, carried by the `speculative` selector only. Every other
 /// worker leaves it at `0`, which is what marks it as not speculating.
 fn speculative_draft_tokens(worker: &IterWorkerSel) -> u32 {
@@ -1246,6 +1259,7 @@ pools:
             kv_admission: Default::default(),
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
+            host_time: Default::default(),
         }
     }
 

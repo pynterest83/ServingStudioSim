@@ -18,6 +18,7 @@ use schema_derive::{ParamStruct, ProviderSchema};
 
 use super::admission::PendingOrderKind;
 use super::kv::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
+use crate::arch::GraphMode;
 
 /// Batch-composition policy for the chunked-prefill worker. Closed set → serde
 /// enum (kebab-case matches the historical CLI spelling).
@@ -180,6 +181,107 @@ impl KvAdmissionSpec {
             "kv_retract_decode_steps must be positive"
         );
         Ok(KvAdmissionConfig::BoundedFuture(config))
+    }
+}
+
+/// An engine step's host-side cost: the iteration lasts
+/// `max(kernel_time + fixed_ms, floor_ms[graph mode])`, where `kernel_time`
+/// already carries the worker's GPU-time multiplier.
+///
+/// A host-bound engine (Python launching every kernel of an eager forward)
+/// cannot be expressed by a multiplier, which scales with kernel time; its
+/// cycle is a floor set by the launch count of the graph mode. `fixed_ms` is
+/// the per-step host work that never overlaps the GPU (scheduling, sampling
+/// sync). Applied once per engine step; see `CostBuffers::run_speculative_iter`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HostTimeModel {
+    pub fixed_ms: f64,
+    pub floor_ms: HostFloorMs,
+}
+
+/// Per-graph-mode host floor (ms) of one engine step. Eager splits by whether
+/// the step schedules prefill: the two launch different kernel sequences.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HostFloorMs {
+    pub full_graph: f64,
+    pub piecewise: f64,
+    pub eager_prefill: f64,
+    pub eager_decode: f64,
+}
+
+impl HostTimeModel {
+    /// The floor for one step in `mode`.
+    pub fn floor_ms(&self, mode: GraphMode, schedules_prefill: bool) -> f64 {
+        match mode {
+            GraphMode::FullGraph => self.floor_ms.full_graph,
+            GraphMode::Piecewise => self.floor_ms.piecewise,
+            GraphMode::Eager if schedules_prefill => self.floor_ms.eager_prefill,
+            GraphMode::Eager => self.floor_ms.eager_decode,
+        }
+    }
+}
+
+/// Selector-level host-time knobs, flattened into the `speculative` worker
+/// document as five scalars so the launcher can sweep each. All absent keeps
+/// the multiplier-only clock; all present enables [`HostTimeModel`]; a partial
+/// set is an error rather than a silent zero floor.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize, ParamStruct)]
+pub struct HostTimeSpec {
+    /// Host time (ms) added to every engine step's kernel time.
+    #[serde(default)]
+    host_fixed_ms: Option<f64>,
+    /// Host floor (ms) of a step that replays one FULL CUDA graph.
+    #[serde(default)]
+    host_floor_full_graph_ms: Option<f64>,
+    /// Host floor (ms) of a step that replays PIECEWISE CUDA graphs.
+    #[serde(default)]
+    host_floor_piecewise_ms: Option<f64>,
+    /// Host floor (ms) of an eager step that schedules prefill.
+    #[serde(default)]
+    host_floor_eager_prefill_ms: Option<f64>,
+    /// Host floor (ms) of an eager decode-only step.
+    #[serde(default)]
+    host_floor_eager_decode_ms: Option<f64>,
+}
+
+impl HostTimeSpec {
+    pub(crate) fn resolve(self) -> Result<Option<HostTimeModel>> {
+        let fields = [
+            ("host_fixed_ms", self.host_fixed_ms),
+            ("host_floor_full_graph_ms", self.host_floor_full_graph_ms),
+            ("host_floor_piecewise_ms", self.host_floor_piecewise_ms),
+            (
+                "host_floor_eager_prefill_ms",
+                self.host_floor_eager_prefill_ms,
+            ),
+            (
+                "host_floor_eager_decode_ms",
+                self.host_floor_eager_decode_ms,
+            ),
+        ];
+        if fields.iter().all(|(_, value)| value.is_none()) {
+            return Ok(None);
+        }
+        let mut values = [0.0; 5];
+        for (slot, (name, value)) in values.iter_mut().zip(fields) {
+            let value =
+                value.ok_or_else(|| anyhow::anyhow!("host-time model requires {name} too"))?;
+            ensure!(
+                value.is_finite() && value >= 0.0,
+                "{name} must be finite and >= 0, got {value}"
+            );
+            *slot = value;
+        }
+        let [fixed_ms, full_graph, piecewise, eager_prefill, eager_decode] = values;
+        Ok(Some(HostTimeModel {
+            fixed_ms,
+            floor_ms: HostFloorMs {
+                full_graph,
+                piecewise,
+                eager_prefill,
+                eager_decode,
+            },
+        }))
     }
 }
 
@@ -380,6 +482,10 @@ pub enum IterWorkerSel {
         /// See [`IterWorkerSel::ChunkedPrefill`]'s field of the same name.
         #[serde(default)]
         prefill_gpu_time_multiplier: Option<f64>,
+        /// Optional host-time model: per-step fixed host time and per-graph-mode
+        /// floors. Requires an arch that reports its graph mode.
+        #[serde(flatten)]
+        host_time: HostTimeSpec,
     },
     /// PD prefill half: prefills then hands off to a decode pool (no local decode).
     PdPrefill {
@@ -668,5 +774,35 @@ mod tests {
                 }
             ))
         ));
+    }
+
+    fn speculative_host_time(extra: &str) -> Result<Option<HostTimeModel>> {
+        let worker: IterWorkerSel = serde_yaml::from_str(&format!(
+            "type: speculative\nattn_gpu_memory_gb: 80.0\nmax_batch_tokens: 8192\ndraft_tokens: 5\n{extra}"
+        ))
+        .expect("parse speculative worker");
+        let IterWorkerSel::Speculative { host_time, .. } = worker else {
+            panic!("expected the speculative selector")
+        };
+        host_time.resolve()
+    }
+
+    #[test]
+    fn host_time_is_off_unless_every_knob_is_set() {
+        assert_eq!(speculative_host_time("").unwrap(), None);
+        let all = "host_fixed_ms: 0.7\nhost_floor_full_graph_ms: 10\n\
+                   host_floor_piecewise_ms: 47.5\nhost_floor_eager_prefill_ms: 120\n\
+                   host_floor_eager_decode_ms: 90\n";
+        let model = speculative_host_time(all).unwrap().expect("all knobs set");
+        assert_eq!(model.fixed_ms, 0.7);
+        assert_eq!(model.floor_ms(GraphMode::FullGraph, false), 10.0);
+        assert_eq!(model.floor_ms(GraphMode::Piecewise, true), 47.5);
+        assert_eq!(model.floor_ms(GraphMode::Eager, true), 120.0);
+        assert_eq!(model.floor_ms(GraphMode::Eager, false), 90.0);
+
+        let partial = speculative_host_time("host_fixed_ms: 0.7\n").unwrap_err();
+        assert!(partial.to_string().contains("host_floor_full_graph_ms"));
+        let negative = all.replace("host_fixed_ms: 0.7", "host_fixed_ms: -1");
+        assert!(speculative_host_time(&negative).is_err());
     }
 }

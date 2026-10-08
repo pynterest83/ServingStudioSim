@@ -240,6 +240,7 @@ mod tests {
             energy_j: 0.1,
             section: "iter",
             layer: -1,
+            graph_mode: None,
             group_len: 1,
             slot_len: slot_count,
             slot_input_len: 0,

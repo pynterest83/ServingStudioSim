@@ -31,7 +31,9 @@ use crate::deployment::config::{IoSpec, WorkloadSpec};
 use crate::orchestrator::config::{GroupSpec, PoolSpec};
 use crate::schema::ParamDef;
 use crate::timing_predict::{PredictGroup, SpeculativePredictGroup};
-use crate::worker::config::{AttnWorkerSel, FfnWorkerSel, IterWorkerSel, KvAdmissionSpec};
+use crate::worker::config::{
+    AttnWorkerSel, FfnWorkerSel, HostTimeSpec, IterWorkerSel, KvAdmissionSpec,
+};
 
 /// Serialize a `const PARAMS` slice to a JSON array of ParamDef objects.
 fn params(p: &[ParamDef]) -> Value {
@@ -43,7 +45,8 @@ fn providers(schema: &[(&str, &[ParamDef])]) -> Value {
     providers_with_flattened(schema, &[])
 }
 
-/// Add params from selector components flattened into only one provider tag.
+/// Add params from selector components flattened into one provider tag; a tag
+/// may list several components.
 fn providers_with_flattened(
     schema: &[(&str, &[ParamDef])],
     flattened: &[(&str, &[ParamDef])],
@@ -51,7 +54,7 @@ fn providers_with_flattened(
     let mut m = Map::new();
     for (tag, p) in schema {
         let mut provider_params = p.to_vec();
-        if let Some((_, extra)) = flattened.iter().find(|(owner, _)| owner == tag) {
+        for (_, extra) in flattened.iter().filter(|(owner, _)| owner == tag) {
             provider_params.extend_from_slice(extra);
         }
         m.insert(
@@ -82,6 +85,7 @@ pub fn list_params() -> Value {
                     &[
                         ("chunked_prefill", KvAdmissionSpec::PARAMS),
                         ("speculative", KvAdmissionSpec::PARAMS),
+                        ("speculative", HostTimeSpec::PARAMS),
                     ],
                 ),
                 "layer_wise_attn": providers(AttnWorkerSel::SCHEMA),
@@ -312,6 +316,42 @@ mod tests {
         let schema = list_params();
         for worker in ["chunked_prefill", "speculative"] {
             check_flattened_kv_admission_spec(&schema, worker);
+        }
+    }
+
+    /// Only the speculative selector carries the host-time knobs, each an
+    /// omittable float the launcher can sweep.
+    #[test]
+    fn only_the_speculative_worker_exposes_the_host_time_knobs() {
+        let schema = list_params();
+        let names = |worker: &str| -> Vec<String> {
+            schema["providers"]["worker"]["iter_wise"][worker]["params"]
+                .as_array()
+                .expect("worker params are an array")
+                .iter()
+                .map(|param| param["name"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let knobs = [
+            "host_fixed_ms",
+            "host_floor_full_graph_ms",
+            "host_floor_piecewise_ms",
+            "host_floor_eager_prefill_ms",
+            "host_floor_eager_decode_ms",
+        ];
+        let speculative = &schema["providers"]["worker"]["iter_wise"]["speculative"]["params"];
+        for knob in knobs {
+            let param = speculative
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|param| param["name"] == knob)
+                .unwrap_or_else(|| panic!("speculative exposes {knob}"));
+            assert_eq!(
+                (&param["type"], &param["required"]),
+                (&json!("float"), &json!(false))
+            );
+            assert!(!names("chunked_prefill").iter().any(|name| name == knob));
         }
     }
 

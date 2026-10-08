@@ -218,6 +218,10 @@ pub struct CostLogEntry {
     /// Layer index this row costs; `-1` when the row is whole-iteration (the
     /// iter-wise Scale-folded form, where one row covers all layers).
     pub layer: i16,
+    /// How the engine launched this step
+    /// ([`GraphMode::as_str`](crate::arch::GraphMode::as_str)); `None` when
+    /// the arch does not report it or the row is not a whole engine step.
+    pub graph_mode: Option<&'static str>,
     /// Number of entries in [`CostLogChunk::group_logs`] belonging to this row.
     pub group_len: usize,
     /// Number of entries in [`CostLogChunk::slot_times`] / [`CostLogChunk::slot_covs`]
@@ -387,6 +391,7 @@ pub(crate) fn cost_to_record_batch(chunk: &CostLogChunk) -> Result<RecordBatch> 
     let energy: Vec<f64> = entries.iter().map(|e| e.energy_j).collect();
     let section: Vec<&str> = entries.iter().map(|e| e.section).collect();
     let layer: Vec<i16> = entries.iter().map(|e| e.layer).collect();
+    let graph_mode: Vec<Option<&str>> = entries.iter().map(|e| e.graph_mode).collect();
 
     // Per-iteration input_section: one List<Struct> entry per row.
     let groups = build_groups_column(entries, &chunk.group_logs);
@@ -494,6 +499,7 @@ pub(crate) fn cost_to_record_batch(chunk: &CostLogChunk) -> Result<RecordBatch> 
             Arc::new(flops_builder.finish()),
             Arc::new(bytes_builder.finish()),
             Arc::new(backend_builder.finish()),
+            Arc::new(StringArray::from(graph_mode)),
         ],
     )?)
 }
@@ -1007,6 +1013,7 @@ mod tests {
                 energy_j: 0.5,
                 section: "iter",
                 layer: -1,
+                graph_mode: Some("eager"),
                 group_len: 2,
                 slot_len: 3,
                 slot_input_len: 0,
@@ -1020,6 +1027,7 @@ mod tests {
                 energy_j: 0.2,
                 section: "iter",
                 layer: -1,
+                graph_mode: None,
                 group_len: 1,
                 slot_len: 3,
                 slot_input_len: 0,
@@ -1111,6 +1119,15 @@ mod tests {
         let backend1 = backend_col.value(1);
         let backend1 = backend1.as_any().downcast_ref::<UInt8Array>().unwrap();
         assert_eq!(backend1.values(), &[2, 0, 255]);
+        // graph_mode is one nullable string per row.
+        let graph_mode = batch
+            .column_by_name("graph_mode")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(graph_mode.value(0), "eager");
+        assert!(graph_mode.is_null(1));
         let pool = batch
             .column(0)
             .as_any()

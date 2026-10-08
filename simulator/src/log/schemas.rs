@@ -152,6 +152,12 @@ pub fn cost_log_schema() -> Arc<Schema> {
             false,
         )
         .with_metadata([("none".to_string(), LeafMetrics::NO_BACKEND.to_string())].into()),
+        // How the engine launched this step (`full_graph` / `piecewise` /
+        // `eager`, `GraphMode::as_str`), so an analyzer can stratify host
+        // overhead by it. Null when the arch does not report a graph mode and
+        // on per-section AFD rows. Appended last: append-only, so old readers
+        // are unaffected.
+        Field::new("graph_mode", DataType::Utf8, true),
     ]))
 }
 

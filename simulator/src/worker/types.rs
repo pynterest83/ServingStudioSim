@@ -462,6 +462,11 @@ pub struct WorkerConfig {
     /// Multiplier for prefill-bearing iterations (from the chunked-prefill
     /// selector). `None` applies `gpu_time_multiplier` to every iteration.
     pub prefill_gpu_time_multiplier: Option<f64>,
+    /// Host-time model of one engine step (from the speculative selector):
+    /// `max(kernel × multiplier + fixed, floor[graph mode])`. `None` keeps the
+    /// multiplier-only clock. Passed to `CostBuffers`, which applies it once per
+    /// whole-iteration eval.
+    pub host_time: Option<crate::worker::config::HostTimeModel>,
     /// Optional per-iteration prefill token budget (from the worker selector).
     /// `Some(n)`: admission reserves the budget for live decodes (1 tok/req)
     /// then fills the remainder with whole prefills, force-admitting one
@@ -511,6 +516,7 @@ impl Default for WorkerConfig {
             kv_log_stride: 8,
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
+            host_time: None,
             max_batch_tokens: None,
             pending_order: crate::worker::admission::PendingOrderKind::default(),
             batch_policy: crate::worker::config::BatchPolicy::Mix,

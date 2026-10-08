@@ -24,12 +24,13 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::path::PathBuf;
 
 use crate::arch::contract::{
-    ArchGroupInput, IterwiseUnifiedModel, SpeculativeArchGroupInput, SpeculativeArchInput,
-    SpeculativeUnifiedModel, UnifiedArchInput,
+    ArchGroupInput, GraphMode, IterwiseUnifiedModel, SpeculativeArchGroupInput,
+    SpeculativeArchInput, SpeculativeUnifiedModel, UnifiedArchInput,
 };
 use crate::common::{Time, WorkerId};
 use crate::log::{CostLogEntry, CostLogger, GroupInputLog};
 use crate::timing::{CostManifestDoc, LeafMetrics, SlotInput};
+use crate::worker::config::HostTimeModel;
 
 /// Upper bound on distinct cached section results per worker. AFD attn keys churn
 /// as KV grows (~a few new keys per iteration), so the table is cleared wholesale
@@ -123,6 +124,10 @@ pub struct CostBuffers {
     /// schedules any prefill tokens. Equals `gpu_time_multiplier` unless set by
     /// [`with_prefill_gpu_time_multiplier`](Self::with_prefill_gpu_time_multiplier).
     prefill_gpu_time_multiplier: f64,
+    /// Host-time model applied once per whole engine step (the iter paths);
+    /// `None` keeps the multiplier-only clock. Set by
+    /// [`with_host_time`](Self::with_host_time).
+    host_time: Option<HostTimeModel>,
 }
 
 impl CostBuffers {
@@ -159,6 +164,7 @@ impl CostBuffers {
             key_scratch: Vec::new(),
             gpu_time_multiplier,
             prefill_gpu_time_multiplier: gpu_time_multiplier,
+            host_time: None,
         }
     }
 
@@ -169,6 +175,16 @@ impl CostBuffers {
         if let Some(multiplier) = multiplier {
             self.prefill_gpu_time_multiplier = multiplier;
         }
+        self
+    }
+
+    /// Bound every whole engine step below by the host: its wall time becomes
+    /// `max(kernel × multiplier + fixed_ms, floor_ms[graph mode])`. `None`
+    /// keeps the multiplier-only clock. Only the iter paths apply it: an AFD
+    /// section row is one layer, not an engine step. The model must report its
+    /// graph mode ([`SpeculativeUnifiedModel::graph_mode`]).
+    pub fn with_host_time(mut self, host_time: Option<HostTimeModel>) -> Self {
+        self.host_time = host_time;
         self
     }
 
@@ -234,16 +250,16 @@ impl CostBuffers {
             Option<&mut Vec<SlotInput>>,
         ) -> LeafMetrics,
     {
-        let multiplier = self.gpu_time_multiplier;
-        self.run_section_scaled(
-            section, layer, iter_id, batch_id, groups, cache_key, now, multiplier, eval,
+        let clock = StepClock::scaled(self.gpu_time_multiplier);
+        self.run_section_clocked(
+            section, layer, iter_id, batch_id, groups, cache_key, now, clock, eval,
         )
     }
 
-    /// [`run_section`](Self::run_section) with the wall-time multiplier chosen
-    /// by the caller.
+    /// [`run_section`](Self::run_section) with the caller's [`StepClock`]:
+    /// the wall-time rule and the graph mode the row records.
     #[allow(clippy::too_many_arguments)]
-    fn run_section_scaled<G, F>(
+    fn run_section_clocked<G, F>(
         &mut self,
         section: &'static str,
         layer: i16,
@@ -252,7 +268,7 @@ impl CostBuffers {
         groups: &G,
         cache_key: Option<&[u32]>,
         now: Time,
-        multiplier: f64,
+        clock: StepClock,
         eval: F,
     ) -> Time
     where
@@ -296,6 +312,7 @@ impl CostBuffers {
                         energy_j: agg.m.energy_j as f64,
                         section,
                         layer,
+                        graph_mode: clock.graph_mode.map(GraphMode::as_str),
                         group_len: 0,
                         slot_len: 0,
                         slot_input_len: 0,
@@ -306,7 +323,7 @@ impl CostBuffers {
                         tracing::warn!("cost_log record failed: {e}");
                     }
                 }
-                return wall_time(&agg, multiplier);
+                return clock.wall_time(&agg);
             }
         }
 
@@ -330,6 +347,7 @@ impl CostBuffers {
                 energy_j: agg.m.energy_j as f64,
                 section,
                 layer,
+                graph_mode: clock.graph_mode.map(GraphMode::as_str),
                 // Filled by `logger.record` from the slice lengths.
                 group_len: 0,
                 slot_len: 0,
@@ -362,7 +380,7 @@ impl CostBuffers {
             }
             self.cache.insert(self.key_scratch.as_slice().into(), snap);
         }
-        wall_time(&agg, multiplier)
+        clock.wall_time(&agg)
     }
 
     /// Iter-wise convenience over [`run_section`](Self::run_section): the whole
@@ -379,9 +397,9 @@ impl CostBuffers {
     ) -> Time {
         // One batch per iteration today; AFD/TBO emit several batches sharing an
         // iter_id with distinct batch_id via `run_section` instead.
-        // `run_section_scaled` applies the stage's multiplier and returns wall Time.
-        let multiplier =
-            self.iter_multiplier(arch_input.groups.iter().any(|g| g.prefill_tokens > 0));
+        // `run_section_clocked` applies the step's clock and returns wall Time.
+        // The ordinary iter-wise contract reports no graph mode.
+        let clock = self.iter_clock(arch_input.groups.iter().any(|g| g.prefill_tokens > 0), None);
         let eval = |slots: &mut Vec<LeafMetrics>,
                     scratch: &mut Vec<LeafMetrics>,
                     inputs: Option<&mut Vec<SlotInput>>| match inputs {
@@ -393,9 +411,9 @@ impl CostBuffers {
             let groups = DecodeKvLensGroupLog {
                 groups: &arch_input.groups,
             };
-            self.run_section_scaled("iter", -1, iter_id, 0, &groups, None, now, multiplier, eval)
+            self.run_section_clocked("iter", -1, iter_id, 0, &groups, None, now, clock, eval)
         } else {
-            self.run_section_scaled(
+            self.run_section_clocked(
                 "iter",
                 -1,
                 iter_id,
@@ -403,19 +421,35 @@ impl CostBuffers {
                 &arch_input.groups,
                 None,
                 now,
-                multiplier,
+                clock,
                 eval,
             )
         }
     }
 
-    /// The wall-time multiplier of one whole iteration: the prefill one when it
-    /// schedules any prefill tokens, `gpu_time_multiplier` otherwise.
-    fn iter_multiplier(&self, schedules_prefill: bool) -> f64 {
-        if schedules_prefill {
+    /// The clock of one whole engine step: the prefill multiplier when it
+    /// schedules any prefill tokens, `gpu_time_multiplier` otherwise, then the
+    /// host-time floor of its graph mode when a host-time model is set.
+    fn iter_clock(&self, schedules_prefill: bool, graph_mode: Option<GraphMode>) -> StepClock {
+        let multiplier = if schedules_prefill {
             self.prefill_gpu_time_multiplier
         } else {
             self.gpu_time_multiplier
+        };
+        let host = self.host_time.map(|host_time| {
+            let mode = graph_mode.expect(
+                "a host-time model needs the arch's graph mode; this arch reports none \
+                 (SpeculativeUnifiedModel::graph_mode)",
+            );
+            HostStep {
+                fixed_ms: host_time.fixed_ms,
+                floor_ms: host_time.floor_ms(mode, schedules_prefill),
+            }
+        });
+        StepClock {
+            multiplier,
+            host,
+            graph_mode,
         }
     }
 
@@ -423,6 +457,12 @@ impl CostBuffers {
     /// `iter` section and stage multiplier, evaluated through the speculative
     /// face and logged through [`SpeculativeGroupLog`] so the row separates
     /// decode query rows from decode request count.
+    ///
+    /// This is where the host-time floor enters a speculating worker: once per
+    /// engine step, over the verify pass and every draft step together, since
+    /// the model folds them into one `iter` eval and the measured host floor
+    /// covers the whole step. The row records the arch's graph mode whether or
+    /// not a host-time model is set.
     pub fn run_speculative_iter<M: SpeculativeUnifiedModel + ?Sized>(
         &mut self,
         model: &M,
@@ -430,9 +470,11 @@ impl CostBuffers {
         iter_id: u64,
         now: Time,
     ) -> Time {
-        let multiplier =
-            self.iter_multiplier(arch_input.groups.iter().any(|g| g.prefill_tokens > 0));
-        self.run_section_scaled(
+        let clock = self.iter_clock(
+            arch_input.groups.iter().any(|g| g.prefill_tokens > 0),
+            model.graph_mode(arch_input),
+        );
+        self.run_section_clocked(
             "iter",
             -1,
             iter_id,
@@ -444,7 +486,7 @@ impl CostBuffers {
             },
             None, // one fused eval per iteration — nothing to memoize
             now,
-            multiplier,
+            clock,
             |slots, scratch, inputs| match inputs {
                 Some(i) => model.eval_speculative_iter_with_inputs(arch_input, slots, scratch, i),
                 None => model.eval_speculative_iter(arch_input, slots, scratch),
@@ -453,12 +495,47 @@ impl CostBuffers {
     }
 }
 
-/// kernel-folded time → wall `Time`, applying the inter-kernel multiplier
-/// (≥ 1.0). The single place the overhead enters the clock; `cost_log` rows are
-/// written pre-scale (pure kernel) by the callers above, so folding a row's
-/// `slot_time_ms` still reproduces its `total_time_ms`.
-fn wall_time(agg: &LeafMetrics, multiplier: f64) -> Time {
-    Time::from_ms(agg.m.time_ms as f64 * multiplier)
+/// How one evaluated section's kernel time becomes the worker's wall time, and
+/// the graph mode its `cost_log` row records.
+#[derive(Clone, Copy, Debug)]
+struct StepClock {
+    /// Inter-kernel multiplier (≥ 1.0).
+    multiplier: f64,
+    /// The host-time terms of this step, when a host-time model is set.
+    host: Option<HostStep>,
+    graph_mode: Option<GraphMode>,
+}
+
+/// One engine step's host-time terms, already resolved for its graph mode.
+#[derive(Clone, Copy, Debug)]
+struct HostStep {
+    fixed_ms: f64,
+    floor_ms: f64,
+}
+
+impl StepClock {
+    /// The multiplier-only clock of a section that is not a whole engine step.
+    fn scaled(multiplier: f64) -> Self {
+        Self {
+            multiplier,
+            host: None,
+            graph_mode: None,
+        }
+    }
+
+    /// kernel-folded time → wall `Time`: `kernel × multiplier`, then
+    /// `max(· + fixed_ms, floor_ms)` under a host-time model. The single place
+    /// overhead enters the clock; `cost_log` rows are written pre-scale (pure
+    /// kernel) by the callers above, so folding a row's `slot_time_ms` still
+    /// reproduces its `total_time_ms`. Without a host-time model the expression
+    /// is exactly the multiplier-only one.
+    fn wall_time(self, agg: &LeafMetrics) -> Time {
+        let scaled_ms = agg.m.time_ms as f64 * self.multiplier;
+        match self.host {
+            None => Time::from_ms(scaled_ms),
+            Some(host) => Time::from_ms((scaled_ms + host.fixed_ms).max(host.floor_ms)),
+        }
+    }
 }
 
 /// The per-row `input_section` source for [`CostBuffers::run_section`]. Different
@@ -832,6 +909,205 @@ mod tests {
             staged.run_speculative_iter(&model, &mixed, 1, now).as_ms(),
             3.0
         );
+    }
+
+    /// A speculative model with a fixed kernel time and a configurable graph
+    /// mode, for the host-time clock.
+    struct FixedSpeculativeModel {
+        time_ms: f32,
+        graph_mode: Option<GraphMode>,
+    }
+
+    impl SpeculativeUnifiedModel for FixedSpeculativeModel {
+        fn eval_speculative_iter(
+            &self,
+            _batch: &SpeculativeArchInput,
+            slots: &mut Vec<LeafMetrics>,
+            _scratch: &mut Vec<LeafMetrics>,
+        ) -> LeafMetrics {
+            slots.clear();
+            leaf(self.time_ms)
+        }
+        fn graph_mode(&self, _batch: &SpeculativeArchInput) -> Option<GraphMode> {
+            self.graph_mode
+        }
+        fn total_kv_bytes_per_token(&self) -> u64 {
+            1
+        }
+        fn max_model_len(&self) -> u32 {
+            4096
+        }
+        fn gpus_per_replica(&self) -> u16 {
+            1
+        }
+    }
+
+    fn host_time() -> HostTimeModel {
+        HostTimeModel {
+            fixed_ms: 0.7,
+            floor_ms: crate::worker::config::HostFloorMs {
+                full_graph: 10.0,
+                piecewise: 45.0,
+                eager_prefill: 120.0,
+                eager_decode: 90.0,
+            },
+        }
+    }
+
+    fn verify_batches() -> (SpeculativeArchInput, SpeculativeArchInput) {
+        let decode = SpeculativeArchInput {
+            draft_tokens: 5,
+            groups: vec![SpeculativeArchGroupInput {
+                batch_tokens: 6,
+                decode_tokens: 6,
+                ..Default::default()
+            }],
+            tokens_per_source_rank: Vec::new(),
+        };
+        let mut mixed = decode.clone();
+        mixed.groups[0].prefill_chunk_pairs = vec![(0, 512)];
+        mixed.groups[0].prefill_tokens = 512;
+        mixed.groups[0].batch_tokens += 512;
+        (decode, mixed)
+    }
+
+    fn host_clocked(multiplier: f64) -> CostBuffers {
+        CostBuffers::new(None, "iter", WorkerId(0), &trivial_manifest(), multiplier)
+            .with_host_time(Some(host_time()))
+    }
+
+    /// The step lasts `max(kernel × multiplier + fixed, floor)`: the floor wins
+    /// while the scaled kernel time plus the fixed host time stays below it.
+    #[test]
+    fn host_time_takes_the_max_of_kernel_plus_fixed_and_the_floor() {
+        let (decode, _) = verify_batches();
+        let now = Time::from_ms(0.0);
+        let floored = FixedSpeculativeModel {
+            time_ms: 4.0,
+            graph_mode: Some(GraphMode::FullGraph),
+        };
+        // 4 × 1.25 + 0.7 = 5.7 < 10: the FULL-graph floor.
+        assert_eq!(
+            host_clocked(1.25)
+                .run_speculative_iter(&floored, &decode, 0, now)
+                .as_ms(),
+            10.0
+        );
+        let kernel_bound = FixedSpeculativeModel {
+            time_ms: 40.0,
+            graph_mode: Some(GraphMode::FullGraph),
+        };
+        // 40 × 1.25 + 0.7 = 50.7 > 10: kernel time plus the fixed host time.
+        let wall = host_clocked(1.25)
+            .run_speculative_iter(&kernel_bound, &decode, 0, now)
+            .as_ms();
+        assert!((wall - 50.7).abs() < 1e-9, "{wall}");
+    }
+
+    /// Eager looks up its floor by whether the step schedules prefill; the
+    /// graphed modes have one floor each.
+    #[test]
+    fn host_floor_follows_the_graph_mode_and_eager_prefill_split() {
+        let (decode, mixed) = verify_batches();
+        let now = Time::from_ms(0.0);
+        let wall = |mode: GraphMode, batch: &SpeculativeArchInput| {
+            let model = FixedSpeculativeModel {
+                time_ms: 1.0,
+                graph_mode: Some(mode),
+            };
+            host_clocked(1.0)
+                .run_speculative_iter(&model, batch, 0, now)
+                .as_ms()
+        };
+        assert_eq!(wall(GraphMode::FullGraph, &decode), 10.0);
+        assert_eq!(wall(GraphMode::Piecewise, &mixed), 45.0);
+        assert_eq!(wall(GraphMode::Eager, &mixed), 120.0);
+        assert_eq!(wall(GraphMode::Eager, &decode), 90.0);
+    }
+
+    /// Without a host-time model the clock is exactly the multiplier-only one,
+    /// whatever graph mode the arch reports.
+    #[test]
+    fn an_unset_host_time_model_keeps_the_multiplier_clock_bit_identical() {
+        let (decode, mixed) = verify_batches();
+        let now = Time::from_ms(0.0);
+        let model = FixedSpeculativeModel {
+            time_ms: 3.3,
+            graph_mode: Some(GraphMode::Eager),
+        };
+        let mut unset = CostBuffers::new(None, "iter", WorkerId(0), &trivial_manifest(), 1.635)
+            .with_prefill_gpu_time_multiplier(Some(1.9))
+            .with_host_time(None);
+        for (batch, multiplier) in [(&decode, 1.635), (&mixed, 1.9)] {
+            let wall = unset.run_speculative_iter(&model, batch, 0, now);
+            assert_eq!(wall, Time::from_ms(3.3_f32 as f64 * multiplier));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "a host-time model needs the arch's graph mode")]
+    fn a_host_time_model_rejects_an_arch_without_a_graph_mode() {
+        let (decode, _) = verify_batches();
+        let model = FixedSpeculativeModel {
+            time_ms: 1.0,
+            graph_mode: None,
+        };
+        host_clocked(1.0).run_speculative_iter(&model, &decode, 0, Time::from_ms(0.0));
+    }
+
+    /// The row records the arch's graph mode, and stays pre-scale: the host
+    /// floor surfaces as a gap between rows, not in `total_time_ms`.
+    #[test]
+    fn the_cost_log_row_records_the_graph_mode_and_the_kernel_time() {
+        let dir = tempdir().unwrap();
+        let (decode, mixed) = verify_batches();
+        let mut cost = CostBuffers::new(
+            Some(dir.path().to_path_buf()),
+            "iter",
+            WorkerId(0),
+            &trivial_manifest(),
+            1.0,
+        )
+        .with_host_time(Some(host_time()));
+        let graphed = FixedSpeculativeModel {
+            time_ms: 2.0,
+            graph_mode: Some(GraphMode::FullGraph),
+        };
+        let eager = FixedSpeculativeModel {
+            time_ms: 2.0,
+            graph_mode: Some(GraphMode::Eager),
+        };
+        let now = Time::from_ms(0.0);
+        assert_eq!(
+            cost.run_speculative_iter(&graphed, &decode, 0, now).as_ms(),
+            10.0
+        );
+        assert_eq!(
+            cost.run_speculative_iter(&eager, &mixed, 1, now).as_ms(),
+            120.0
+        );
+        drop(cost);
+
+        let path = dir.path().join("raw/cost_log/worker_iter_0.parquet");
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&path).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        let mode = batch
+            .column_by_name("graph_mode")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        assert_eq!((mode.value(0), mode.value(1)), ("full_graph", "eager"));
+        let total = batch
+            .column_by_name("total_time_ms")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!((total.value(0), total.value(1)), (2.0, 2.0));
     }
 
     /// With a logger attached, every call still emits one `cost_log` row (a hit does
