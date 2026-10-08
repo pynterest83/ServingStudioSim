@@ -21,18 +21,28 @@
 //!   `index_topk` (`_use_dense_mha_prefill`; the masked-MHA path is sm100
 //!   only): the `kv_b` up-projection, then FlashAttention varlen causal;
 //! - verify rows (and prefill rows of a longer batch) run sparse MQA:
-//!   `W_UK` absorb, the index remap, FlashAttention over the top-k block
-//!   table (`prepare_varlen_num_blocks`, `FlashAttnFwdSm90`,
-//!   `FlashAttnFwdCombine`), then `W_UV`.
+//!   `W_UK` absorb, the index remap, the zero fill of FA3's 64-wide rope-free
+//!   query (`q_nope.new_zeros(..., 64)` in `_run_mqa_kernel`), FlashAttention
+//!   over the top-k block table, then `W_UV`.
+//!
+//! The sparse FlashAttention is ONE `forward_mqa` call per layer over every
+//! MQA row, decode rows first (vLLM only splits it per decode / prefill under
+//! HiSparse, which this deployment does not enable). It is priced on the
+//! `dsa_sparse_mla_attention` L1 kind, backend `vllm_fa3_sparse_bf16`, whose
+//! measured call is `prepare_varlen_num_blocks` + `FlashAttnFwdSm90` +
+//! `FlashAttnFwdCombine`, the combine only at 992 rows or fewer
+//! (`FA3_COMBINE_MAX_QUERIES`). The call's rows are collapsed onto the kind's
+//! `PooledUniformFull` encoding with the same total of valid slots (see
+//! `sparse_attention_input`).
 //!
 //! The BF16 latent is appended with `concat_and_cache_mla<bf16, bf16>`; there is
 //! no query FP8 quant and no query concat (both FP8-cache artifacts on B200).
 //!
-//! First-cut placeholders, labeled until their L1 lands (plan M4): the sparse
-//! and dense FlashAttention calls and the combine, and the index remap, are
-//! byte-sized elementwise leaves; the small indexer kernels keep the B200
-//! byte formulas and effective-bandwidth factors (provisional on H200). The
-//! glue launch counts are H200-measured per forward kind.
+//! First-cut placeholders, labeled until their L1 lands (plan M4): the dense
+//! FlashAttention call and the index remap are byte-sized elementwise leaves;
+//! the small indexer kernels keep the B200 byte formulas and
+//! effective-bandwidth factors (provisional on H200). The glue launch counts
+//! are H200-measured per forward kind.
 
 use crate::common::gpu::compute_capability;
 use crate::op::Op;
@@ -42,16 +52,19 @@ use crate::timing::kernels::{
     DsaMqaLogitsPrefillKernelConfig, DsaMqaLogitsPrefillKernelInput, DsaPagedMqaLogitsDecodeKernel,
     DsaPagedMqaLogitsDecodeKernelConfig, DsaPagedMqaLogitsDecodeKernelInput,
     DsaPersistentTopkDecodeKernel, DsaPersistentTopkDecodeKernelConfig,
-    DsaPersistentTopkDecodeKernelInput, DsaTopkPrefillKernel, DsaTopkPrefillKernelConfig,
-    DsaTopkPrefillKernelInput, ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
-    GemmFp32OutputKernel, GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput,
-    MlaCacheAppendKernel, MlaCacheAppendKernelConfig, MlaCacheAppendKernelInput, QKvRmsNormKernel,
+    DsaPersistentTopkDecodeKernelInput, DsaSparseMlaAttentionKernel,
+    DsaSparseMlaAttentionKernelConfig, DsaSparseMlaAttentionKernelInput, DsaTopkPrefillKernel,
+    DsaTopkPrefillKernelConfig, DsaTopkPrefillKernelInput, ElementwiseKernel,
+    ElementwiseKernelConfig, ElementwiseKernelInput, GemmFp32OutputKernel,
+    GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput, MlaCacheAppendKernel,
+    MlaCacheAppendKernelConfig, MlaCacheAppendKernelInput, QKvRmsNormKernel,
     QKvRmsNormKernelConfig, QKvRmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
-    SingleGemmKernelInput,
+    SingleGemmKernelInput, ValidCountsPattern,
 };
 use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
 use super::glm53_common::{atomic, elementwise, push_or_zero, repeated};
+use super::glm53_dsa_attn_local::integer_sqrt;
 
 /// Small copy / fill / index launches per DSA layer, counted in the H200
 /// case-03 capture (logs/20261007_0_glm53_flash_h200_campaign): every
@@ -68,8 +81,12 @@ const PREFILL_GLUE_LAUNCHES: u32 = 12;
 const FWHT_EFFECTIVE_FACTOR: u32 = 5;
 /// `k[idx]` and `gate_score[idx]` gathers ahead of the prefill kpool write.
 const PREFILL_GATHER_LAUNCHES: u32 = 2;
-/// FlashAttention's split-KV combine reads fp32 partials of this many splits.
-const COMBINE_SPLITS: u32 = 2;
+/// FA3's q/k width on vLLM's rope-free path: `q` is zeros of this width and
+/// `k` the first this-many latent columns (`_FA3_QV_HEAD_DIM`).
+const FA3_QK_HEAD_DIM: u32 = 64;
+/// The synthetic index pattern the pooled sparse-attention rows were measured
+/// with (as the B200 pooled decode).
+const SPARSE_INDEX_DISTRIBUTION: &str = "unique_scattered_pages";
 
 #[derive(Clone, Debug)]
 pub struct Glm53DsaSpecAttnLocalWorkletConfig {
@@ -103,6 +120,7 @@ pub struct Glm53DsaSpecAttnLocalWorkletConfig {
     pub mqa_logits_prefill_backends: Vec<&'static str>,
     pub topk_prefill_backends: Vec<&'static str>,
     pub mla_cache_append_backends: Vec<&'static str>,
+    pub sparse_attention_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
 }
 
@@ -135,8 +153,8 @@ pub struct Glm53DsaSpecAttnLocalWorkletResolved {
     pub dense_prefill_attention: ElementwiseKernelConfig,
     pub q_absorb: BatchedGemmKernelConfig,
     pub index_remap: ElementwiseKernelConfig,
-    pub sparse_attention: ElementwiseKernelConfig,
-    pub sparse_combine: ElementwiseKernelConfig,
+    pub q_rope_zero_fill: ElementwiseKernelConfig,
+    pub sparse_attention: DsaSparseMlaAttentionKernelConfig,
     pub v_up: BatchedGemmKernelConfig,
     pub o_proj: SingleGemmKernelConfig,
     pub glue: ElementwiseKernelConfig,
@@ -184,8 +202,8 @@ pub struct Glm53DsaSpecAttnLocalWorklet {
     pub dense_prefill_attention: Op<ElementwiseKernel>,
     pub q_absorb: Op<BatchedGemmKernel>,
     pub index_remap: Op<ElementwiseKernel>,
-    pub sparse_attention: Op<ElementwiseKernel>,
-    pub sparse_combine: Op<ElementwiseKernel>,
+    pub q_rope_zero_fill: Op<ElementwiseKernel>,
+    pub sparse_attention: Op<DsaSparseMlaAttentionKernel>,
     pub v_up: Op<BatchedGemmKernel>,
     pub o_proj: Op<SingleGemmKernel>,
     pub glue: Op<ElementwiseKernel>,
@@ -207,7 +225,6 @@ impl Glm53DsaSpecAttnLocalWorklet {
         let index_heads = cfg.index_num_heads.get();
         let index_dim = cfg.index_head_dim.get();
         let kpool = cfg.index_kpool;
-        let cache_bpe = cfg.kv_cache_dtype.size_bytes();
         let gemm = |n: u32, k: Dim| SingleGemmKernelConfig {
             backends: cfg.bf16_gemm_backends.clone(),
             gpu_name: cfg.gpu_name.clone(),
@@ -227,7 +244,6 @@ impl Glm53DsaSpecAttnLocalWorklet {
             dtype: bf16,
         };
         let max_model_len = Dim::param("max_model_len", cfg.max_model_len);
-        let latent_q_bytes = heads * latent * bf16.size_bytes();
         let window = cfg.index_topk + kpool - 1;
         let flatten_decode_indexer =
             !native_decode_next_n_supported(&cfg.gpu_name, cfg.verify_width);
@@ -342,13 +358,29 @@ impl Glm53DsaSpecAttnLocalWorklet {
             ),
             // Placeholder: one int32 index row in, one global-slot row out.
             index_remap: ew(4 * cfg.selected_k, 4 * cfg.selected_k),
-            // Placeholder: the gathered top-k latent rows plus the latent
-            // query in, the latent output out (MQA: one KV head per rank).
-            sparse_attention: ew(
-                cfg.selected_k * latent * cache_bpe + latent_q_bytes,
-                latent_q_bytes,
-            ),
-            sparse_combine: ew(COMBINE_SPLITS * heads * latent * 4, latent_q_bytes),
+            // `q_nope.new_zeros(Q, H, 64)`: written once per MQA row, nothing read.
+            q_rope_zero_fill: ew(0, heads * FA3_QK_HEAD_DIM * bf16.size_bytes()),
+            sparse_attention: DsaSparseMlaAttentionKernelConfig {
+                backends: cfg.sparse_attention_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                num_heads: cfg.num_heads.clone(),
+                num_kv_heads: Dim::param("num_kv_heads", 1),
+                selected_k: cfg.selected_k,
+                latent_dim: cfg.kv_lora_rank.clone(),
+                rope_dim: Dim::param("qk_rope_head_dim", 0),
+                value_dim: cfg.kv_lora_rank.clone(),
+                softmax_scale_denominator: integer_sqrt(nope),
+                q_dtype: bf16,
+                cache_dtype: cfg.kv_cache_dtype,
+                index_dtype: "int32".into(),
+                output_dtype: bf16,
+                valid_counts_pattern: ValidCountsPattern::PooledUniformFull {
+                    index_topk: cfg.index_topk,
+                    index_kpool: kpool,
+                },
+                index_distribution: SPARSE_INDEX_DISTRIBUTION.into(),
+                cache_layout: "token_major_mqa_bf16_latent".into(),
+            },
             v_up: bmm(
                 &cfg.mla_bmm_v_up_backends,
                 cfg.v_head_dim.clone(),
@@ -439,8 +471,14 @@ impl Glm53DsaSpecAttnLocalWorklet {
             dense_prefill_attention: ew("dense_prefill.attention", r.dense_prefill_attention)?,
             q_absorb: atomic(n, "q_absorb", r.q_absorb, BatchedGemmKernel::build, bridge)?,
             index_remap: ew("sparse_mla.index_remap", r.index_remap)?,
-            sparse_attention: ew("sparse_mla.attention", r.sparse_attention)?,
-            sparse_combine: ew("sparse_mla.combine", r.sparse_combine)?,
+            q_rope_zero_fill: ew("sparse_mla.q_rope_zero_fill", r.q_rope_zero_fill)?,
+            sparse_attention: atomic(
+                n,
+                "sparse_mla.attention",
+                r.sparse_attention,
+                DsaSparseMlaAttentionKernel::build,
+                bridge,
+            )?,
             v_up: atomic(n, "v_up", r.v_up, BatchedGemmKernel::build, bridge)?,
             o_proj: gemm("o_proj", r.o_proj)?,
             glue: ew("glue", r.glue)?,
@@ -490,8 +528,8 @@ impl Glm53DsaSpecAttnLocalWorklet {
                 self.dense_prefill_attention.compile(builder),
                 self.q_absorb.compile(builder),
                 self.index_remap.compile(builder),
+                self.q_rope_zero_fill.compile(builder),
                 self.sparse_attention.compile(builder),
-                self.sparse_combine.compile(builder),
                 self.v_up.compile(builder),
                 self.o_proj.compile(builder),
                 repeated(&self.glue, GLUE_LAUNCHES, builder),
@@ -630,8 +668,16 @@ impl Glm53DsaSpecAttnLocalWorklet {
             ev,
         );
         push_or_zero(&self.index_remap, tokens(mqa), mqa == 0, ev);
-        push_or_zero(&self.sparse_attention, tokens(mqa), mqa == 0, ev);
-        push_or_zero(&self.sparse_combine, tokens(mqa), mqa == 0, ev);
+        push_or_zero(&self.q_rope_zero_fill, tokens(mqa), mqa == 0, ev);
+        push_or_zero(
+            &self.sparse_attention,
+            DsaSparseMlaAttentionKernelInput {
+                num_queries: mqa,
+                num_cache_tokens: w.sparse_cache_tokens,
+            },
+            mqa == 0,
+            ev,
+        );
         push_or_zero(&self.v_up, BatchedGemmKernelInput { m: mqa }, mqa == 0, ev);
         push_or_zero(&self.o_proj, rows, false, ev);
         push_or_zero(&self.glue, all.clone(), false, ev);
@@ -657,6 +703,9 @@ struct Work {
     /// Rows on the sparse-MQA path: decode rows, plus the prefill rows of a
     /// batch too long for dense MHA.
     mqa_rows: u32,
+    /// The pooled-uniform context the one FA3 call over `mqa_rows` is priced
+    /// at (`sparse_attention_input`); 0 without MQA rows.
+    sparse_cache_tokens: u32,
 }
 
 fn derive_work(
@@ -715,6 +764,23 @@ fn derive_work(
         return Err("an iteration must carry at least one token".into());
     }
     let dense_prefill_rows = if long_prefill { 0 } else { prefill_tokens };
+    // Every MQA row's own context: verify row `i` of a `width`-row request
+    // sees `kv_len - (width - 1 - i)` tokens; a long batch's prefill rows walk
+    // their causal spans.
+    let width = input.decode_width;
+    let decode_contexts = input.decode_kv_lens.iter().flat_map(|&kv_len| {
+        (0..width).map(move |row| kv_len.saturating_sub(width - 1 - row).max(1))
+    });
+    let prefill_contexts = input
+        .prefill_chunk_pairs
+        .iter()
+        .filter(|_| long_prefill)
+        .flat_map(|&(prefix, append)| prefix + 1..=prefix + append);
+    let sparse_cache_tokens = sparse_attention_context(
+        decode_contexts.chain(prefill_contexts),
+        index_topk,
+        index_kpool,
+    );
     Ok(Work {
         total_tokens,
         prefill_tokens,
@@ -725,7 +791,40 @@ fn derive_work(
         prefill_indexer_keys,
         dense_prefill_rows,
         mqa_rows: total_tokens - dense_prefill_rows,
+        sparse_cache_tokens,
     })
+}
+
+/// The `num_cache_tokens` that prices one FA3 call over these row contexts on
+/// the kind's `PooledUniformFull` encoding.
+///
+/// A row at context `n` reads `min(n, index_topk + n mod index_kpool)` slots
+/// (the kpool law). The encoding gives every row the same context `S`, reading
+/// `min(S, index_topk + row mod index_kpool)`. Below `index_topk` that is `S`
+/// itself, so `S` is the rows' mean count, which keeps the call's total valid
+/// slots. Once the mean reaches `index_topk` the rows are saturated, and the
+/// call's largest context gives the saturated phase mix and gather footprint.
+/// Returns 0 for no rows.
+fn sparse_attention_context(
+    contexts: impl Iterator<Item = u32>,
+    index_topk: u32,
+    index_kpool: u32,
+) -> u32 {
+    let (mut rows, mut slots, mut max_context) = (0_u64, 0_u64, 0_u32);
+    for context in contexts {
+        rows += 1;
+        slots += u64::from(context.min(index_topk + context % index_kpool));
+        max_context = max_context.max(context);
+    }
+    if rows == 0 {
+        return 0;
+    }
+    let mean = (2 * slots + rows) / (2 * rows);
+    if mean < u64::from(index_topk) {
+        mean.max(1) as u32
+    } else {
+        max_context
+    }
 }
 
 /// Whether DeepGEMM's paged MQA logits takes `next_n` rows per request on
@@ -779,6 +878,7 @@ mod tests {
             mqa_logits_prefill_backends: vec!["deepgemm_fp8"],
             topk_prefill_backends: vec!["vllm_cuda"],
             mla_cache_append_backends: vec!["vllm_cuda"],
+            sparse_attention_backends: vec![crate::timing::kernels::FA3_SPARSE_BACKEND],
             elementwise_backends: vec!["triton"],
         }
     }
@@ -875,5 +975,94 @@ mod tests {
         )
         .unwrap();
         assert_eq!(w.mqa_rows, 2);
+    }
+
+    /// Catches the sparse attention leaf drifting from the profiled FA3
+    /// identity (rope-free BF16 latent rows, 1/16 scale, pooled pattern) or
+    /// the zero fill reading bytes or covering the 512-wide latent.
+    #[test]
+    fn sparse_attention_is_the_fa3_l1_with_its_q_zero_fill() {
+        let r = Glm53DsaSpecAttnLocalWorklet::resolve_config(&cfg());
+        let a = &r.sparse_attention;
+        assert_eq!(a.backends, vec!["vllm_fa3_sparse_bf16"]);
+        assert_eq!((a.num_heads.get(), a.num_kv_heads.get()), (16, 1));
+        assert_eq!(
+            (a.latent_dim.get(), a.rope_dim.get(), a.value_dim.get()),
+            (512, 0, 512)
+        );
+        assert_eq!((a.selected_k, a.softmax_scale_denominator), (2176, 16));
+        assert_eq!(
+            (a.q_dtype, a.cache_dtype, a.output_dtype),
+            (DType::Bf16, DType::Bf16, DType::Bf16)
+        );
+        assert_eq!(a.cache_layout, "token_major_mqa_bf16_latent");
+        assert_eq!(
+            a.valid_counts_pattern,
+            ValidCountsPattern::PooledUniformFull {
+                index_topk: 2048,
+                index_kpool: 4
+            }
+        );
+        assert_eq!(r.q_rope_zero_fill.input_bytes_per_token.get(), 0);
+        assert_eq!(r.q_rope_zero_fill.output_bytes_per_token.get(), 16 * 64 * 2);
+    }
+
+    /// Catches a sparse call priced at the wrong total of valid slots: verify
+    /// rows below `index_topk` read their own descending contexts, saturated
+    /// rows a phase mix at the largest context.
+    #[test]
+    fn one_fa3_call_keeps_the_rows_valid_slot_total() {
+        let work = |decode_kv_lens: Vec<u32>, prefill_chunk_pairs: Vec<(u32, u32)>| {
+            derive_work(
+                &Glm53DsaSpecAttnLocalWorkletInput {
+                    prefill_chunk_pairs,
+                    decode_kv_lens,
+                    decode_width: 6,
+                    skip_indexer: false,
+                },
+                &cfg(),
+            )
+            .unwrap()
+        };
+        // 1001..=1006 read themselves (6021); 4001..=4006 read 2048 + n mod 4
+        // (12297): 18318 slots over 12 rows, mean 1526.5.
+        let mixed = work(vec![1006, 4006], Vec::new());
+        assert_eq!((mixed.mqa_rows, mixed.sparse_cache_tokens), (12, 1527));
+        let saturated = work(vec![5000, 9000], Vec::new());
+        assert_eq!(saturated.sparse_cache_tokens, 9000);
+        // A long prefill joins the decode rows in the same call.
+        let long = work(vec![300], vec![(2304, 1792)]);
+        assert_eq!(long.mqa_rows, 6 + 1792);
+        let slots = (295..=300).sum::<u64>() + (2305..=4096_u64).map(|n| 2048 + n % 4).sum::<u64>();
+        assert_eq!(
+            u64::from(long.sparse_cache_tokens),
+            (2 * slots + 1798) / (2 * 1798)
+        );
+        // Short prefills take dense MHA and leave only the verify rows.
+        let short = work(vec![300], vec![(0, 2048)]);
+        assert_eq!((short.mqa_rows, short.sparse_cache_tokens), (6, 298));
+    }
+
+    /// The whole MQA batch is one FA3 call, so the measured Combine drop
+    /// falls at the call's row count: 165 verifying requests (990 rows) still
+    /// combine, 166 (996 rows) do not.
+    #[test]
+    fn the_combine_boundary_falls_at_the_calls_row_count() {
+        use crate::timing::kernels::FA3_COMBINE_MAX_QUERIES;
+        let rows = |requests: usize| {
+            derive_work(
+                &Glm53DsaSpecAttnLocalWorkletInput {
+                    prefill_chunk_pairs: Vec::new(),
+                    decode_kv_lens: vec![3000; requests],
+                    decode_width: 6,
+                    skip_indexer: false,
+                },
+                &cfg(),
+            )
+            .unwrap()
+            .mqa_rows
+        };
+        assert!(rows(165) <= FA3_COMBINE_MAX_QUERIES);
+        assert!(rows(166) > FA3_COMBINE_MAX_QUERIES);
     }
 }
