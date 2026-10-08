@@ -28,12 +28,15 @@ _INPUT_DTYPE = DType.BF16
 _COLUMN_MAJOR = "ue8m0_column_major"
 _ROW_MAJOR = "ue8m0_row_major"
 _PACKED_INT32 = "ue8m0_packed_int32"
-# scale_format -> CUPTI kernel name. Both kernels are generic CUDA built for
-# every arch vLLM ships (their sm90+ code is only optional PDL), so the GPU a
-# format is deployed on in production is not a launch constraint.
+# scale_format -> CUPTI kernel-name substring. Both kernels are generic CUDA
+# built for every arch vLLM ships (their sm90+ code is only optional PDL), so
+# the GPU a format is deployed on in production is not a launch constraint.
+# The unpacked formats match both the older `per_token_group_quant_8bit_kernel`
+# and vLLM v0.31's `per_token_group_quant_8bit_register_kernel` (the H200
+# GLM-5.3-Flash capture runs the latter); the call launches only that kernel.
 _SCALE_FORMATS = {
-    _COLUMN_MAJOR: "per_token_group_quant_8bit_kernel",
-    _ROW_MAJOR: "per_token_group_quant_8bit_kernel",
+    _COLUMN_MAJOR: "per_token_group_quant_8bit",
+    _ROW_MAJOR: "per_token_group_quant_8bit",
     _PACKED_INT32: "per_token_group_quant_8bit_packed_register_kernel",
 }
 _FP8_E4M3_MIN = -448.0
