@@ -4,20 +4,24 @@ For every request, over its verify rounds (`decode_request_progress` entries of 
 excluding the wasted round of an already-finished request), count n_k = rounds that accepted at least k drafts.
 Its chain is the conditional acceptance per draft position, p_k = n_k / n_{k-1} for k = 1..K, kept per position
 (never collapsed to a mean) so a shorter speculation depth is the chain's prefix. A position the request never
-reached (n_{k-1} = 0) takes the case's pooled conditional value. One chain per measured request; rendering assigns
-chains to trace requests by a fixed hash of the trace request id, not by measured request id.
+reached (n_{k-1} = 0) takes the case's pooled conditional value. One chain per measured request, tagged with the
+request's trace shape (input_len, output_len): acceptance correlates strongly with output length on this workload,
+so rendering assigns a trace request one chain of ITS OWN shape, picked by a fixed hash of the trace request id (not
+by measured request id).
 
 Measured on the alignment matrix's synthetic prompts (enwik9 text, tokens-only replay); production traffic may
 have a different per-request distribution.
 
 usage: extract_per_request.py <case_dir> <out.json> [K=5]
 """
-import glob, json, sys
+import csv, glob, json, sys
 from collections import defaultdict
 
 case_dir, out = sys.argv[1], sys.argv[2]
 K = int(sys.argv[3]) if len(sys.argv) > 3 else 5
 metrics = glob.glob(f"{case_dir}/profile_workload/vllm/*_metrics.jsonl")[0]
+shape_of = {row["id"]: (int(row["input_len"]), int(row["output_len"]))
+            for row in csv.DictReader(open(f"{case_dir}/trace.csv"))}
 counts = defaultdict(lambda: [0] * (K + 1))
 for line in open(metrics):
     record = json.loads(line)
@@ -39,11 +43,13 @@ for request_id in sorted(counts):
             chain.append(round(row[k] / row[k - 1], 4))
         else:
             chain.append(round(pooled[k - 1], 4)); filled += 1
-    chains.append(chain)
+    trace_id = request_id.removeprefix("independent_")
+    input_len, output_len = shape_of[trace_id]
+    chains.append({"input_len": input_len, "output_len": output_len, "chain": chain})
 json.dump({
     "schema_version": 1,
     "draft_tokens": K,
-    "meaning": "per request, conditional acceptance P(accept draft k | accepted k-1), k = 1..K",
+    "meaning": "per request (tagged with its trace shape), conditional acceptance P(accept draft k | accepted k-1), k = 1..K",
     "evidence": metrics.split("/logs/", 1)[-1] if "/logs/" in metrics else metrics,
     "requests": len(chains),
     "rounds": pooled_n[0],

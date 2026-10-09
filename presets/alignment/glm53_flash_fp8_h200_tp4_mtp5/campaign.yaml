@@ -243,7 +243,7 @@ cases:
     value: acceptance/03_balanced_anchor_c32.json
     status: measured
     derived_from: per-request conditional acceptance of draft positions 1-5 (128 requests, 9400
-      verify rounds; acceptance/extract_per_request.py). Measured on the synthetic enwik9 prompts of this
+      verify rounds; acceptance/extract_per_request.py; each trace request draws a chain of its own shape by a fixed hash of its id). Measured on the synthetic enwik9 prompts of this
       matrix (tokens-only replay); production traffic may have a different per-request distribution.
     evidence: logs/20261008_5_glm53_flash_h200_tuned/03_balanced_anchor_c32/profile_workload/vllm/glm53_flash_h200_tp4_mtp5_03_balanced_anchor_c32_workload_metrics.jsonl
   provenance:
@@ -298,7 +298,7 @@ cases:
     value: acceptance/04_prefill_spectrum_c32.json
     status: measured
     derived_from: per-request conditional acceptance of draft positions 1-5 (128 requests, 3274
-      verify rounds; acceptance/extract_per_request.py). Measured on the synthetic enwik9 prompts of this
+      verify rounds; acceptance/extract_per_request.py; each trace request draws a chain of its own shape by a fixed hash of its id). Measured on the synthetic enwik9 prompts of this
       matrix (tokens-only replay); production traffic may have a different per-request distribution.
     evidence: logs/20261008_5_glm53_flash_h200_tuned/04_prefill_spectrum_c32/profile_workload/vllm/glm53_flash_h200_tp4_mtp5_04_prefill_spectrum_c32_workload_metrics.jsonl
   provenance:
@@ -353,7 +353,7 @@ cases:
     value: acceptance/05_decode_spectrum_c64.json
     status: measured
     derived_from: per-request conditional acceptance of draft positions 1-5 (128 requests, 50107
-      verify rounds; acceptance/extract_per_request.py). Measured on the synthetic enwik9 prompts of this
+      verify rounds; acceptance/extract_per_request.py; each trace request draws a chain of its own shape by a fixed hash of its id). Measured on the synthetic enwik9 prompts of this
       matrix (tokens-only replay); production traffic may have a different per-request distribution.
     evidence: logs/20261008_5_glm53_flash_h200_tuned/05_decode_spectrum_c64/profile_workload/vllm/glm53_flash_h200_tp4_mtp5_05_decode_spectrum_c64_workload_metrics.jsonl
   provenance:
@@ -590,7 +590,7 @@ cases:
     value: acceptance/10_full_saturation_rate.json
     status: measured
     derived_from: per-request conditional acceptance of draft positions 1-5 (512 requests, 202737
-      verify rounds; acceptance/extract_per_request.py). Measured on the synthetic enwik9 prompts of this
+      verify rounds; acceptance/extract_per_request.py; each trace request draws a chain of its own shape by a fixed hash of its id). Measured on the synthetic enwik9 prompts of this
       matrix (tokens-only replay); production traffic may have a different per-request distribution.
     evidence: logs/20261008_5_glm53_flash_h200_tuned/10_full_saturation_rate/profile_workload/vllm/glm53_flash_h200_tp4_mtp5_10_full_saturation_rate_workload_metrics.jsonl
   provenance:
@@ -742,7 +742,7 @@ cases:
     value: acceptance/12_ultra_context_decode_c1.json
     status: measured
     derived_from: per-request conditional acceptance of draft positions 1-5 (15 requests, 6378
-      verify rounds; acceptance/extract_per_request.py). Measured on the synthetic enwik9 prompts of this
+      verify rounds; acceptance/extract_per_request.py; each trace request draws a chain of its own shape by a fixed hash of its id). Measured on the synthetic enwik9 prompts of this
       matrix (tokens-only replay); production traffic may have a different per-request distribution.
     evidence: logs/20261008_5_glm53_flash_h200_tuned/12_ultra_context_decode_c1/profile_workload/vllm/glm53_flash_h200_tp4_mtp5_12_ultra_context_decode_c1_workload_metrics.jsonl
   provenance:
