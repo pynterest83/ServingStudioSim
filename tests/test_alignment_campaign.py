@@ -1366,12 +1366,19 @@ def test_variant_arch_tag_and_params_exist_in_the_exported_schema(pack):
 
 
 def test_per_request_acceptance_gives_each_trace_request_one_measured_chain(pack, tmp_path):
-    """The defect this catches: one pooled chain for every request. A per-request
-    mean TPOT averages 1/acceptance, so pooling hides per-request variance and
-    under-predicts TPOT (H200 GLM-5.3-Flash cases 05/10/12: -12..-23%)."""
+    """The defects this catches: one pooled chain for every request (a per-request
+    mean TPOT averages 1/acceptance, so pooling hides per-request variance), and
+    chains handed out regardless of request length (acceptance correlates with
+    output length; H200 GLM-5.3-Flash case 05 fell from 4.46 to 3.62 tokens/verify)."""
     original_case = pack.cases[0]
     calibrated = original_case.attn_gpu_memory_gb
-    chains = [[0.9, 0.8], [0.2, 0.1], [0.6, 0.5]]
+    shapes = sorted({tuple(shape) for shape in original_case.workload_trace.shapes})
+    (i0, o0) = shapes[0]
+    chains = [
+        {"input_len": i0, "output_len": o0, "chain": [0.9, 0.8]},
+        {"input_len": i0, "output_len": o0, "chain": [0.2, 0.1]},
+        {"input_len": 1, "output_len": 1, "chain": [0.6, 0.5]},
+    ]
     pack_root = tmp_path / "pack"
     (pack_root / "acceptance").mkdir(parents=True)
     (pack_root / "acceptance" / "c.json").write_text(json.dumps({"chains": chains}))
@@ -1380,19 +1387,24 @@ def test_per_request_acceptance_gives_each_trace_request_one_measured_chain(pack
         speculative_acceptance=dataclasses.replace(calibrated, value=[0.6, 0.6]),
         speculative_acceptance_per_request=dataclasses.replace(calibrated, value="acceptance/c.json"),
     )
-    loaded = load_per_request_chains(pack_root, case)
-    assert [list(c) for c in loaded] == chains
-    # A fixed hash of the trace id picks the chain: stable across calls and
-    # machines, and spread over the measured chains.
-    picks = [tuple(render_module.per_request_chain(loaded, f"x-{i:04d}")) for i in range(64)]
-    assert picks == [tuple(render_module.per_request_chain(loaded, f"x-{i:04d}")) for i in range(64)]
-    assert set(picks) == {tuple(c) for c in chains}
+    entries = load_per_request_chains(pack_root, case)
+    assert [list(chain) for _, _, chain in entries] == [c["chain"] for c in chains]
+    # A fixed hash of the trace id picks among the chains of the request's own shape.
+    picks = [tuple(render_module.per_request_chain(entries, f"x-{i:04d}", i0, o0)) for i in range(64)]
+    assert picks == [
+        tuple(render_module.per_request_chain(entries, f"x-{i:04d}", i0, o0)) for i in range(64)
+    ]
+    assert set(picks) == {(0.9, 0.8), (0.2, 0.1)}
     patched = dataclasses.replace(pack, root=pack_root)
     rows = list(csv.DictReader(io.StringIO(case_traces(patched, case)["trace_speculative.csv"])))
     for row in rows:
-        assert json.loads(row["accept_rate"]) == list(render_module.per_request_chain(loaded, row["id"]))
+        assert json.loads(row["accept_rate"]) == render_module.per_request_chain(
+            entries, row["id"], int(row["input_len"]), int(row["output_len"])
+        )
     # A chain shorter than the pooled depth is rejected.
-    (pack_root / "acceptance" / "c.json").write_text(json.dumps({"chains": [[0.5]]}))
+    (pack_root / "acceptance" / "c.json").write_text(
+        json.dumps({"chains": [{"input_len": 1, "output_len": 1, "chain": [0.5]}]})
+    )
     with pytest.raises(PackError, match="2 probabilities each"):
         load_per_request_chains(pack_root, case)
 

@@ -198,11 +198,13 @@ class Case:
     #: short and long requests stop sharing one token-weighted chain.
     speculative_acceptance_by_output_position: Calibrated | None = None
     #: Per-request acceptance: `value` names a JSON file under the pack root
-    #: holding one conditional chain per measured request (`chains`, each as
-    #: long as `speculative_acceptance`). Rendering gives each trace request one
-    #: chain, picked by a fixed hash of its trace id (never by measured request
-    #: id), so per-request variance and the within-request correlation of draft
-    #: positions survive. Exclusive with the output-position buckets.
+    #: holding one conditional chain per measured request (`chains`: entries
+    #: `{input_len, output_len, chain}`, each chain as long as
+    #: `speculative_acceptance`). Rendering gives each trace request one chain
+    #: of its own shape, picked by a fixed hash of its trace id (never by
+    #: measured request id), so per-request variance, its correlation with
+    #: request length, and the within-request correlation of draft positions
+    #: survive. Exclusive with the output-position buckets.
     speculative_acceptance_per_request: Calibrated | None = None
 
     @property
@@ -627,8 +629,10 @@ def _case(raw: Any, index_hint: int) -> Case:
     return case
 
 
-def load_per_request_chains(root: Path, case: Case) -> tuple[tuple[float, ...], ...]:
-    """The validated per-request conditional chains a case's
+def load_per_request_chains(
+    root: Path, case: Case
+) -> tuple[tuple[int, int, tuple[float, ...]], ...]:
+    """The validated `(input_len, output_len, chain)` entries a case's
     `speculative_acceptance_per_request` names (a JSON file under the pack root)."""
     assert case.speculative_acceptance_per_request is not None
     assert case.speculative_acceptance is not None
@@ -643,15 +647,23 @@ def load_per_request_chains(root: Path, case: Case) -> tuple[tuple[float, ...], 
     chains = document.get("chains") if isinstance(document, dict) else None
     depth = len(case.speculative_acceptance.value)
     if not isinstance(chains, list) or not chains or any(
-        not isinstance(chain, list)
-        or len(chain) != depth
-        or any(type(x) not in (int, float) or not 0 <= x <= 1 for x in chain)
-        for chain in chains
+        not isinstance(entry, dict)
+        or set(entry) != {"input_len", "output_len", "chain"}
+        or type(entry["input_len"]) is not int
+        or type(entry["output_len"]) is not int
+        or not isinstance(entry["chain"], list)
+        or len(entry["chain"]) != depth
+        or any(type(x) not in (int, float) or not 0 <= x <= 1 for x in entry["chain"])
+        for entry in chains
     ):
         raise PackError(
-            f"{where}: {path.name} must hold a non-empty 'chains' list of {depth} probabilities each"
+            f"{where}: {path.name} must hold a non-empty 'chains' list of "
+            f"{{input_len, output_len, chain}} entries with {depth} probabilities each"
         )
-    return tuple(tuple(float(x) for x in chain) for chain in chains)
+    return tuple(
+        (entry["input_len"], entry["output_len"], tuple(float(x) for x in entry["chain"]))
+        for entry in chains
+    )
 
 
 def load_pack(root: Path) -> Pack:

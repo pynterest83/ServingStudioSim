@@ -167,26 +167,36 @@ def acceptance_chain(case: Case, output_len: int) -> list[float]:
     return [tail[k + 1] / tail[k] if tail[k] > 0 else 0.0 for k in range(depth)]
 
 
-def per_request_chain(chains: tuple[tuple[float, ...], ...], request_id: str) -> list[float]:
-    """The per-request chain a trace request gets: a fixed hash (sha256) of its
-    trace id picks one measured request's chain, never its measured request id.
-    Deterministic across runs and machines (Python's `hash` is salted)."""
+def per_request_chain(
+    entries: tuple[tuple[int, int, tuple[float, ...]], ...],
+    request_id: str,
+    input_len: int,
+    output_len: int,
+) -> list[float]:
+    """The per-request chain a trace request gets: one measured request of the
+    same shape, picked by a fixed hash (sha256) of the trace id -- never by the
+    measured request id. Acceptance depends on the request (its length among
+    others), so the pool is the same (input, output) shape, else the same output
+    length, else every chain. Deterministic across runs and machines."""
+    pool = [chain for i, o, chain in entries if (i, o) == (input_len, output_len)]
+    pool = pool or [chain for _, o, chain in entries if o == output_len]
+    pool = pool or [chain for _, _, chain in entries]
     digest = hashlib.sha256(request_id.encode()).digest()
-    return list(chains[int.from_bytes(digest[:8], "big") % len(chains)])
+    return list(pool[int.from_bytes(digest[:8], "big") % len(pool)])
 
 
 def trace_text(
     case: Case,
     spec: TraceSpec,
     *,
-    speculative_acceptance: Callable[[str, int], list[float]] | None = None,
+    speculative_acceptance: Callable[[str, int, int], list[float]] | None = None,
 ) -> str:
     """Regenerate one trace from its shapes.
 
     Request ids carry the case slug so two cases replayed into one server are
     never confused, and arrival times are a deterministic 1 req/s baseline that
     `saturated` discards and `trace-timed` rescales by `rate`.
-    `speculative_acceptance` maps a request's trace id and output length to its chain.
+    `speculative_acceptance` maps a request's trace id, input and output length to its chain.
     """
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\n")
@@ -206,7 +216,10 @@ def trace_text(
         row = [request_id, input_len, output_len, float(index * 1000)]
         if speculative_acceptance is not None:
             row.append(
-                json.dumps(speculative_acceptance(request_id, output_len), separators=(",", ":"))
+                json.dumps(
+                    speculative_acceptance(request_id, input_len, output_len),
+                    separators=(",", ":"),
+                )
             )
         writer.writerow(row)
     return buffer.getvalue()
@@ -585,10 +598,12 @@ def case_traces(pack: Pack, case: Case) -> dict[str, str]:
     traces = {WORKLOAD_TRACE_NAME: trace_text(case, case.workload_trace)}
     if case.speculative_acceptance is not None:
         if case.speculative_acceptance_per_request is not None:
-            chains = load_per_request_chains(pack.root, case)
-            chain_of = lambda request_id, _output_len: per_request_chain(chains, request_id)
+            entries = load_per_request_chains(pack.root, case)
+            chain_of = lambda request_id, input_len, output_len: per_request_chain(
+                entries, request_id, input_len, output_len
+            )
         else:
-            chain_of = lambda _request_id, output_len: acceptance_chain(case, output_len)
+            chain_of = lambda _id, _input_len, output_len: acceptance_chain(case, output_len)
         traces[SPECULATIVE_TRACE_NAME] = trace_text(
             case, case.workload_trace, speculative_acceptance=chain_of
         )
