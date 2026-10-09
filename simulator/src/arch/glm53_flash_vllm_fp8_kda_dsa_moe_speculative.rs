@@ -94,9 +94,15 @@ const CACHE_BLOCK_SIZE: u32 = 64;
 /// tokens" in the H200 server log): the attention tokens one page holds, the
 /// KDA checkpoint interval, and the prefix-cache reuse quantum.
 pub const HYBRID_BLOCK_SIZE: u32 = 1152;
-/// Mamba `align` cache mode keeps two state pages per KDA group per request,
-/// plus one per speculative token (`MambaSpec.max_memory_usage_bytes`).
+/// Mamba `align` cache mode sizes the pool for two state pages per KDA group
+/// per request, plus one per speculative token
+/// (`MambaSpec.max_memory_usage_bytes`): the running state, the prefill
+/// checkpoint, and the speculative scratch.
 const ALIGN_STATE_PAGES: u32 = 2;
+/// Of those, a decoding request holds only the running state and the
+/// speculative scratch: `MambaManager.remove_skipped_blocks` frees the prefill
+/// checkpoint once the request computes past it.
+const ALIGN_RESIDENT_STATE_PAGES: u32 = 1;
 /// The kpool tail group's one block per request.
 const KPOOL_TAIL_PAGES: u32 = 1;
 /// vLLM runs the shared expert on an aux stream at or below this batch size.
@@ -448,13 +454,26 @@ pub fn kv_bytes_per_token_per_gpu(model: &Glm53FlashModelCfg) -> u64 {
     mla_layers * (latent + index)
 }
 
-/// Pages of recurrent state vLLM pins per request: KDA layers are packed into
-/// groups the size of the attention group (12 layers), each holding
-/// `2 + draft_tokens` pages in `align` mode, plus the kpool tail block.
+/// Pages of recurrent state vLLM's startup sizer reserves per request: KDA
+/// layers are packed into groups the size of the attention group (12 layers),
+/// each sized for `2 + draft_tokens` pages in `align` mode, plus the kpool tail
+/// block. This is the "maximum concurrency" figure in the server log.
 pub fn state_pages_per_request(model: &Glm53FlashModelCfg, draft_tokens: u32) -> u32 {
+    kda_groups(model) * (ALIGN_STATE_PAGES + draft_tokens) + KPOOL_TAIL_PAGES
+}
+
+/// Pages of recurrent state a decoding request actually holds:
+/// `1 + draft_tokens` per KDA group plus the kpool tail. The worker charges
+/// this, so admission sees the pool vLLM's scheduler sees. The prefill
+/// checkpoint page each group holds until the request computes past it is not
+/// charged.
+pub fn resident_state_pages_per_request(model: &Glm53FlashModelCfg, draft_tokens: u32) -> u32 {
+    kda_groups(model) * (ALIGN_RESIDENT_STATE_PAGES + draft_tokens) + KPOOL_TAIL_PAGES
+}
+
+fn kda_groups(model: &Glm53FlashModelCfg) -> u32 {
     let attention_layers = model.num_dsa_layers() + 1;
-    let kda_groups = (model.kda_layers.len() as u32).div_ceil(attention_layers);
-    kda_groups * (ALIGN_STATE_PAGES + draft_tokens) + KPOOL_TAIL_PAGES
+    (model.kda_layers.len() as u32).div_ceil(attention_layers)
 }
 
 /// One TP all-reduce: FlashInfer up to its fusion workspace, a plain
@@ -993,8 +1012,9 @@ pub fn build(
     let per_gpu_token = kv_bytes_per_token_per_gpu(model_cfg);
     let page_bytes_per_gpu = u64::from(HYBRID_BLOCK_SIZE) * per_gpu_token;
     let total_kv_bytes_per_token = tp * per_gpu_token;
-    let recurrent_state_bytes_per_request =
-        tp * u64::from(state_pages_per_request(model_cfg, draft_tokens)) * page_bytes_per_gpu;
+    let recurrent_state_bytes_per_request = tp
+        * u64::from(resident_state_pages_per_request(model_cfg, draft_tokens))
+        * page_bytes_per_gpu;
     let mtp_step0 = MtpPass::build(
         &format!("{n}.mtp.step_0"),
         &resolved,
@@ -1521,8 +1541,8 @@ mod tests {
     }
 
     /// The H200 server logs: a 42.79 GiB per-GPU pool held 3144 pages of 1152
-    /// tokens, and 858,521 "tokens" = 104.8 requests x 8192 because every
-    /// request also pins 22 state pages; at 37.34 GiB, 2744 pages and
+    /// tokens, and 858,521 "tokens" = 104.8 requests x 8192 because the sizer
+    /// reserves 22 state pages per request; at 37.34 GiB, 2744 pages and
     /// 2.941 x 1,048,576 = 3,083,914.
     #[test]
     fn kv_and_state_pages_reproduce_the_vllm_capacity_lines() {
@@ -1530,6 +1550,10 @@ mod tests {
         assert_eq!(kv_bytes_per_token_per_gpu(&model), 12 * (1024 + 33));
         assert_eq!(state_pages_per_request(&model, 5), 22);
         assert_eq!(state_pages_per_request(&model, 0), 7);
+        // Case 10 (saturated at 256 clients, no preemption) peaks at 3142 of
+        // 3144 pages with 19 state pages per running request and would
+        // overflow the pool with 20.
+        assert_eq!(resident_state_pages_per_request(&model, 5), 19);
         let page = u64::from(HYBRID_BLOCK_SIZE) * kv_bytes_per_token_per_gpu(&model);
         // The logs print the pool rounded to 0.01 GiB, so round the page count.
         let pages = |gib: f64| (gib * f64::from(1u32 << 30) / page as f64).round() as u64;
