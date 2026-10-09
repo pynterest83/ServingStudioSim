@@ -167,8 +167,9 @@ def acceptance_chain(case: Case, output_len: int) -> list[float]:
     return [tail[k + 1] / tail[k] if tail[k] > 0 else 0.0 for k in range(depth)]
 
 
-def _trace_hash(request_id: str) -> int:
-    return int.from_bytes(hashlib.sha256(request_id.encode()).digest()[:8], "big")
+def _trace_hash(request_id: str, seed: int = 0) -> int:
+    key = request_id if seed == 0 else f"{seed}:{request_id}"
+    return int.from_bytes(hashlib.sha256(key.encode()).digest()[:8], "big")
 
 
 def _chain_pool(
@@ -184,6 +185,7 @@ def _chain_pool(
 def per_request_chains(
     entries: tuple[tuple[int, int, tuple[float, ...]], ...],
     requests: list[tuple[str, int, int]],
+    seed: int = 0,
 ) -> dict[str, list[float]]:
     """Trace request id -> its measured chain. Within one shape, trace requests
     ordered by a fixed hash (sha256) of their trace id take that shape's chains
@@ -191,15 +193,16 @@ def per_request_chains(
     measured per-request distribution, not a resample of it) -- and the pairing
     never follows the measured request id. Acceptance depends on the request
     (its length among others), hence the per-shape pools. Deterministic across
-    runs and machines."""
+    runs and machines; `seed` picks another hash order (0 = the rendered trace)
+    so stochastic scoring can sample the pairing."""
     by_shape: dict[tuple[int, int], list[str]] = {}
     for request_id, input_len, output_len in requests:
         by_shape.setdefault((input_len, output_len), []).append(request_id)
     assigned: dict[str, list[float]] = {}
     for (input_len, output_len), ids in by_shape.items():
         pool = _chain_pool(entries, input_len, output_len)
-        start = _trace_hash(f"{input_len}x{output_len}") % len(pool)
-        for rank, request_id in enumerate(sorted(ids, key=_trace_hash)):
+        start = _trace_hash(f"{input_len}x{output_len}", seed) % len(pool)
+        for rank, request_id in enumerate(sorted(ids, key=lambda i: _trace_hash(i, seed))):
             assigned[request_id] = list(pool[(start + rank) % len(pool)])
     return assigned
 
