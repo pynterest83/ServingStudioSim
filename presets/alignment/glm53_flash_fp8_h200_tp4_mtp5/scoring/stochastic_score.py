@@ -5,12 +5,16 @@ which trace request draws which measured chain (who finishes last sets the drain
 sample of that variable. This tool therefore scores in two parts.
 
 (i) Deterministic, 1% tolerance:
-  - rounds_by_shape_pct: total simulated decode (verify) rounds per (input, output) shape, mean over seeds, vs the
-    measured rounds of that shape; reported as the worst shape and the total.
+  - rounds_total_pct: simulated decode (verify) rounds of the whole case, mean over seeds, vs measured.
+    Per (input, output) shape the same deviation is a diagnostic only, flagged when it exceeds 3 standard errors:
+    bootstrapped from the shape's measured per-request rounds, or (one request in the shape) the renewal
+    approximation Var(R) ~= N v / m^3 of per-round draw noise (m, v = mean/variance of tokens per verify round
+    under the request's chain, N = its output tokens).
   - replica_iterations_pct: replica.py with vLLM v0.31's scheduling rules on the MEASURED per-request rounds vs the
     measured iteration count (closed-loop saturated cases only; rate-driven cases are n/a).
 (ii) Stochastic: the case is simulated under >= N hash orders of the chain assignment (render seed 1..N):
-  - the measured iteration count must lie in the simulated p5-p95 band; its percentile is reported;
+  - the measured iteration count must lie in the simulated p5-p95 band; its percentile is reported. A band of
+    zero width (no re-pairing freedom, e.g. one request per shape) falls back to the deterministic 1% bound;
   - e2e / throughput / TPOT / TTFT and the workload-structure metrics are reported as simulated mean +- sd (and
     p5/p95) of the pack's metric formula, next to the measured noise band when given.
 A diagnostic run (`--measured-id`) assigns every trace request the chain of the SAME measured request id; it is
@@ -25,6 +29,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
+import random
 import glob
 import io
 import json
@@ -149,6 +155,32 @@ def simulated_rounds_by_shape(variant: Path, shape_of: dict[str, tuple[int, int]
     return rounds
 
 
+def tokens_per_round_moments(chain: list[float]) -> tuple[float, float]:
+    """Mean and variance of tokens emitted per verify round (1 + accepted drafts) under a conditional chain."""
+    reach, probs = 1.0, []
+    for p_k in chain:
+        probs.append(reach * (1 - p_k))
+        reach *= p_k
+    probs.append(reach)  # all drafts accepted
+    mean = sum((a + 1) * p for a, p in enumerate(probs))
+    var = sum(((a + 1) - mean) ** 2 * p for a, p in enumerate(probs))
+    return mean, var
+
+
+def shape_rounds_se(rounds: list[int], chains: list[list[float]], outputs: list[int], resamples: int) -> tuple[float, str]:
+    """Standard error of a shape's total decode rounds: bootstrap over its measured requests, or the renewal
+    approximation of per-round draw noise when the shape has a single request."""
+    if len(rounds) >= 2:
+        rng = random.Random(0)
+        sums = [sum(rng.choice(rounds) for _ in rounds) for _ in range(resamples)]
+        return st.pstdev(sums), "bootstrap"
+    var = 0.0
+    for chain, n in zip(chains, outputs):
+        mean, v = tokens_per_round_moments(chain)
+        var += max(n - 1, 0) * v / mean ** 3
+    return math.sqrt(var), "renewal"
+
+
 def pct(xs: list[float], q: float) -> float:
     xs = sorted(xs)
     return xs[min(len(xs) - 1, max(0, round(q * (len(xs) - 1))))]
@@ -199,6 +231,18 @@ def score_case(pack, case, run_root: Path, seeds: int, jobs: int, measured_id: b
         measured_by_shape[shape_of[rid]] += value
     by_shape = {f"{s[0]}x{s[1]}": 100.0 * (rounds_mean[s] / measured_by_shape[s] - 1) for s in measured_by_shape}
     total = 100.0 * (sum(rounds_mean.values()) / sum(measured_by_shape.values()) - 1)
+    policy = (pack.acceptance.get("stochastic_scoring") or {})
+    flag_sigma = float((policy.get("rounds_by_shape_diagnostic") or {}).get("flag_sigma", 3.0))
+    resamples = int((policy.get("rounds_by_shape_diagnostic") or {}).get("bootstrap_resamples", 2000))
+    shape_diag = {}
+    for shape in measured_by_shape:
+        members = [rid for rid in ids if shape_of[rid] == shape and rid in per_id_rounds]
+        se, method = shape_rounds_se([per_id_rounds[r] for r in members], [by_id[r] for r in members if r in by_id],
+                                     [shape[1] for r in members], resamples)
+        diff = rounds_mean[shape] - measured_by_shape[shape]
+        shape_diag[f"{shape[0]}x{shape[1]}"] = {
+            "pct": by_shape[f"{shape[0]}x{shape[1]}"], "diff_rounds": diff, "se_rounds": se, "se_method": method,
+            "z": diff / se if se > 0 else None, "flagged": se > 0 and abs(diff) > flag_sigma * se}
     replica = None
     if case.profile_arrival_mode == "saturated":
         trace = [shape_of[rid] for rid in ids]
@@ -209,12 +253,31 @@ def score_case(pack, case, run_root: Path, seeds: int, jobs: int, measured_id: b
                    "pct": 100.0 * (len(steps) / measured_iters - 1) if measured_iters else None}
     return {
         "case": case.slug, "seeds": len(seeded), "failed_variants": [n for n, good in ok.items() if not good],
-        "deterministic": {"rounds_by_shape_pct": by_shape, "rounds_total_pct": total,
-                          "rounds_worst_shape_pct": max(by_shape.values(), key=abs),
+        "deterministic": {"rounds_total_pct": total, "rounds_by_shape": shape_diag,
                           "replica_iterations": replica},
         "stochastic": {"iterations_band": band, "metrics": stoch},
         "diagnostic_measured_id": results.get("measured_id"),
+        "verdict": verdict(pack, policy, total, replica, band, stoch),
     }
+
+
+def verdict(pack, policy, rounds_total, replica, band, stoch) -> dict:
+    """Pass/fail per scored item of acceptance.yaml's stochastic_scoring."""
+    tol = (policy.get("deterministic_tolerances") or {})
+    default = (pack.acceptance.get("tolerances") or {}).get("default", {})
+    out = {"rounds_total": abs(rounds_total) <= float(tol.get("rounds_total_pct", 1.0))}
+    if replica and replica.get("pct") is not None:
+        out["replica_iterations"] = abs(replica["pct"]) <= float(tol.get("replica_iterations_pct", 1.0))
+    if band["p5"] == band["p95"]:
+        out["iterations"] = abs(stoch["iterations_pct"]["mean"]) <= float(policy.get("zero_width_band_iterations_pct", 1.0))
+        out["iterations_rule"] = "zero-width band: deterministic bound"
+    else:
+        out["iterations"] = band["measured_in_band"]
+        out["iterations_rule"] = "measured within simulated p5-p95"
+    for metric in ("e2e_mean_pct", "output_tps_pct", "server_tpot_mean_pct", "server_ttft_mean_pct"):
+        if metric in stoch and metric in default:
+            out[metric] = abs(stoch[metric]["mean"]) <= float(default[metric])
+    return out
 
 
 def main() -> None:
@@ -237,10 +300,11 @@ def main() -> None:
         report.append(result)
         band = result["stochastic"]["iterations_band"]
         det = result["deterministic"]
-        print(f"{case.slug}: iterations measured {band['measured']} in sim p5-p95 [{band['p5']}, {band['p95']}] "
-              f"-> {'IN' if band['measured_in_band'] else 'OUT'} (percentile {band['measured_percentile']:.0f}); "
-              f"rounds total {det['rounds_total_pct']:+.2f}% worst shape {det['rounds_worst_shape_pct']:+.2f}%; "
-              f"replica {det['replica_iterations']}", flush=True)
+        flagged = [k for k, v in det["rounds_by_shape"].items() if v["flagged"]]
+        print(f"{case.slug}: iterations measured {band['measured']} sim p5-p95 [{band['p5']}, {band['p95']}] "
+              f"(percentile {band['measured_percentile']:.0f}); rounds total {det['rounds_total_pct']:+.2f}%; "
+              f"shapes flagged >3SE {flagged}; replica {det['replica_iterations']}; verdict {result['verdict']}",
+              flush=True)
     if args.out:
         args.out.write_text(json.dumps(report, indent=1))
 
