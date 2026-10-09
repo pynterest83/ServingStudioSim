@@ -43,7 +43,7 @@ from launcher.alignment_campaign.metrics import (
     metric_names,
     metric_specs,
 )
-from launcher.alignment_campaign.pack import PackError, load_host, load_pack
+from launcher.alignment_campaign.pack import PackError, load_host, load_pack, load_per_request_chains
 from launcher.alignment_campaign.render import (
     ANALYSIS_KERNEL_PHASE,
     CONTEXT_LIMIT_FLAG,
@@ -1363,3 +1363,53 @@ def test_variant_arch_tag_and_params_exist_in_the_exported_schema(pack):
         known |= {item["name"] for item in schema.arch_common}
         unknown = set(variant.arch) - known - {"type", "max_model_len"}
         assert not unknown, f"variants.{name}.arch has unknown params {sorted(unknown)}"
+
+
+def test_per_request_acceptance_gives_each_trace_request_one_measured_chain(pack, tmp_path):
+    """The defect this catches: one pooled chain for every request. A per-request
+    mean TPOT averages 1/acceptance, so pooling hides per-request variance and
+    under-predicts TPOT (H200 GLM-5.3-Flash cases 05/10/12: -12..-23%)."""
+    original_case = pack.cases[0]
+    calibrated = original_case.attn_gpu_memory_gb
+    chains = [[0.9, 0.8], [0.2, 0.1], [0.6, 0.5]]
+    pack_root = tmp_path / "pack"
+    (pack_root / "acceptance").mkdir(parents=True)
+    (pack_root / "acceptance" / "c.json").write_text(json.dumps({"chains": chains}))
+    case = dataclasses.replace(
+        original_case,
+        speculative_acceptance=dataclasses.replace(calibrated, value=[0.6, 0.6]),
+        speculative_acceptance_per_request=dataclasses.replace(calibrated, value="acceptance/c.json"),
+    )
+    loaded = load_per_request_chains(pack_root, case)
+    assert [list(c) for c in loaded] == chains
+    # A fixed hash of the trace id picks the chain: stable across calls and
+    # machines, and spread over the measured chains.
+    picks = [tuple(render_module.per_request_chain(loaded, f"x-{i:04d}")) for i in range(64)]
+    assert picks == [tuple(render_module.per_request_chain(loaded, f"x-{i:04d}")) for i in range(64)]
+    assert set(picks) == {tuple(c) for c in chains}
+    patched = dataclasses.replace(pack, root=pack_root)
+    rows = list(csv.DictReader(io.StringIO(case_traces(patched, case)["trace_speculative.csv"])))
+    for row in rows:
+        assert json.loads(row["accept_rate"]) == list(render_module.per_request_chain(loaded, row["id"]))
+    # A chain shorter than the pooled depth is rejected.
+    (pack_root / "acceptance" / "c.json").write_text(json.dumps({"chains": [[0.5]]}))
+    with pytest.raises(PackError, match="2 probabilities each"):
+        load_per_request_chains(pack_root, case)
+
+
+def test_per_request_acceptance_excludes_output_position_buckets(pack):
+    raw = {
+        "index": 99, "name": "x", "variant": next(iter(pack.variants)), "purpose": "", "coverage": [],
+        "max_model_len": 8192, "max_concurrency": 1, "profile_arrival_mode": "saturated",
+        "simulation_arrival_mode": "saturated", "gpu_memory_utilization": 0.9, "capture_seconds": 1.0,
+        "device_role": "primary",
+        "workload_trace": {"file": "traces/x.csv", "shapes": [[16, 16]], "repeats": 1},
+        "attn_gpu_memory_gb": {"value": 1.0, "status": "measured", "derived_from": "t"},
+        "speculative_acceptance": {"value": [0.5], "status": "measured", "derived_from": "t"},
+        "speculative_acceptance_by_output_position": {
+            "value": [{"from": 1, "p": [0.5, 0.5]}], "status": "measured", "derived_from": "t"},
+        "speculative_acceptance_per_request": {
+            "value": "acceptance/x.json", "status": "measured", "derived_from": "t"},
+    }
+    with pytest.raises(PackError, match="exclusive"):
+        pack_module._case(raw, 0)

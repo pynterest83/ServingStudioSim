@@ -33,6 +33,7 @@ re-rendering on a different machine cannot silently reuse a stale KV budget.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -196,6 +197,13 @@ class Case:
     #: request's declared output length crosses into that request's chain, so
     #: short and long requests stop sharing one token-weighted chain.
     speculative_acceptance_by_output_position: Calibrated | None = None
+    #: Per-request acceptance: `value` names a JSON file under the pack root
+    #: holding one conditional chain per measured request (`chains`, each as
+    #: long as `speculative_acceptance`). Rendering gives each trace request one
+    #: chain, picked by a fixed hash of its trace id (never by measured request
+    #: id), so per-request variance and the within-request correlation of draft
+    #: positions survive. Exclusive with the output-position buckets.
+    speculative_acceptance_per_request: Calibrated | None = None
 
     @property
     def slug(self) -> str:
@@ -214,6 +222,8 @@ class Case:
             found["speculative_acceptance_by_output_position"] = (
                 self.speculative_acceptance_by_output_position
             )
+        if self.speculative_acceptance_per_request is not None:
+            found["speculative_acceptance_per_request"] = self.speculative_acceptance_per_request
         return found
 
     def trace_for(self, role: str) -> TraceSpec:
@@ -485,6 +495,7 @@ def _case(raw: Any, index_hint: int) -> Case:
     chunk_size_raw = body.pop("chunk_size", None)
     acceptance_raw = body.pop("speculative_acceptance", None)
     by_position_raw = body.pop("speculative_acceptance_by_output_position", None)
+    per_request_raw = body.pop("speculative_acceptance_per_request", None)
     rate_raw = body.pop("rate", None)
     kernel_raw = body.pop("kernel_trace", None)
     window_raw = body.pop("analyze_iterations", None)
@@ -555,6 +566,9 @@ def _case(raw: Any, index_hint: int) -> Case:
         speculative_acceptance_by_output_position=None if by_position_raw is None else _calibrated(
             by_position_raw, f"{where}.speculative_acceptance_by_output_position"
         ),
+        speculative_acceptance_per_request=None if per_request_raw is None else _calibrated(
+            per_request_raw, f"{where}.speculative_acceptance_per_request"
+        ),
     )
     _reject_extra(body, where)
     if case.chunk_size is not None and case.chunk_size <= 0:
@@ -576,6 +590,22 @@ def _case(raw: Any, index_hint: int) -> Case:
             len(case.speculative_acceptance.value),
             f"{where}.speculative_acceptance_by_output_position.value",
         )
+    if case.speculative_acceptance_per_request is not None:
+        if case.speculative_acceptance is None:
+            raise PackError(
+                f"{where}: speculative_acceptance_per_request refines speculative_acceptance "
+                "and needs it"
+            )
+        if case.speculative_acceptance_by_output_position is not None:
+            raise PackError(
+                f"{where}: speculative_acceptance_per_request and "
+                "speculative_acceptance_by_output_position are exclusive"
+            )
+        if not isinstance(case.speculative_acceptance_per_request.value, str):
+            raise PackError(
+                f"{where}.speculative_acceptance_per_request.value must name a JSON file "
+                "under the pack root"
+            )
 
     # The two arrival vocabularies are separate spellings of one decision, and a
     # config that disagrees with itself produces a simulation of a different
@@ -595,6 +625,33 @@ def _case(raw: Any, index_hint: int) -> Case:
     if profile_mode == "trace-timed" and case.rate is None:
         raise PackError(f"{where}: trace-timed arrival needs a rate")
     return case
+
+
+def load_per_request_chains(root: Path, case: Case) -> tuple[tuple[float, ...], ...]:
+    """The validated per-request conditional chains a case's
+    `speculative_acceptance_per_request` names (a JSON file under the pack root)."""
+    assert case.speculative_acceptance_per_request is not None
+    assert case.speculative_acceptance is not None
+    where = f"cases[{case.slug}].speculative_acceptance_per_request"
+    path = Path(root) / case.speculative_acceptance_per_request.value
+    if not path.is_file():
+        raise PackError(f"{where}: missing {path}")
+    try:
+        document = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise PackError(f"{where}: {path} is not JSON: {exc}") from exc
+    chains = document.get("chains") if isinstance(document, dict) else None
+    depth = len(case.speculative_acceptance.value)
+    if not isinstance(chains, list) or not chains or any(
+        not isinstance(chain, list)
+        or len(chain) != depth
+        or any(type(x) not in (int, float) or not 0 <= x <= 1 for x in chain)
+        for chain in chains
+    ):
+        raise PackError(
+            f"{where}: {path.name} must hold a non-empty 'chains' list of {depth} probabilities each"
+        )
+    return tuple(tuple(float(x) for x in chain) for chain in chains)
 
 
 def load_pack(root: Path) -> Pack:
@@ -624,6 +681,9 @@ def load_pack(root: Path) -> Pack:
     if not isinstance(cases_raw, list) or not cases_raw:
         raise PackError(f"{where}.cases must be a non-empty list")
     cases = tuple(_case(item, position) for position, item in enumerate(cases_raw))
+    for case in cases:
+        if case.speculative_acceptance_per_request is not None:
+            load_per_request_chains(root, case)
 
     acceptance_path = root / "acceptance.yaml"
     acceptance = _document(acceptance_path, "acceptance") if acceptance_path.is_file() else {}

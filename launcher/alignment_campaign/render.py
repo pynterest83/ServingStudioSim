@@ -46,6 +46,7 @@ so the venv's `site-packages` discovery is unchanged.
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import os
@@ -58,7 +59,7 @@ import yaml
 from alignment.load_generator.config import IndependentFrontendConfig, routes_backend
 
 from ..corpus import ROUTING_FILES
-from .pack import Case, HostProfile, Pack, PackError, TraceSpec, Variant
+from .pack import Case, HostProfile, Pack, PackError, TraceSpec, Variant, load_per_request_chains
 
 #: Trace file names inside a rendered case directory. Fixed rather than derived
 #: from the pack's file names so a run directory reads the same for every pack.
@@ -166,15 +167,26 @@ def acceptance_chain(case: Case, output_len: int) -> list[float]:
     return [tail[k + 1] / tail[k] if tail[k] > 0 else 0.0 for k in range(depth)]
 
 
+def per_request_chain(chains: tuple[tuple[float, ...], ...], request_id: str) -> list[float]:
+    """The per-request chain a trace request gets: a fixed hash (sha256) of its
+    trace id picks one measured request's chain, never its measured request id.
+    Deterministic across runs and machines (Python's `hash` is salted)."""
+    digest = hashlib.sha256(request_id.encode()).digest()
+    return list(chains[int.from_bytes(digest[:8], "big") % len(chains)])
+
+
 def trace_text(
-    case: Case, spec: TraceSpec, *, speculative_acceptance: Callable[[int], list[float]] | None = None
+    case: Case,
+    spec: TraceSpec,
+    *,
+    speculative_acceptance: Callable[[str, int], list[float]] | None = None,
 ) -> str:
     """Regenerate one trace from its shapes.
 
     Request ids carry the case slug so two cases replayed into one server are
     never confused, and arrival times are a deterministic 1 req/s baseline that
     `saturated` discards and `trace-timed` rescales by `rate`.
-    `speculative_acceptance` maps a request's output length to its chain.
+    `speculative_acceptance` maps a request's trace id and output length to its chain.
     """
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\n")
@@ -190,9 +202,12 @@ def trace_text(
                 f"{case.slug} trace row {index} reaches max_model_len: "
                 f"{input_len}+{output_len} >= {case.max_model_len}"
             )
-        row = [f"{prefix}-{index:04d}", input_len, output_len, float(index * 1000)]
+        request_id = f"{prefix}-{index:04d}"
+        row = [request_id, input_len, output_len, float(index * 1000)]
         if speculative_acceptance is not None:
-            row.append(json.dumps(speculative_acceptance(output_len), separators=(",", ":")))
+            row.append(
+                json.dumps(speculative_acceptance(request_id, output_len), separators=(",", ":"))
+            )
         writer.writerow(row)
     return buffer.getvalue()
 
@@ -569,10 +584,13 @@ def case_traces(pack: Pack, case: Case) -> dict[str, str]:
     """Trace file name → contents for one rendered case directory."""
     traces = {WORKLOAD_TRACE_NAME: trace_text(case, case.workload_trace)}
     if case.speculative_acceptance is not None:
+        if case.speculative_acceptance_per_request is not None:
+            chains = load_per_request_chains(pack.root, case)
+            chain_of = lambda request_id, _output_len: per_request_chain(chains, request_id)
+        else:
+            chain_of = lambda _request_id, output_len: acceptance_chain(case, output_len)
         traces[SPECULATIVE_TRACE_NAME] = trace_text(
-            case,
-            case.workload_trace,
-            speculative_acceptance=lambda output_len: acceptance_chain(case, output_len),
+            case, case.workload_trace, speculative_acceptance=chain_of
         )
     if case.kernel_trace is not None:
         traces[KERNEL_TRACE_NAME] = trace_text(case, case.kernel_trace)
