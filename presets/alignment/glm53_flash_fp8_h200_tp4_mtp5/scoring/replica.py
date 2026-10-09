@@ -26,7 +26,10 @@ Toggles (value 'sim' or 'vllm'):
            | vllm (block-granular, prompt must fit at admission
              (scheduler_reserve_full_isl), incremental growth, LIFO preemption
              with recompute)
-  state_blocks: fixed recurrent-state blocks per request for kv=vllm/sim.
+  state_blocks: fixed recurrent-state blocks per request for kv=vllm/sim:
+           19 = 3 KDA groups x (1 + K) + 1, what a decoding request holds
+           in mamba align mode (the startup sizer's 22 adds a prefill
+           checkpoint per group, freed by remove_skipped_blocks).
 """
 
 from __future__ import annotations
@@ -93,7 +96,7 @@ class Config:
     ramp: str = "sim"
     order: str = "sim"
     kv: str = "none"
-    state_blocks: int = 22
+    state_blocks: int = 19
     total_blocks: int = 3144
     sim_kv_tokens: int = 3622674
 

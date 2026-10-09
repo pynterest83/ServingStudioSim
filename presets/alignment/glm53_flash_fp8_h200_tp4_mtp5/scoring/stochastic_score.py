@@ -248,7 +248,7 @@ def score_case(pack, case, run_root: Path, seeds: int, jobs: int, measured_id: b
         trace = [shape_of[rid] for rid in ids]
         rounds = [per_id_rounds.get(rid, 0) for rid in ids]
         steps, _ = replica_run(trace, case.max_concurrency, rounds, [wasted.get(rid, False) for rid in ids],
-                               Config(split="vllm", lag="vllm", ramp="vllm", order="vllm"))
+                               Config(split="vllm", lag="vllm", ramp="vllm", order="vllm", kv="vllm"))
         replica = {"steps": len(steps), "measured": measured_iters,
                    "pct": 100.0 * (len(steps) / measured_iters - 1) if measured_iters else None}
     return {
