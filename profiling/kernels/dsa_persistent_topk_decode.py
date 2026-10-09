@@ -73,6 +73,13 @@ DOC = KernelDoc(
         "the reference only when the kernel's known threshold-bin buffer "
         "overflow explains the difference; such a row's timing is the "
         "production kernel's, but its selection is wrong.",
+        "vllm_auto's cooperative_topk (up to 64 rows) keeps every element above "
+        "its FP16-key threshold bin but tie-breaks within that bin over at most "
+        "top_k (rows up to 16384) or 1024 (longer rows) buffered candidates. The "
+        "increasing uniform template overflows that buffer, so the check accepts "
+        "a cooperative row whose selection differs from the reference only "
+        "inside an overflowing threshold bin; its timing is the production "
+        "kernel's.",
         "GB/s counts the valid FP32 logits, one int32 length and top_k int32 "
         "outputs per row, not padding, scratch space or physical transactions.",
     ),

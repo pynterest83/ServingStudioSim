@@ -1,6 +1,9 @@
+from dataclasses import replace
+
 import pytest
 import torch
 
+from profiling.runners.attention.dsa_persistent_topk_decode import _fp16_key_bin
 from profiling.runners.attention.dsa_persistent_topk_decode_auto import (
     _build_operands,
     _check_output,
@@ -82,4 +85,53 @@ def test_check_requires_the_minus_one_tail_on_short_rows():
     _fill_like_kernel(operands)
     operands.indices[1, 300] = 0
     with pytest.raises(KernelLaunchFailed, match="natural-position"):
+        _check_output(torch, operands)
+
+
+def _overflowing_row(backend):
+    # One increasing uniform row longer than the cooperative register path:
+    # its threshold bin (10 FP16-key bits) holds ~2000 logits, more than the
+    # 1024 ties cooperative_topk buffers.
+    operands = _operands(
+        (32767,), batch_size=1, next_n=1, stride=131072, width=131072, mode="uniform"
+    )
+    return replace(operands, backend=backend)
+
+
+def _keep_buffered_ties(operands, buffered=1024):
+    # Like cooperative_topk on overflow: the right bin, wrong tie-break.
+    row = operands.logits[0, :32767]
+    bins = _fp16_key_bin(torch, row, 6)
+    threshold = int(_fp16_key_bin(torch, row.topk(512).values.min().reshape(1), 6)[0])
+    ties = torch.nonzero(bins == threshold).flatten()
+    assert ties.numel() > buffered and int((bins > threshold).sum()) == 0
+    kept = ties[:buffered]
+    operands.indices[0] = kept[row[kept].topk(512).indices].to(torch.int32)
+
+
+def test_check_accepts_a_cooperative_tie_buffer_overflow_only():
+    operands = _overflowing_row("cooperative")
+    _keep_buffered_ties(operands)
+    _check_output(torch, operands)
+    # The same output from a path without that buffer is a real mismatch.
+    persistent = _overflowing_row("persistent")
+    _keep_buffered_ties(persistent)
+    with pytest.raises(KernelLaunchFailed, match="different values"):
+        _check_output(torch, persistent)
+
+
+def test_check_rejects_a_cooperative_pick_below_the_threshold_bin():
+    operands = _overflowing_row("cooperative")
+    _keep_buffered_ties(operands)
+    operands.indices[0, 0] = 0  # far below the threshold bin
+    with pytest.raises(KernelLaunchFailed, match="different values"):
+        _check_output(torch, operands)
+
+
+def test_check_rejects_a_cooperative_mismatch_without_overflow():
+    operands = _operands((700,), batch_size=1, next_n=1, mode="max_ragged")
+    operands = replace(operands, backend="cooperative")
+    _fill_like_kernel(operands)
+    operands.indices[0, 0] = int(torch.argmin(operands.logits[0, :700]))
+    with pytest.raises(KernelLaunchFailed, match="different values"):
         _check_output(torch, operands)
