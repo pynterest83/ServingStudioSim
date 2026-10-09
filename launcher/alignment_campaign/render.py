@@ -167,22 +167,41 @@ def acceptance_chain(case: Case, output_len: int) -> list[float]:
     return [tail[k + 1] / tail[k] if tail[k] > 0 else 0.0 for k in range(depth)]
 
 
-def per_request_chain(
-    entries: tuple[tuple[int, int, tuple[float, ...]], ...],
-    request_id: str,
-    input_len: int,
-    output_len: int,
-) -> list[float]:
-    """The per-request chain a trace request gets: one measured request of the
-    same shape, picked by a fixed hash (sha256) of the trace id -- never by the
-    measured request id. Acceptance depends on the request (its length among
-    others), so the pool is the same (input, output) shape, else the same output
-    length, else every chain. Deterministic across runs and machines."""
+def _trace_hash(request_id: str) -> int:
+    return int.from_bytes(hashlib.sha256(request_id.encode()).digest()[:8], "big")
+
+
+def _chain_pool(
+    entries: tuple[tuple[int, int, tuple[float, ...]], ...], input_len: int, output_len: int
+) -> list[tuple[float, ...]]:
+    """Measured chains a request of this shape draws from: the same (input,
+    output) shape, else the same output length, else every chain."""
     pool = [chain for i, o, chain in entries if (i, o) == (input_len, output_len)]
     pool = pool or [chain for _, o, chain in entries if o == output_len]
-    pool = pool or [chain for _, _, chain in entries]
-    digest = hashlib.sha256(request_id.encode()).digest()
-    return list(pool[int.from_bytes(digest[:8], "big") % len(pool)])
+    return pool or [chain for _, _, chain in entries]
+
+
+def per_request_chains(
+    entries: tuple[tuple[int, int, tuple[float, ...]], ...],
+    requests: list[tuple[str, int, int]],
+) -> dict[str, list[float]]:
+    """Trace request id -> its measured chain. Within one shape, trace requests
+    ordered by a fixed hash (sha256) of their trace id take that shape's chains
+    in turn, so each measured chain is used once per pass over the pool (the
+    measured per-request distribution, not a resample of it) -- and the pairing
+    never follows the measured request id. Acceptance depends on the request
+    (its length among others), hence the per-shape pools. Deterministic across
+    runs and machines."""
+    by_shape: dict[tuple[int, int], list[str]] = {}
+    for request_id, input_len, output_len in requests:
+        by_shape.setdefault((input_len, output_len), []).append(request_id)
+    assigned: dict[str, list[float]] = {}
+    for (input_len, output_len), ids in by_shape.items():
+        pool = _chain_pool(entries, input_len, output_len)
+        start = _trace_hash(f"{input_len}x{output_len}") % len(pool)
+        for rank, request_id in enumerate(sorted(ids, key=_trace_hash)):
+            assigned[request_id] = list(pool[(start + rank) % len(pool)])
+    return assigned
 
 
 def trace_text(
@@ -599,9 +618,14 @@ def case_traces(pack: Pack, case: Case) -> dict[str, str]:
     if case.speculative_acceptance is not None:
         if case.speculative_acceptance_per_request is not None:
             entries = load_per_request_chains(pack.root, case)
-            chain_of = lambda request_id, input_len, output_len: per_request_chain(
-                entries, request_id, input_len, output_len
+            spec = case.workload_trace
+            prefix = case.slug if spec.id_suffix is None else f"{case.slug}-{spec.id_suffix}"
+            shapes = [shape for _ in range(spec.repeats) for shape in spec.shapes]
+            assigned = per_request_chains(
+                entries,
+                [(f"{prefix}-{index:04d}", i, o) for index, (i, o) in enumerate(shapes)],
             )
+            chain_of = lambda request_id, _input_len, _output_len: assigned[request_id]
         else:
             chain_of = lambda _id, _input_len, output_len: acceptance_chain(case, output_len)
         traces[SPECULATIVE_TRACE_NAME] = trace_text(

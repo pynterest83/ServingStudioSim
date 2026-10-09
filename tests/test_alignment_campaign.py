@@ -1389,18 +1389,21 @@ def test_per_request_acceptance_gives_each_trace_request_one_measured_chain(pack
     )
     entries = load_per_request_chains(pack_root, case)
     assert [list(chain) for _, _, chain in entries] == [c["chain"] for c in chains]
-    # A fixed hash of the trace id picks among the chains of the request's own shape.
-    picks = [tuple(render_module.per_request_chain(entries, f"x-{i:04d}", i0, o0)) for i in range(64)]
-    assert picks == [
-        tuple(render_module.per_request_chain(entries, f"x-{i:04d}", i0, o0)) for i in range(64)
-    ]
-    assert set(picks) == {(0.9, 0.8), (0.2, 0.1)}
+    # Within the request's own shape, hash-ordered trace requests take the
+    # measured chains in turn: each chain once per pass, stable across calls.
+    requests = [(f"x-{i:04d}", i0, o0) for i in range(4)] + [("y", 7, 7)]
+    assigned = render_module.per_request_chains(entries, requests)
+    assert assigned == render_module.per_request_chains(entries, requests)
+    picks = [tuple(assigned[f"x-{i:04d}"]) for i in range(4)]
+    assert sorted(picks) == sorted([(0.9, 0.8), (0.2, 0.1)] * 2)
+    assert len(assigned["y"]) == 2  # no matching shape: drawn from every chain
     patched = dataclasses.replace(pack, root=pack_root)
     rows = list(csv.DictReader(io.StringIO(case_traces(patched, case)["trace_speculative.csv"])))
+    assigned = render_module.per_request_chains(
+        entries, [(row["id"], int(row["input_len"]), int(row["output_len"])) for row in rows]
+    )
     for row in rows:
-        assert json.loads(row["accept_rate"]) == render_module.per_request_chain(
-            entries, row["id"], int(row["input_len"]), int(row["output_len"])
-        )
+        assert json.loads(row["accept_rate"]) == assigned[row["id"]]
     # A chain shorter than the pooled depth is rejected.
     (pack_root / "acceptance" / "c.json").write_text(
         json.dumps({"chains": [{"input_len": 1, "output_len": 1, "chain": [0.5]}]})
