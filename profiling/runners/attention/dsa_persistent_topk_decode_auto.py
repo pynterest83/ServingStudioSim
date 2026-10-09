@@ -13,17 +13,33 @@ rows, and its persistent kernel (after a workspace memset) otherwise. The timed
 closure is the public ``forward`` call, so every launch that dispatch makes is
 counted; the workspace view comes from vLLM's workspace manager, initialized
 once outside timing.
+
+``cooperative_topk`` is exact only while its threshold bin fits its tie buffer.
+It bins each score by the top bits of its FP16 sign-magnitude key (12 bits for
+rows up to ``kHist4096MaxLen`` = 16384, else 10 bits), selects every element
+above the threshold bin, and fills the rest by an exact FP32 tie-break over the
+threshold-bin candidates it buffered: at most top_k on the short path
+(``topk_histogram_4096.cuh`` ``histogram_4096_topk``) and at most ``kMaxTies`` =
+1024 per CTA and per row on the cluster path (``cooperative_topk.cuh``
+``large_topk``, ``le = min(le_full, kMaxTies)``); the rest are dropped. The
+increasing uniform template packs thousands of logits into one bin, so the check
+accepts a cooperative row that differs from the reference only when such an
+overflow explains it (``_cooperative_overflow_explains``). Its timing is the
+production kernel's.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
-from profiling.runners.attention.dsa_persistent_topk_decode import require_vllm_top_k
+from profiling.runners.attention.dsa_persistent_topk_decode import (
+    _fp16_key_bin,
+    require_vllm_top_k,
+)
 from profiling.runners.attention.dsa_persistent_topk_decode_fork import _max_ragged_lengths
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
@@ -33,6 +49,11 @@ _CONTEXT_MODES = ("uniform", "max_ragged")
 # Rows compared with the Torch reference: all of them up to this count, else an
 # evenly spaced sample that keeps the first and last rows.
 _MAX_CHECKED_ROWS = 64
+# cooperative_topk's register path (topk_histogram_4096.cuh kHist4096MaxLen):
+# rows up to this length bin by 12 FP16-key bits and buffer top_k ties; longer
+# rows take the cluster path, which bins by 10 bits and buffers kMaxTies ties.
+_COOPERATIVE_SHORT_MAX_LEN = 16384
+_COOPERATIVE_MAX_TIES = 1024
 
 
 @dataclass(frozen=True)
@@ -43,6 +64,7 @@ class _Operands:
     next_n: int
     top_k: int
     max_seq_len: int
+    backend: str = ""
 
 
 def _row_lengths(
@@ -137,13 +159,39 @@ def _checked_rows(num_rows: int) -> list[int]:
     return sorted({round(i * step) for i in range(_MAX_CHECKED_ROWS)})
 
 
+def _cooperative_overflow_explains(
+    torch: Any, row_logits: Any, selected: Any, expected_values: Any, top_k: int
+) -> bool:
+    """Return whether cooperative_topk's tie-buffer overflow accounts for one row.
+
+    The threshold bin (the bin of the reference's k-th value) must hold more
+    candidates than the row's path can buffer, and the kernel must still have
+    selected every element above that bin and none below it, so only the
+    threshold-bin tie-break may differ from the reference.
+    """
+    if row_logits.numel() <= _COOPERATIVE_SHORT_MAX_LEN:
+        shift, buffered = 4, top_k
+    else:
+        shift, buffered = 6, _COOPERATIVE_MAX_TIES
+    bins = _fp16_key_bin(torch, row_logits, shift)
+    threshold = int(_fp16_key_bin(torch, expected_values.min().reshape(1), shift)[0])
+    if int((bins == threshold).sum()) <= buffered:
+        return False
+    selected_bins = bins.index_select(0, selected)
+    if bool((selected_bins < threshold).any()):
+        return False
+    return int((selected_bins > threshold).sum()) == int((bins > threshold).sum())
+
+
 def _check_output(torch: Any, operands: _Operands) -> None:
     """Compare sampled rows with the kind's Torch reference.
 
     Rows no longer than top_k must equal the reference exactly (natural
     positions, then -1). Longer rows must hold top_k distinct valid positions
     whose logit values equal the reference selection's; the kernels do not
-    define output order or equal-value tie choice.
+    define output order or equal-value tie choice. A cooperative_topk row may
+    differ only where its threshold-bin buffer overflowed
+    (``_cooperative_overflow_explains``).
     """
     from profiling.runners.attention.dsa_persistent_topk_decode_reference import (
         dsa_persistent_topk_decode_reference,
@@ -173,11 +221,20 @@ def _check_output(torch: Any, operands: _Operands) -> None:
             or selected.unique().numel() != operands.top_k
         ):
             raise KernelLaunchFailed(f"{_BACKEND} returned invalid or duplicate indices")
-        torch.testing.assert_close(
-            logits[position].index_select(0, selected).sort().values,
-            logits[position].index_select(0, expected[position].long()).sort().values,
-            atol=0,
-            rtol=0,
+        row_logits = logits[position, :length]
+        expected_values = row_logits.index_select(0, expected[position].long())
+        if torch.equal(
+            row_logits.index_select(0, selected).sort().values, expected_values.sort().values
+        ):
+            continue
+        if operands.backend == "cooperative" and _cooperative_overflow_explains(
+            torch, row_logits, selected, expected_values, operands.top_k
+        ):
+            continue
+        raise KernelLaunchFailed(
+            f"{_BACKEND} row {int(rows[position])} (length {length}, "
+            f"{operands.backend or 'unresolved'} path) selected different values "
+            "than the reference"
         )
 
 
@@ -228,6 +285,10 @@ def profile_dsa_persistent_topk_decode_vllm_auto(
             top_k=top_k,
             context_mode=context_mode,
             device=device,
+        )
+        operands = replace(
+            operands,
+            backend=topk.resolve_backend(operands.logits, top_k, operands.logits.shape[0]),
         )
 
         def launch() -> None:
