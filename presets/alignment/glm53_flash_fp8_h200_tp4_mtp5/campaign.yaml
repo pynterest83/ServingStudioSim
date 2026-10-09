@@ -16,13 +16,17 @@ recorded_on:
   checkpoint_snapshots: {glm53_flash: GLM-5.3-Flash@eb9eb208eb0d988989d07a6a12d0fdeb5f52574a}
   nsys_version: 2025.5.2
   device_roles: {primary: '4,5,6,7'}
-  # Measurement contract since 2026-10-08 (node hgx45 tuned by the admins; lost on node reboot). Every
-  # profile pass logs these before it starts and stops if they no longer hold. Baselines measured before
-  # this (logs/20261007_0_glm53_flash_h200_campaign, untuned: default governor, C-states on, unlocked
-  # GPU clocks) are not comparable with baselines measured under it.
+  # Measurement contract since 2026-10-08 (node hgx45 CPU tuning by the admins; lost on node reboot).
+  # Baselines measured before it (logs/20261007_0_glm53_flash_h200_campaign, untuned: default governor,
+  # C-states on) are not comparable with baselines measured under it. Before every GPU pass: no other process
+  # on GPUs 4-7 and the CPU governor below, else stop. During it: clocks.sm, power.draw, temperature.gpu and
+  # clocks_event_reasons are sampled; any HW slowdown, thermal or power-cap throttle makes the pass unclean
+  # and it is re-measured. Each pass's provenance records the clock policy.
   host_conditions:
     since: '2026-10-08'
-    gpu_sm_clock_lock_mhz: 1980        # GPUs 4-7, application clock mode 1 (nvidia-smi clocks.sm = 1980)
+    # Never locked, from the first measurement on (corrected 2026-10-09: the 1980 MHz read earlier was the
+    # boost clock under load; ~345 MHz idle is normal). profile.db rows and all baselines share this policy.
+    gpu_clock_policy: default boost, unlocked
     cpu_governor: performance          # CPUs 48-95 and 144-191 (NUMA 2-3, the GPU 4-7 side)
     cpu_cstates_disabled: [C1E, C6]
     smt_contention: about 40% remaining (admin micro-benchmark; launch time 1.5-3.3x faster than before)
