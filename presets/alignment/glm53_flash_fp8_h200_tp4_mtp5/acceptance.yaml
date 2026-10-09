@@ -74,3 +74,29 @@ tolerances:
   # No per-case exceptions yet: the GLM-5.2 ones describe that model's run and
   # must be re-earned from this matrix's own evidence, each with a rationale.
   per_case: {}
+
+# Stochastic scoring of the speculative (MTP) cases. The single-run tolerances above stay as diagnostics for the
+# workload-structure metrics; scoring follows this block (scoring/stochastic_score.py).
+# Why: with MTP and per-request acceptance (speculative_acceptance_per_request), the iteration count of a run is a
+# random variable -- it depends on which request draws which acceptance chain, i.e. who finishes last and how
+# long the drain tail runs. The measured run is ONE sample of it: re-pairing the measured per-request rounds
+# within each shape moves the replica's iteration count by sd 3.8% (case 03), 1.7% (04) and 8.5% (05), p5-p95 up
+# to -10..+17%, so a 1% single-run bound on iterations is below the comparison's own sampling noise.
+stochastic_scoring:
+  # (i) Deterministic part, 1% tolerance.
+  deterministic_tolerances:
+    # Simulated decode (verify) rounds per (input, output) shape, mean over the seeds, vs measured.
+    rounds_by_shape_pct: 1.0
+    # replica.py with vLLM v0.31's scheduling rules on the MEASURED per-request rounds vs the measured iteration
+    # count (closed-loop saturated cases; n/a for rate-driven cases, which the replica does not model).
+    replica_iterations_pct: 1.0
+  # (ii) Stochastic part: simulate under >= min_seeds hash orders of the chain assignment.
+  min_seeds: 50
+  # The measured iteration count must lie inside the simulated [p5, p95]; its percentile is reported.
+  iterations_band: [5, 95]
+  # e2e / throughput / TPOT / TTFT (and the structure metrics) are reported as simulated mean +- sd against the
+  # measured value and its measured noise band; the single-run tolerances above judge the simulated MEAN.
+  judge_mean_against: tolerances.default
+  # Not scored: one run with each trace request given the chain of the same measured request id, to show what
+  # remains when the pairing matches the measured sample (the scheduling rules alone).
+  diagnostic: measured_id
