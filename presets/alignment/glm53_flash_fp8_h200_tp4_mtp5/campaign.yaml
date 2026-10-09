@@ -85,7 +85,10 @@ variants:
       host_floor_eager_prefill_ms: 153.65, host_floor_eager_decode_ms: 125.13,
       # vLLM-reproduction rule (a framework constraint, not a target design): the hybrid prompt's last
       # cacheable prefill chunk stops one block early under the MTP drafter (use_eagle_block_drop).
-      eagle_block_drop: true}
+      eagle_block_drop: true,
+      # vLLM framework limitation reproduced for the baseline, not an optimization target: async scheduling's
+      # trailing verify row after a draft-finished request and its one-decision admission lag.
+      async_scheduling: true}
     profile_passes:
     - {kind: workload_metrics, name: profile_workload, trace: workload, warmup: true}
     - {kind: nsys, name: profile_nsys, trace: kernel, warmup: true}
