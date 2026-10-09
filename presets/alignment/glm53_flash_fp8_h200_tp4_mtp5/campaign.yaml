@@ -74,14 +74,15 @@ variants:
         320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512]
     # Speculative worker on the hybrid KV store (recurrent state pinned per request). No gpu_time_multiplier:
     # the host-time model replaces it, cycle = max(kernel + host_fixed, host_floor[graph mode]).
-    # Host values (tools/host-time-fit on case-03 kernel-align, logs/20261008_2_h200_v031refresh_03): fixed
-    # 0.62 ms, piecewise 52 ms and eager-with-prefill 230 ms are fitted on the nsys pass, which ran ~99% in
-    # the host "slow state" (analysis_host/REPORT.md; fast-state eager is ~100-130 ms). full_graph 10 ms and
-    # eager_decode 180 ms are not identified by case 03 (no binding iterations) and come from the host report
-    # (fast full-graph floor; slow-state eager decode). Re-fit after the host CPU fix.
+    # Host values fitted ONLY on the tuned-host (2026-10-08) WORKLOAD passes of cases 03/04/05/10 (4199 engine
+    # steps; kernel time + graph mode from timing-predict of the workload iterations; logs/20261008_5_glm53_flash_
+    # h200_tuned/host_fit/workload_pooled.json): fixed 1.02 ms, eager-with-prefill 153.7 ms (binds 438), eager
+    # decode-only 125.1 ms (binds 816); full-graph and piecewise floors never bind (kernel + fixed is always
+    # above them) and are set to 0. Cycle |error| p50 2.1% / p90 7.3%, total +0.7%. The nsys passes are not used:
+    # nsys tracing inflates the eager host floor (~155-165 ms vs ~111-123 ms).
     worker: {type: speculative, max_batch_tokens: 8192, batch_policy: mix, draft_tokens: 5, acceptance_seed: 73,
-      host_fixed_ms: 0.62, host_floor_full_graph_ms: 10.0, host_floor_piecewise_ms: 52.0,
-      host_floor_eager_prefill_ms: 230.0, host_floor_eager_decode_ms: 180.0}
+      host_fixed_ms: 1.02, host_floor_full_graph_ms: 0.0, host_floor_piecewise_ms: 0.0,
+      host_floor_eager_prefill_ms: 153.65, host_floor_eager_decode_ms: 125.13}
     profile_passes:
     - {kind: workload_metrics, name: profile_workload, trace: workload, warmup: true}
     - {kind: nsys, name: profile_nsys, trace: kernel, warmup: true}
@@ -230,11 +231,11 @@ cases:
       case''s workload pass at max_model_len 8192, gpu_memory_utilization 0.92'
     evidence: logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32/profile_workload
   speculative_acceptance:
-    value: [0.7384, 0.5747, 0.5745, 0.5937, 0.6686]
+    value: [0.7347, 0.5721, 0.5548, 0.6026, 0.6571]
     status: measured
     derived_from: consecutive accepted-token count ratios from this case's clean Prometheus replay delta
-      (mean acceptance length 2.648, 9298 drafts)
-    evidence: logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32/profile_workload/spec_decode_metrics.json
+      (tuned host, mean acceptance length 2.621, 9400 drafts)
+    evidence: logs/20261008_5_glm53_flash_h200_tuned/03_balanced_anchor_c32/profile_workload/spec_decode_metrics.json
   provenance:
     derived_from_pack: glm53_flash_fp8_b200_tp4_ep4 case 03 (same shapes, repeats and concurrency)
 - index: 4
@@ -278,11 +279,11 @@ cases:
       case''s workload pass at max_model_len 8192, gpu_memory_utilization 0.92'
     evidence: logs/20261007_0_glm53_flash_h200_campaign/04_prefill_spectrum_c32/profile_workload
   speculative_acceptance:
-    value: [0.7411, 0.5404, 0.5168, 0.4912, 0.5796]
+    value: [0.7324, 0.5467, 0.5080, 0.5180, 0.6058]
     status: measured
     derived_from: consecutive accepted-token count ratios from this case's clean Prometheus replay delta
-      (mean acceptance length 2.509, 3276 drafts)
-    evidence: logs/20261007_0_glm53_flash_h200_campaign/04_prefill_spectrum_c32/profile_workload/spec_decode_metrics.json
+      (tuned host, mean acceptance length 2.505, 3274 drafts)
+    evidence: logs/20261008_5_glm53_flash_h200_tuned/04_prefill_spectrum_c32/profile_workload/spec_decode_metrics.json
   provenance:
     derived_from_pack: glm53_flash_fp8_b200_tp4_ep4 case 04 (same shapes, repeats and concurrency)
 - index: 5
@@ -326,11 +327,11 @@ cases:
       case''s workload pass at max_model_len 8192, gpu_memory_utilization 0.92'
     evidence: logs/20261007_0_glm53_flash_h200_campaign/05_decode_spectrum_c64/profile_workload
   speculative_acceptance:
-    value: [0.8969, 0.8544, 0.8788, 0.8889, 0.9106]
+    value: [0.8993, 0.8543, 0.8727, 0.8802, 0.9060]
     status: measured
     derived_from: consecutive accepted-token count ratios from this case's clean Prometheus replay delta
-      (mean acceptance length 4.480, 49906 drafts)
-    evidence: logs/20261007_0_glm53_flash_h200_campaign/05_decode_spectrum_c64/profile_workload/spec_decode_metrics.json
+      (tuned host, mean acceptance length 4.463, 50107 drafts)
+    evidence: logs/20261008_5_glm53_flash_h200_tuned/05_decode_spectrum_c64/profile_workload/spec_decode_metrics.json
   provenance:
     derived_from_pack: glm53_flash_fp8_b200_tp4_ep4 case 05 (same shapes, repeats and concurrency)
 - index: 6
@@ -556,11 +557,11 @@ cases:
       case''s workload pass at max_model_len 8192, gpu_memory_utilization 0.92'
     evidence: logs/20261007_0_glm53_flash_h200_campaign/10_full_saturation_rate/profile_workload
   speculative_acceptance:
-    value: [0.8760, 0.8206, 0.8496, 0.8816, 0.9051]
+    value: [0.8749, 0.8178, 0.8452, 0.8792, 0.8984]
     status: measured
     derived_from: consecutive accepted-token count ratios from this case's clean Prometheus replay delta
-      (mean acceptance length 4.231, 201458 drafts)
-    evidence: logs/20261007_0_glm53_flash_h200_campaign/10_full_saturation_rate/profile_workload/spec_decode_metrics.json
+      (tuned host, mean acceptance length 4.204, 202737 drafts)
+    evidence: logs/20261008_5_glm53_flash_h200_tuned/10_full_saturation_rate/profile_workload/spec_decode_metrics.json
   provenance:
     derived_from_pack: glm53_flash_fp8_b200_tp4_ep4 case 10 (same shapes, repeats and concurrency)
 - index: 11
@@ -701,11 +702,11 @@ cases:
       case''s workload pass at max_model_len 524288, gpu_memory_utilization 0.92'
     evidence: logs/20261007_0_glm53_flash_h200_campaign/12_ultra_context_decode_c1/profile_workload
   speculative_acceptance:
-    value: [0.8859, 0.8379, 0.8701, 0.9007, 0.9156]
+    value: [0.8794, 0.8219, 0.8397, 0.8856, 0.8749]
     status: measured
     derived_from: consecutive accepted-token count ratios from this case's clean Prometheus replay delta
-      (mean acceptance length 4.389, 6128 drafts)
-    evidence: logs/20261007_0_glm53_flash_h200_campaign/12_ultra_context_decode_c1/profile_workload/spec_decode_metrics.json
+      (tuned host, mean acceptance length 4.217, 6378 drafts)
+    evidence: logs/20261008_5_glm53_flash_h200_tuned/12_ultra_context_decode_c1/profile_workload/spec_decode_metrics.json
   provenance:
     derived_from_pack: glm53_flash_fp8_b200_tp4_ep4 case 12 (same shapes, repeats and concurrency)
 - index: 13
