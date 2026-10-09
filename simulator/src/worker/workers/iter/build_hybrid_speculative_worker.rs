@@ -141,12 +141,24 @@ pub(crate) fn build_hybrid_speculative_worker<M: SpeculativeUnifiedModel>(
         Some(quantum) => admission.with_chunk_end_quantum(quantum),
         None => admission,
     };
-    IterBatchWorker::from_components(
+    // vLLM's async scheduling has a lifecycle half (the trailing verify row)
+    // and a cadence half (the admission lag); both or neither.
+    let admission = if config.async_scheduling {
+        admission.with_async_scheduling()
+    } else {
+        admission
+    };
+    let worker = IterBatchWorker::from_components(
         essentials.context,
         kv_store,
         admission,
         SpeculativeIterExecution::new(model, essentials.cost, draft_tokens),
-    )
+    );
+    if config.async_scheduling {
+        worker.with_async_scheduling()
+    } else {
+        worker
+    }
 }
 
 #[cfg(test)]

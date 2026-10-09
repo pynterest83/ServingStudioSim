@@ -107,13 +107,24 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
         ),
         drafting_slots,
     );
-
-    IterBatchWorker::from_components(
+    // vLLM's async scheduling has a lifecycle half (the trailing verify row)
+    // and a cadence half (the admission lag); both or neither.
+    let admission = if config.async_scheduling {
+        admission.with_async_scheduling()
+    } else {
+        admission
+    };
+    let worker = IterBatchWorker::from_components(
         essentials.context,
         kv_store,
         admission,
         SpeculativeIterExecution::new(model, essentials.cost, draft_tokens),
-    )
+    );
+    if config.async_scheduling {
+        worker.with_async_scheduling()
+    } else {
+        worker
+    }
 }
 
 #[cfg(test)]
@@ -381,6 +392,301 @@ mod tests {
         // Full-footprint would hold two (2 x 32 of 76 tokens); bounded-future
         // admits on the near future and decodes more at once.
         assert!(model.most_decodes.load(Ordering::Relaxed) > 2);
+    }
+
+    /// vLLM async-scheduling rules. Every iteration costs 1 ms and the tests
+    /// tick at 1 ms, so iteration `i` (1-based) is formed at tick `i - 1` and
+    /// completes at tick `i`.
+    mod async_scheduling {
+        use std::sync::Mutex;
+
+        use super::*;
+
+        /// One iteration as the model saw it.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        struct Iteration {
+            decode_rows: u32,
+            prefill_tokens: u32,
+        }
+
+        fn iteration(decode_rows: u32, prefill_tokens: u32) -> Iteration {
+            Iteration {
+                decode_rows,
+                prefill_tokens,
+            }
+        }
+
+        /// 1 ms per iteration; records each iteration's composition.
+        #[derive(Default)]
+        struct RecordingModel {
+            iterations: Mutex<Vec<Iteration>>,
+        }
+
+        impl SpeculativeUnifiedModel for RecordingModel {
+            fn eval_speculative_iter(
+                &self,
+                batch: &SpeculativeArchInput,
+                slots: &mut Vec<LeafMetrics>,
+                scratch: &mut Vec<LeafMetrics>,
+            ) -> LeafMetrics {
+                self.iterations.lock().unwrap().push(Iteration {
+                    decode_rows: batch
+                        .groups
+                        .iter()
+                        .map(|group| group.decode_requests.len() as u32)
+                        .sum(),
+                    prefill_tokens: batch.groups.iter().map(|group| group.prefill_tokens).sum(),
+                });
+                FakeSpeculativeModel.eval_speculative_iter(batch, slots, scratch)
+            }
+            fn total_kv_bytes_per_token(&self) -> u64 {
+                1024
+            }
+            fn max_model_len(&self) -> u32 {
+                8192
+            }
+            fn gpus_per_replica(&self) -> u16 {
+                1
+            }
+        }
+
+        /// One request: output length, uniform acceptance, and, for a
+        /// closed-loop replacement, the request whose completion releases it.
+        #[derive(Clone, Copy)]
+        struct Spec {
+            output_tokens: u32,
+            accept_rate: f32,
+            replaces: Option<u32>,
+        }
+
+        fn spec(output_tokens: u32, accept_rate: f32) -> Spec {
+            Spec {
+                output_tokens,
+                accept_rate,
+                replaces: None,
+            }
+        }
+
+        fn replacing(predecessor: u32, output_tokens: u32, accept_rate: f32) -> Spec {
+            Spec {
+                replaces: Some(predecessor),
+                ..spec(output_tokens, accept_rate)
+            }
+        }
+
+        struct Run {
+            iterations: Vec<Iteration>,
+            /// Iteration (1-based) whose completion emitted each request's
+            /// `RequestComplete`.
+            completed_at: Vec<usize>,
+            /// Active (KV-resident) requests the worker reported after each
+            /// tick.
+            active_after_tick: Vec<u32>,
+            requests: SharedRequests,
+        }
+
+        impl Run {
+            /// Iteration (1-based) in which `request`'s prefill ran.
+            fn prefilled_at(&self, request: u32) -> usize {
+                let admitted = self.requests.borrow()[RequestId(request)]
+                    .telemetry
+                    .speculative
+                    .is_some();
+                assert!(admitted, "request {request} never ran");
+                // Every prompt in these scenarios fits one chunk, so the k-th
+                // prefill-bearing iteration admitted the k-th prompt group.
+                self.iterations
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, iteration)| iteration.prefill_tokens > 0)
+                    .map(|(index, _)| index + 1)
+                    .last()
+                    .unwrap()
+            }
+        }
+
+        fn run(async_scheduling: bool, specs: &[Spec]) -> Run {
+            let rows: Vec<_> = specs
+                .iter()
+                .enumerate()
+                .map(|(id, spec)| (id as u32, PROMPT_TOKENS, spec.output_tokens))
+                .collect();
+            let requests = shared_with(&rows);
+            for (id, spec) in specs.iter().enumerate() {
+                requests.borrow_mut()[RequestId(id as u32)]
+                    .request
+                    .definition
+                    .decoding = DecodingStrategy::Speculative {
+                    accept_rate: AcceptanceProfile::Uniform(spec.accept_rate),
+                };
+            }
+            let model = Arc::new(RecordingModel::default());
+            let mut config = config(KvAdmissionConfig::FullFootprint);
+            config.async_scheduling = async_scheduling;
+            let mut worker = build_speculative_worker(
+                WorkerId(0),
+                "test",
+                model.clone(),
+                requests.clone(),
+                config,
+                None,
+                PoolId(0),
+                "test-gpu",
+                test_cluster(),
+            );
+            for (id, spec) in specs.iter().enumerate() {
+                if spec.replaces.is_none() {
+                    worker.enqueue(WorkerMsgCommon::Request(RequestId(id as u32)));
+                }
+            }
+            let mut completed_at = vec![0; specs.len()];
+            let mut active_after_tick = Vec::new();
+            let mut events = Vec::new();
+            for tick in 0..100u64 {
+                worker.tick(Time::from_ms(tick as f64), &mut events);
+                active_after_tick.push(worker.status().active_requests);
+                for event in events.drain(..) {
+                    let WorkerEventCommon::RequestComplete { req, .. } = event;
+                    completed_at[req.0 as usize] = tick as usize;
+                    // L6 delivers the replacement after this tick, while the
+                    // iteration the tick just formed is running.
+                    for (id, spec) in specs.iter().enumerate() {
+                        if spec.replaces == Some(req.0) {
+                            worker.enqueue(WorkerMsgCommon::Request(RequestId(id as u32)));
+                        }
+                    }
+                }
+            }
+            for (id, spec) in specs.iter().enumerate() {
+                let record = &requests.borrow()[RequestId(id as u32)];
+                assert!(record.lifecycle.completed, "request {id}");
+                assert_eq!(record.progress.output_tokens_emitted, spec.output_tokens);
+            }
+            let iterations = model.iterations.lock().unwrap().clone();
+            Run {
+                iterations,
+                completed_at,
+                active_after_tick,
+                requests,
+            }
+        }
+
+        #[test]
+        fn a_request_finished_by_accepted_drafts_runs_exactly_one_trailing_row() {
+            // Prefill emits 1 of 4; round 2 starts with 3 left and accepts them
+            // all, so only the drafts finished it. The async scheduler had
+            // already issued a third row.
+            let on = run(true, &[spec(4, 1.0)]);
+            assert_eq!(
+                on.iterations,
+                [
+                    iteration(0, PROMPT_TOKENS),
+                    iteration(1, 0),
+                    iteration(1, 0)
+                ]
+            );
+            let off = run(false, &[spec(4, 1.0)]);
+            assert_eq!(
+                off.iterations,
+                [iteration(0, PROMPT_TOKENS), iteration(1, 0)]
+            );
+            // The client still sees completion at the final real round.
+            assert_eq!(on.completed_at, [2]);
+            assert_eq!(off.completed_at, [2]);
+            // KV stays resident through the trailing row, then is released.
+            assert_eq!(on.active_after_tick[2..4], [1, 0]);
+            assert_eq!(off.active_after_tick[2], 0);
+            // The trailing row emits nothing and is not a verify round.
+            let requests = on.requests.borrow();
+            let observation = requests[RequestId(0)]
+                .telemetry
+                .speculative
+                .as_ref()
+                .unwrap();
+            assert_eq!(observation.decode_rounds, 1);
+            assert_eq!(observation.emitted_tokens, 3);
+            assert_eq!(observation.pending_decode, None);
+        }
+
+        #[test]
+        fn a_request_with_at_most_one_token_left_runs_no_trailing_row() {
+            // Two tokens: prefill emits 1 and round 2 starts with 1 left, so it
+            // is sure to finish. Four tokens rejecting every draft: the final
+            // round also starts with 1 left.
+            for (output_tokens, accept_rate, rounds) in [(2, 1.0, 1), (4, 0.0, 3)] {
+                let on = run(true, &[spec(output_tokens, accept_rate)]);
+                let off = run(false, &[spec(output_tokens, accept_rate)]);
+                assert_eq!(on.iterations, off.iterations);
+                assert_eq!(on.iterations.len(), 1 + rounds);
+                assert_eq!(on.completed_at, off.completed_at);
+                assert_eq!(on.active_after_tick[1 + rounds], 0);
+            }
+        }
+
+        #[test]
+        fn a_closed_loop_replacement_enters_at_n_plus_3_behind_a_busy_engine() {
+            // Request 0 keeps the engine busy; request 1 finishes at N = 2 by
+            // accepting drafts; request 2 replaces it.
+            let specs = [spec(64, 0.0), spec(4, 1.0), replacing(1, 2, 0.0)];
+            let on = run(true, &specs);
+            assert_eq!(on.completed_at[1], 2);
+            assert_eq!(
+                on.iterations[2],
+                iteration(2, 0),
+                "N+1 carries the trailing row"
+            );
+            assert_eq!(
+                on.iterations[3],
+                iteration(1, 0),
+                "N+2 was decided without it"
+            );
+            assert_eq!(on.prefilled_at(2), 2 + 3);
+            let off = run(false, &specs);
+            assert_eq!(off.completed_at[1], 2);
+            assert_eq!(off.prefilled_at(2), 2 + 2);
+        }
+
+        #[test]
+        fn a_closed_loop_replacement_enters_at_n_plus_2_into_an_otherwise_idle_engine() {
+            // Request 0 alone finishes at N = 2 by accepting drafts. Its
+            // trailing row runs at N+1; with nothing else runnable the engine
+            // waits for that row's output and admits the replacement at once.
+            let on = run(true, &[spec(4, 1.0), replacing(0, 2, 0.0)]);
+            assert_eq!(on.completed_at[0], 2);
+            assert_eq!(on.iterations[2], iteration(1, 0));
+            assert_eq!(on.prefilled_at(1), 2 + 2);
+            // With no trailing row the engine is idle at N+1 already, so a
+            // replacement starts as soon as it arrives, as without the option.
+            let on = run(true, &[spec(2, 1.0), replacing(0, 2, 0.0)]);
+            let off = run(false, &[spec(2, 1.0), replacing(0, 2, 0.0)]);
+            assert_eq!(on.iterations, off.iterations);
+            assert_eq!(on.prefilled_at(1), off.prefilled_at(1));
+        }
+
+        #[test]
+        fn the_option_off_keeps_the_synchronous_schedule() {
+            // Hand-derived synchronous schedule: request 0 decodes rounds 2..8;
+            // request 1 finishes at 2 and frees its row at once; its
+            // replacement joins iteration 4 and decodes once.
+            let specs = [spec(8, 0.0), spec(4, 1.0), replacing(1, 2, 0.0)];
+            let off = run(false, &specs);
+            assert_eq!(
+                off.iterations,
+                [
+                    iteration(0, 2 * PROMPT_TOKENS),
+                    iteration(2, 0),
+                    iteration(1, 0),
+                    iteration(1, PROMPT_TOKENS),
+                    iteration(2, 0),
+                    iteration(1, 0),
+                    iteration(1, 0),
+                    iteration(1, 0),
+                ]
+            );
+            assert_eq!(off.completed_at, [8, 2, 5]);
+            let default_config = WorkerConfig::default();
+            assert!(!default_config.async_scheduling);
+        }
     }
 
     #[test]

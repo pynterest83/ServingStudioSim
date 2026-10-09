@@ -2,6 +2,16 @@
 //!
 //! The shell owns cadence and cross-axis sequencing. KV, Admission, and Execution
 //! are statically composed; the FSM itself is deliberately not an axis.
+//!
+//! Synchronous by default: a message that arrives while an iteration runs is
+//! handed to admission at once and can join the next iteration. Under async
+//! scheduling (`with_async_scheduling`) the shell reproduces an engine whose
+//! scheduler builds iteration j+1 while j runs (vLLM's batch queue,
+//! `core.py:760-876`): j+1 was already built when j launched, so a message that
+//! arrives while j runs first reaches admission after the decision that forms
+//! j+1, and can join j+2 at the earliest. When that decision finds nothing to
+//! run, the engine waits for the in-flight output instead and decides again
+//! with the held messages.
 
 use crate::common::{RequestId, Time, WorkerId};
 use crate::worker::admission::{
@@ -50,6 +60,10 @@ where
     input: E::Input,
     batch_plan: IterBatchPlan,
     iteration_fsm: IterationFsm,
+    /// Async scheduling only: messages that arrived since the last batch
+    /// decision, held back from admission for one decision. `None` delivers
+    /// every message immediately.
+    async_ingress: Option<Vec<A::Msg>>,
 }
 
 /// Compatibility name retained for L6 factories and deployment selectors.
@@ -116,12 +130,25 @@ where
             input: Default::default(),
             batch_plan: IterBatchPlan::default(),
             iteration_fsm: IterationFsm::new(),
+            async_ingress: None,
         }
     }
 
+    /// Hold each arriving message back from admission for one batch decision,
+    /// as an engine that schedules one iteration ahead does. See the module
+    /// docs; a framework constraint enabled only to reproduce such an engine.
+    pub(super) fn with_async_scheduling(mut self) -> Self {
+        self.async_ingress = Some(Vec::new());
+        self
+    }
+
     pub fn enqueue(&mut self, msg: A::Msg) {
-        self.admission
-            .accept_message(&mut self.kv_store, msg, &self.context);
+        match &mut self.async_ingress {
+            Some(ingress) => ingress.push(msg),
+            None => self
+                .admission
+                .accept_message(&mut self.kv_store, msg, &self.context),
+        }
     }
 
     pub fn tick(&mut self, now: Time, events: &mut Vec<A::Event>) -> Option<Time> {
@@ -167,10 +194,29 @@ where
     }
 
     fn form_batch(&mut self, now: Time) -> bool {
-        if !self
-            .admission
-            .form_batch(&mut self.kv_store, &self.context, &mut self.batch_plan, now)
-        {
+        let mut formed =
+            self.admission
+                .form_batch(&mut self.kv_store, &self.context, &mut self.batch_plan, now);
+        if let Some(ingress) = self.async_ingress.as_mut() {
+            // Messages that arrived while the last iteration ran were not
+            // visible to this decision. They reach admission now, for the next
+            // one; if this one found nothing to run, the engine waits for them
+            // instead and decides again at once.
+            let delivered = !ingress.is_empty();
+            for msg in ingress.drain(..) {
+                self.admission
+                    .accept_message(&mut self.kv_store, msg, &self.context);
+            }
+            if !formed && delivered {
+                formed = self.admission.form_batch(
+                    &mut self.kv_store,
+                    &self.context,
+                    &mut self.batch_plan,
+                    now,
+                );
+            }
+        }
+        if !formed {
             return false;
         }
         self.iteration_fsm.iteration += 1;
@@ -209,13 +255,22 @@ where
         let active_requests = (0..self.kv_store.num_partitions() as u16)
             .map(|partition| self.kv_store.status_active(partition))
             .sum();
+        let held_messages = self.async_ingress.as_ref().map_or(0, Vec::len) as u32;
         WorkerStatus {
-            queued_requests: self.admission.queued_requests(),
+            queued_requests: self.admission.queued_requests() + held_messages,
             active_requests,
         }
     }
 
     pub fn release_request(&mut self, request: RequestId, current_kv: u64) -> Option<u16> {
+        // A held arrival is still a pending request; hand held messages over so
+        // cancellation can find it (they become eligible one decision early).
+        if let Some(ingress) = self.async_ingress.as_mut() {
+            for msg in ingress.drain(..) {
+                self.admission
+                    .accept_message(&mut self.kv_store, msg, &self.context);
+            }
+        }
         if self.admission.cancel_pending(request) {
             return None;
         }

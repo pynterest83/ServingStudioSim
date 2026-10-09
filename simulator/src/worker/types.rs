@@ -36,17 +36,42 @@ pub struct BatchFsmState {
 /// KV membership remains authoritative in the KV axis. This plan only states
 /// whether each partition's resident decode requests participate in the
 /// current iteration, so a prefill-only scheduler can leave those requests
-/// resident without charging or advancing them.
+/// resident without charging or advancing them, and how many of those resident
+/// requests already finished but still run one trailing verify row that an
+/// async scheduler issued before it saw them finish.
 #[derive(Clone, Debug, Default)]
 pub struct IterBatchPlan {
     decode_participation: Vec<bool>,
+    trailing_decode_rows: Vec<u32>,
 }
 
 impl IterBatchPlan {
+    /// Starts a new plan: every partition takes `participates`, and none
+    /// carries trailing rows.
     pub(crate) fn reset_decode_participation(&mut self, num_partitions: usize, participates: bool) {
         self.decode_participation.clear();
         self.decode_participation
             .resize(num_partitions, participates);
+        self.trailing_decode_rows.clear();
+        self.trailing_decode_rows.resize(num_partitions, 0);
+    }
+
+    /// Declares how many of the partition's resident decode members are
+    /// finished requests running a trailing verify row (billed, never
+    /// advanced). Execution checks its rendered batch against this count.
+    pub(crate) fn set_partition_trailing_decode_rows(&mut self, partition: u16, rows: u32) {
+        let entry = self
+            .trailing_decode_rows
+            .get_mut(usize::from(partition))
+            .expect("batch plan partition must exist");
+        *entry = rows;
+    }
+
+    pub(crate) fn partition_trailing_decode_rows(&self, partition: u16) -> u32 {
+        self.trailing_decode_rows
+            .get(usize::from(partition))
+            .copied()
+            .unwrap_or(0)
     }
 
     pub(crate) fn set_partition_runs_decode(&mut self, partition: u16, runs_decode: bool) {
@@ -507,6 +532,10 @@ pub struct WorkerConfig {
     /// Reproduce vLLM's `use_eagle_block_drop` chunk split (from the
     /// `speculative` selector). Only the hybrid speculative recipe reads it.
     pub eagle_block_drop: bool,
+    /// Reproduce vLLM's async scheduling (from the `speculative` selector): a
+    /// trailing verify row after a request finished by accepted drafts, and a
+    /// one-decision admission lag. Only the speculative recipes read it.
+    pub async_scheduling: bool,
 }
 
 impl Default for WorkerConfig {
@@ -529,6 +558,7 @@ impl Default for WorkerConfig {
             speculative_draft_tokens: 0,
             speculative_acceptance_seed: None,
             eagle_block_drop: false,
+            async_scheduling: false,
         }
     }
 }

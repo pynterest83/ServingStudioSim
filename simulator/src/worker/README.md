@@ -187,6 +187,27 @@ position)` rather than drawn from one stream, so a request accepts the same
 chain no matter which requests it was batched with. Comparing two schedulers on
 one trace therefore measures the schedulers, not a reshuffled random stream.
 
+The `speculative` selector's opt-in `async_scheduling` reproduces vLLM's async
+scheduler, which builds iteration N+1 while N runs. It has two halves, enabled
+together by both speculative recipes:
+
+- lifecycle (`ChunkedPrefillAdmission::with_async_scheduling`): a request that
+  finishes at N with more than one output token left before N (so accepted
+  drafts, not the guaranteed target token, finished it) keeps one trailing
+  verify row at N+1. `DecodeCompletion` reports those requests; KV keeps them
+  in live decode membership without advancing (`hold_trailing_decode_row`), the
+  batch plan declares the count, execution bills the row, and the lifecycle
+  releases it at the end of N+1. The completion event still fires at N, and the
+  row is not a verify round.
+- shell (`IterBatchWorker::with_async_scheduling`): a message that arrives
+  while iteration j runs reaches admission only after the decision that forms
+  j+1, so a closed-loop replacement starts at N+3; when that decision finds
+  nothing runnable the shell delivers the held messages and decides again at
+  once (N+2 behind a trailing row into an otherwise idle engine).
+
+It is a framework limitation reproduced for a vLLM baseline, off by default,
+and requires `full-footprint` KV admission.
+
 The lifecycle freezes `AdmissionCandidate` facts once at enqueue. Its
 `conversation_start_time` is a session's first trace-declared arrival, or the
 standalone request's own release. Production builders choose `SessionStartOrder`,

@@ -188,6 +188,7 @@ impl Deployment for UnifiedDeployment {
             speculative_draft_tokens: speculative_draft_tokens(&g.worker),
             speculative_acceptance_seed: speculative_acceptance_seed(&g.worker),
             eagle_block_drop: eagle_block_drop(&g.worker),
+            async_scheduling: async_scheduling(&g.worker),
             ..WorkerConfig::default()
         };
 
@@ -882,6 +883,16 @@ fn eagle_block_drop(worker: &IterWorkerSel) -> bool {
     }
 }
 
+/// vLLM's async scheduling, carried by the `speculative` selector only.
+fn async_scheduling(worker: &IterWorkerSel) -> bool {
+    match worker {
+        IterWorkerSel::Speculative {
+            async_scheduling, ..
+        } => *async_scheduling,
+        _ => false,
+    }
+}
+
 /// Draft candidate count, carried by the `speculative` selector only. Every other
 /// worker leaves it at `0`, which is what marks it as not speculating.
 fn speculative_draft_tokens(worker: &IterWorkerSel) -> u32 {
@@ -1272,6 +1283,7 @@ pools:
             prefill_gpu_time_multiplier: None,
             host_time: Default::default(),
             eagle_block_drop: false,
+            async_scheduling: false,
         }
     }
 
@@ -1287,6 +1299,21 @@ pools:
         }
         assert!(eagle_block_drop(&reproduce_vllm));
         assert!(!eagle_block_drop(&barebone_worker()));
+    }
+
+    #[test]
+    fn async_scheduling_reaches_only_the_speculative_selector() {
+        assert!(!async_scheduling(&speculative_worker(5)));
+        let mut reproduce_vllm = speculative_worker(5);
+        if let IterWorkerSel::Speculative {
+            async_scheduling, ..
+        } = &mut reproduce_vllm
+        {
+            *async_scheduling = true;
+        }
+        assert!(async_scheduling(&reproduce_vllm));
+        assert!(!eagle_block_drop(&reproduce_vllm));
+        assert!(!async_scheduling(&barebone_worker()));
     }
 
     #[test]

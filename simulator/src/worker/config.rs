@@ -493,6 +493,15 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(default = false)]
         eagle_block_drop: bool,
+        /// vLLM's async scheduling: the scheduler builds iteration N+1 while N
+        /// runs. A request finished at N by accepted drafts still runs one
+        /// billed, token-less verify row at N+1, and an arrival reaches the
+        /// scheduler one batch decision late unless the engine would idle. A
+        /// framework limitation, turned on only to reproduce a vLLM baseline;
+        /// off by default.
+        #[serde(default)]
+        #[param(default = false)]
+        async_scheduling: bool,
     },
     /// PD prefill half: prefills then hands off to a decode pool (no local decode).
     PdPrefill {

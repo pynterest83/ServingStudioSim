@@ -41,12 +41,21 @@ pub trait DecodeCompletion<K: IterWorkerKv> {
 
     /// Retire this iteration's accepted tokens on one partition, appending any
     /// request that finished to `completed`, and advance KV to match.
+    ///
+    /// `finished_by_accepted_drafts` receives the subset of `completed` that had
+    /// more than one output token left before this round: an all-rejected
+    /// verify, which still retires the target's own token, would not have
+    /// finished them, so accepted drafts did. An engine that schedules one step
+    /// ahead cannot rule out such a request's next round (see
+    /// `ChunkedPrefillAdmission::with_async_scheduling`). One-token decode never
+    /// reports any.
     fn complete_decodes(
         &mut self,
         kv_store: &mut K,
         partition: PartitionId,
         context: &WorkerContext,
         completed: &mut Vec<RequestId>,
+        finished_by_accepted_drafts: &mut Vec<RequestId>,
         now: Time,
     );
 }
@@ -67,6 +76,7 @@ impl<K: IterWorkerKv> DecodeCompletion<K> for SingleTokenDecodeCompletion {
         partition: PartitionId,
         context: &WorkerContext,
         completed: &mut Vec<RequestId>,
+        _finished_by_accepted_drafts: &mut Vec<RequestId>,
         now: Time,
     ) {
         {
@@ -155,6 +165,7 @@ impl<K: IterWorkerKv> DecodeCompletion<K> for SpeculativeDecodeCompletion {
         partition: PartitionId,
         context: &WorkerContext,
         completed: &mut Vec<RequestId>,
+        finished_by_accepted_drafts: &mut Vec<RequestId>,
         now: Time,
     ) {
         for bucket in &mut self.request_buckets {
@@ -209,6 +220,9 @@ impl<K: IterWorkerKv> DecodeCompletion<K> for SpeculativeDecodeCompletion {
                 if record.is_complete() {
                     context.stamp_stage(record, now, UnifiedStage::Done as u16);
                     completed.push(request);
+                    if remaining > 1 {
+                        finished_by_accepted_drafts.push(request);
+                    }
                 }
             });
         }
@@ -386,7 +400,14 @@ mod tests {
             .progress
             .output_tokens_emitted;
         let mut completed = Vec::new();
-        policy.complete_decodes(kv_store, 0, context, &mut completed, Time::from_ms(1.0));
+        policy.complete_decodes(
+            kv_store,
+            0,
+            context,
+            &mut completed,
+            &mut Vec::new(),
+            Time::from_ms(1.0),
+        );
         let after = context.requests.borrow()[RequestId(0)]
             .progress
             .output_tokens_emitted;
@@ -479,14 +500,20 @@ mod tests {
         let (mut kv_store, context) = one_resident_decode(2, 63, uniform(1.0));
         let mut policy = SpeculativeDecodeCompletion::new(DRAFT_TOKENS, 7);
         let mut completed = Vec::new();
+        let mut finished_by_accepted_drafts = Vec::new();
         policy.complete_decodes(
             &mut kv_store,
             0,
             &context,
             &mut completed,
+            &mut finished_by_accepted_drafts,
             Time::from_ms(1.0),
         );
         assert_eq!(completed, vec![RequestId(0)]);
+        assert!(
+            finished_by_accepted_drafts.is_empty(),
+            "one token left: even an all-rejected verify would have finished it"
+        );
         let store = context.requests.borrow();
         assert_eq!(store[RequestId(0)].progress.output_tokens_emitted, 2);
         let mut grown = 0;
@@ -495,6 +522,27 @@ mod tests {
             grown, 1,
             "KV must not grow past the tokens actually emitted"
         );
+    }
+
+    #[test]
+    fn a_request_finished_by_accepted_drafts_is_reported_as_such() {
+        // Four tokens in total, one emitted at prefill: three remain, so only
+        // accepted drafts can finish it in one round. A rejecting twin with
+        // the same length stays resident.
+        let (mut kv_store, context) = resident_decodes(&[uniform(1.0), uniform(0.0)], 4, 63);
+        let mut policy = SpeculativeDecodeCompletion::new(DRAFT_TOKENS, 7);
+        let mut completed = Vec::new();
+        let mut finished_by_accepted_drafts = Vec::new();
+        policy.complete_decodes(
+            &mut kv_store,
+            0,
+            &context,
+            &mut completed,
+            &mut finished_by_accepted_drafts,
+            Time::from_ms(1.0),
+        );
+        assert_eq!(completed, vec![RequestId(0)]);
+        assert_eq!(finished_by_accepted_drafts, vec![RequestId(0)]);
     }
 
     #[test]
@@ -525,6 +573,7 @@ mod tests {
             0,
             &context,
             &mut completed,
+            &mut Vec::new(),
             Time::from_ms(1.0),
         );
 
@@ -568,6 +617,7 @@ mod tests {
                 0,
                 &context,
                 &mut completed,
+                &mut Vec::new(),
                 Time::from_ms(1.0),
             );
             let emitted = context.requests.borrow()[RequestId(2)]
@@ -622,6 +672,7 @@ mod tests {
             0,
             &context,
             &mut completed,
+            &mut Vec::new(),
             Time::from_ms(1.0),
         );
         assert!(completed.is_empty());

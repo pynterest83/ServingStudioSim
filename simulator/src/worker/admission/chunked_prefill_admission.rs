@@ -19,6 +19,13 @@
 //! resident and unadvanced until a later decode-only iteration. This is the
 //! mechanism selected by SGLang when `enable_mixed_chunk` is false; admission
 //! capacity estimation and decode retraction are separate policies.
+//!
+//! Under async scheduling (`with_async_scheduling`, vLLM's scheduler building
+//! step N+1 while step N runs), a request that finishes at N only because drafts
+//! were accepted keeps one trailing verify row in N+1: it stays KV-resident and
+//! billed for that iteration, emits nothing, and is released at its end. Its
+//! completion event still fires at N. The shell models the matching admission
+//! lag.
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -67,6 +74,16 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     /// (see `SpeculativeUnifiedModel::drafting_slots_per_request`). Zero for
     /// ordinary decode and sequential drafters.
     drafting_slots: u32,
+    /// vLLM's async scheduling: a request finished by accepted drafts runs one
+    /// trailing verify row in the next iteration. A framework constraint,
+    /// enabled only to reproduce a vLLM baseline.
+    async_scheduling: bool,
+    /// Per partition: requests that finished last iteration, emitted their
+    /// completion, and stay KV-resident for one trailing verify row this
+    /// iteration. Released, without a token, when that iteration completes.
+    trailing_decode_rows: Vec<Vec<RequestId>>,
+    /// Scratch for `DecodeCompletion::complete_decodes`.
+    finished_by_accepted_drafts: Vec<RequestId>,
 }
 
 impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P, SingleTokenDecodeCompletion> {
@@ -136,6 +153,9 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             next_admission: 0,
             decode_completion,
             drafting_slots,
+            async_scheduling: false,
+            trailing_decode_rows: Vec::new(),
+            finished_by_accepted_drafts: Vec::new(),
         }
     }
 
@@ -155,6 +175,24 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             "eagle block drop needs a chunk-end quantum"
         );
         self.eagle_block_drop = true;
+        self
+    }
+
+    /// Reproduce vLLM's async scheduling (`scheduler.py:635-647`): the
+    /// scheduler builds iteration N+1 before seeing N's output, so a decoding
+    /// request whose round N finished it is scheduled again unless it was sure
+    /// to finish at N even with every draft rejected (at most one output token
+    /// left). That N+1 row is billed and holds its KV through N+1 but retires
+    /// nothing and is not a verify round.
+    ///
+    /// Full-footprint KV only: retracting a finished trailing row is not a
+    /// modeled transition.
+    pub(crate) fn with_async_scheduling(mut self) -> Self {
+        assert!(
+            matches!(self.kv_admission, KvAdmissionConfig::FullFootprint),
+            "async scheduling is modeled only with full-footprint KV admission"
+        );
+        self.async_scheduling = true;
         self
     }
 
@@ -420,7 +458,15 @@ where
         let num_partitions = kv_store.num_partitions();
         debug_assert_eq!(self.partition_policies.len(), num_partitions);
         self.started_prefills.resize_with(num_partitions, Vec::new);
+        self.trailing_decode_rows
+            .resize_with(num_partitions, Vec::new);
         batch_plan.reset_decode_participation(num_partitions, true);
+        for (partition, trailing) in self.trailing_decode_rows.iter().enumerate() {
+            if !trailing.is_empty() {
+                batch_plan
+                    .set_partition_trailing_decode_rows(partition as u16, trailing.len() as u32);
+            }
+        }
         let has_live_decode = |kv_store: &K| {
             (0..num_partitions as u16).any(|partition| kv_store.has_live_decode(partition))
         };
@@ -668,7 +714,13 @@ where
                 });
                 if batch_plan.partition_runs_decode(partition) {
                     kv_store.visit_decode_members(partition, |request, resident| {
-                        let observation = store[request]
+                        let record = &mut store[request];
+                        // A trailing row's request already completed; this
+                        // iteration is not one of its verify rounds.
+                        if record.is_complete() {
+                            return;
+                        }
+                        let observation = record
                             .telemetry
                             .speculative
                             .get_or_insert_with(Default::default);
@@ -691,12 +743,22 @@ where
     ) {
         for partition in 0..kv_store.num_partitions() as u16 {
             let mut completed = Vec::new();
+            self.finished_by_accepted_drafts.clear();
             if batch_plan.partition_runs_decode(partition) {
+                // Trailing rows ran their billed verify this iteration; they
+                // retire nothing, so they leave before any decode advances.
+                if let Some(trailing) = self.trailing_decode_rows.get_mut(partition as usize) {
+                    for request in trailing.drain(..) {
+                        self.admission_order.remove(&request);
+                        kv_store.release_retaining_prefix(request, partition, now);
+                    }
+                }
                 self.decode_completion.complete_decodes(
                     kv_store,
                     partition,
                     context,
                     &mut completed,
+                    &mut self.finished_by_accepted_drafts,
                     now,
                 );
             }
@@ -774,8 +836,15 @@ where
             kv_store.clear_prefill_admits(partition);
 
             for request in completed {
-                self.admission_order.remove(&request);
-                kv_store.release_retaining_prefix(request, partition, now);
+                if self.async_scheduling && self.finished_by_accepted_drafts.contains(&request) {
+                    // The async scheduler already issued this request's next
+                    // row: it stays resident for one trailing verify.
+                    kv_store.hold_trailing_decode_row(request, partition);
+                    self.trailing_decode_rows[partition as usize].push(request);
+                } else {
+                    self.admission_order.remove(&request);
+                    kv_store.release_retaining_prefix(request, partition, now);
+                }
                 events.push(WorkerEventCommon::RequestComplete {
                     worker: context.id,
                     req: request,

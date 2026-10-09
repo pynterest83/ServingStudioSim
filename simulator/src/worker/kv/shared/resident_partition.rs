@@ -126,6 +126,17 @@ impl KvCapacityState {
 struct ResidentDecodeState {
     current_kv: u64,
     remaining_decode: u32,
+    /// Finished (`remaining_decode == 0`) but still scheduled for one trailing
+    /// verify row that an async scheduler issued before it saw the finish.
+    /// Such a member stays in live decode membership and never advances.
+    trailing_row: bool,
+}
+
+impl ResidentDecodeState {
+    /// Whether the next iteration runs a decode row for this member.
+    fn runs_decode_row(&self) -> bool {
+        self.remaining_decode > 0 || self.trailing_row
+    }
 }
 
 /// KV-owned state for one partition.
@@ -173,11 +184,11 @@ impl ResidentPartitionState {
             .map(|&index| self.decodes[index].1.current_kv)
     }
 
-    /// Live decodes in insertion order.
+    /// Live decodes in insertion order, including trailing rows.
     fn iter_decoding(&self) -> impl Iterator<Item = (RequestId, &ResidentDecodeState)> {
         self.decodes
             .iter()
-            .filter(|(_, state)| state.remaining_decode > 0)
+            .filter(|(_, state)| state.runs_decode_row())
             .map(|(request, state)| (*request, state))
     }
 
@@ -317,9 +328,25 @@ impl ResidentPartitionState {
             ResidentDecodeState {
                 current_kv: post_prefill_context_tokens,
                 remaining_decode: decode_budget,
+                trailing_row: false,
             },
         ));
         self.recompute_peak();
+    }
+
+    /// Keep a finished resident decode in live membership for one trailing
+    /// row: billed by execution, never advanced, ended by `release_decode`.
+    pub(crate) fn hold_trailing_row(&mut self, request: RequestId) {
+        let index = *self
+            .decode_index
+            .get(&request)
+            .expect("a trailing row needs a resident decode");
+        let state = &mut self.decodes[index].1;
+        assert_eq!(
+            state.remaining_decode, 0,
+            "only a finished decode runs a trailing row"
+        );
+        state.trailing_row = true;
     }
 
     /// Remove one resident decode while preserving the order of all survivors.
@@ -455,10 +482,12 @@ mod tests {
             ResidentDecodeState {
                 current_kv: 0,
                 remaining_decode: 1,
+                trailing_row: false,
             },
             ResidentDecodeState {
                 current_kv: 0,
                 remaining_decode: 10,
+                trailing_row: false,
             },
         ];
         // Two residents at 100 each; the first leaves after one step, so the
@@ -501,10 +530,12 @@ mod tests {
             ResidentDecodeState {
                 current_kv: 0,
                 remaining_decode: 1,
+                trailing_row: false,
             },
             ResidentDecodeState {
                 current_kv: 0,
                 remaining_decode: 10,
+                trailing_row: false,
             },
         ];
         assert_eq!(capacity.projected_peak(decodes.iter(), 0), 10);
@@ -520,10 +551,12 @@ mod tests {
             ResidentDecodeState {
                 current_kv: 10,
                 remaining_decode: 2,
+                trailing_row: false,
             },
             ResidentDecodeState {
                 current_kv: 20,
                 remaining_decode: 5,
+                trailing_row: false,
             },
         ];
         assert_eq!(capacity.projected_peak(decodes.iter(), 0), 34);

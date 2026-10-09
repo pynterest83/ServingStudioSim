@@ -277,6 +277,11 @@ pub trait ChunkedPrefillKv: PrefixKv + IterWorkerKv {
         partition: PartitionId,
         remaining_output_tokens: u32,
     );
+    /// Keep a resident decode that has no output left in live decode
+    /// membership for one more iteration, without advancing it: an async
+    /// scheduler already issued its next verify row. Its KV stays charged
+    /// until `release_retaining_prefix`.
+    fn hold_trailing_decode_row(&mut self, request: RequestId, partition: PartitionId);
 }
 
 pub trait IterWorkerKv: KvStore {

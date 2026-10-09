@@ -87,6 +87,7 @@ impl<M: SpeculativeUnifiedModel> SpeculativeIterExecution<M> {
             });
             if batch_plan.partition_runs_decode(partition) {
                 let request_store = requests.borrow();
+                let mut finished_members = 0_u32;
                 kv_store.visit_decode_members(partition, |request, current_kv| {
                     let record = &request_store[request];
                     // The batch this adapter bills must be the batch the
@@ -101,16 +102,18 @@ impl<M: SpeculativeUnifiedModel> SpeculativeIterExecution<M> {
                         "speculative worker received standard request {}",
                         request.0
                     );
-                    assert!(
-                        record
-                            .request
-                            .definition
-                            .target_output_tokens
-                            .saturating_sub(record.progress.output_tokens_emitted)
-                            > 0,
-                        "completed request {} remained in speculative decode membership",
-                        request.0
-                    );
+                    // A finished member is legal only as a trailing row the
+                    // plan declared (async scheduling); it is billed like any
+                    // other verify row. The count is checked after the visit.
+                    if record
+                        .request
+                        .definition
+                        .target_output_tokens
+                        .saturating_sub(record.progress.output_tokens_emitted)
+                        == 0
+                    {
+                        finished_members += 1;
+                    }
                     // A capped endpoint would silently discard resident keys
                     // while still billing every query. Variable-width boundary
                     // batches need their own model input/profile support.
@@ -131,6 +134,12 @@ impl<M: SpeculativeUnifiedModel> SpeculativeIterExecution<M> {
                     });
                     group.total_kv_len += current_kv;
                 });
+                assert_eq!(
+                    finished_members,
+                    batch_plan.partition_trailing_decode_rows(partition),
+                    "completed requests remained in speculative decode membership \
+                     beyond the planned trailing rows on partition {partition}"
+                );
             }
             group.decode_tokens = group.decode_requests.len() as u32 * verify_width;
             group.batch_tokens = group.prefill_tokens + group.decode_tokens;

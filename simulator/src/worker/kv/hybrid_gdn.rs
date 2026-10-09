@@ -564,6 +564,10 @@ impl ChunkedPrefillKv for HybridGdnKv {
             remaining_output_tokens,
         );
     }
+
+    fn hold_trailing_decode_row(&mut self, request: RequestId, partition: PartitionId) {
+        self.partitions[partition as usize].hold_trailing_row(request);
+    }
 }
 
 impl HybridGdnKv {
