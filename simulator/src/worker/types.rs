@@ -504,6 +504,9 @@ pub struct WorkerConfig {
     /// draw must be reproducible run-to-run like every other modeled quantity,
     /// so this selects *which* deterministic stream, never whether there is one.
     pub speculative_acceptance_seed: Option<u64>,
+    /// Reproduce vLLM's `use_eagle_block_drop` chunk split (from the
+    /// `speculative` selector). Only the hybrid speculative recipe reads it.
+    pub eagle_block_drop: bool,
 }
 
 impl Default for WorkerConfig {
@@ -525,6 +528,7 @@ impl Default for WorkerConfig {
             ssm_checkpoint_interval_tokens: None,
             speculative_draft_tokens: 0,
             speculative_acceptance_seed: None,
+            eagle_block_drop: false,
         }
     }
 }

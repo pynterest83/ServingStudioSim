@@ -187,6 +187,7 @@ impl Deployment for UnifiedDeployment {
             ssm_checkpoint_interval_tokens: ssm_checkpoint_interval_tokens(&g.worker),
             speculative_draft_tokens: speculative_draft_tokens(&g.worker),
             speculative_acceptance_seed: speculative_acceptance_seed(&g.worker),
+            eagle_block_drop: eagle_block_drop(&g.worker),
             ..WorkerConfig::default()
         };
 
@@ -871,6 +872,16 @@ fn host_time_model(
     }
 }
 
+/// vLLM's eagle block-drop chunk split, carried by the `speculative` selector only.
+fn eagle_block_drop(worker: &IterWorkerSel) -> bool {
+    match worker {
+        IterWorkerSel::Speculative {
+            eagle_block_drop, ..
+        } => *eagle_block_drop,
+        _ => false,
+    }
+}
+
 /// Draft candidate count, carried by the `speculative` selector only. Every other
 /// worker leaves it at `0`, which is what marks it as not speculating.
 fn speculative_draft_tokens(worker: &IterWorkerSel) -> u32 {
@@ -1260,7 +1271,22 @@ pools:
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
             host_time: Default::default(),
+            eagle_block_drop: false,
         }
+    }
+
+    #[test]
+    fn eagle_block_drop_reaches_only_the_speculative_selector() {
+        assert!(!eagle_block_drop(&speculative_worker(5)));
+        let mut reproduce_vllm = speculative_worker(5);
+        if let IterWorkerSel::Speculative {
+            eagle_block_drop, ..
+        } = &mut reproduce_vllm
+        {
+            *eagle_block_drop = true;
+        }
+        assert!(eagle_block_drop(&reproduce_vllm));
+        assert!(!eagle_block_drop(&barebone_worker()));
     }
 
     #[test]

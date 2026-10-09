@@ -486,6 +486,13 @@ pub enum IterWorkerSel {
         /// floors. Requires an arch that reports its graph mode.
         #[serde(flatten)]
         host_time: HostTimeSpec,
+        /// vLLM's `use_eagle_block_drop`: with a speculative drafter and prefix
+        /// caching, a hybrid arch's prompt stops its last cacheable prefill chunk
+        /// one recurrent-checkpoint block early. A framework constraint, turned on
+        /// only to reproduce a vLLM baseline; off by default.
+        #[serde(default)]
+        #[param(default = false)]
+        eagle_block_drop: bool,
     },
     /// PD prefill half: prefills then hands off to a decode pool (no local decode).
     PdPrefill {

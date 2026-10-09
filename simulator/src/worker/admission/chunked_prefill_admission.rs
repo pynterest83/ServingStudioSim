@@ -50,6 +50,11 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     /// Context-token spacing that every non-final chunk must end on, when the
     /// engine can only checkpoint recurrent state at those boundaries.
     chunk_end_quantum: Option<u32>,
+    /// vLLM's `use_eagle_block_drop` (speculative drafter with prefix caching):
+    /// the prompt's last cacheable boundary backs off one `chunk_end_quantum`,
+    /// because full attention prunes the last matching block. A framework
+    /// constraint, enabled only to reproduce a vLLM baseline.
+    eagle_block_drop: bool,
     prefill_episodes: HashMap<RequestId, bool>,
     /// Order in which each running request was last admitted from the waiting
     /// queue; FCFS retraction evicts the most recent one.
@@ -125,6 +130,7 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             balance,
             started_prefills: Vec::new(),
             chunk_end_quantum: None,
+            eagle_block_drop: false,
             prefill_episodes: HashMap::new(),
             admission_order: HashMap::new(),
             next_admission: 0,
@@ -137,6 +143,18 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
     pub(crate) fn with_chunk_end_quantum(mut self, quantum: u32) -> Self {
         assert!(quantum > 0, "chunk-end quantum must be positive");
         self.chunk_end_quantum = Some(quantum);
+        self
+    }
+
+    /// Back the prompt's last cacheable chunk end off one quantum, as vLLM's
+    /// `_mamba_block_aligned_split` does under `use_eagle_block_drop`. Only
+    /// meaningful together with [`Self::with_chunk_end_quantum`].
+    pub(crate) fn with_eagle_block_drop(mut self) -> Self {
+        assert!(
+            self.chunk_end_quantum.is_some(),
+            "eagle block drop needs a chunk-end quantum"
+        );
+        self.eagle_block_drop = true;
         self
     }
 
@@ -425,6 +443,7 @@ where
         // drafter's slots.
         let drafting_slots = self.drafting_slots;
         let chunk_end_quantum = self.chunk_end_quantum;
+        let eagle_block_drop = self.eagle_block_drop;
         let max_batch_tokens = self.max_batch_tokens;
         let decode_budget = query_width + drafting_slots;
         // One short prompt can create a whole verify window next iteration.
@@ -472,6 +491,7 @@ where
                     resolved_prefill,
                     remaining_budgets[partition_index].saturating_sub(drafting_slots),
                     chunk_end_quantum,
+                    eagle_block_drop,
                     max_batch_tokens,
                 );
                 if chunk_tokens == 0 {
@@ -521,6 +541,7 @@ where
                     resolved_prefill,
                     remaining_budgets[partition_index] - drafting_slots,
                     chunk_end_quantum,
+                    eagle_block_drop,
                     max_batch_tokens,
                 );
                 if chunk_tokens == 0 {
@@ -795,6 +816,7 @@ fn next_chunk_tokens(
     resolved_prefill: ResolvedPrefillContext,
     budget: u32,
     chunk_end_quantum: Option<u32>,
+    eagle_block_drop: bool,
     max_chunk_tokens: u32,
 ) -> u32 {
     let remaining = resolved_prefill.remaining_prefill_tokens();
@@ -808,6 +830,7 @@ fn next_chunk_tokens(
                 start + remaining,
                 chunk_tokens,
                 quantum,
+                eagle_block_drop,
                 max_chunk_tokens,
             )
         }
@@ -824,7 +847,8 @@ fn next_chunk_tokens(
 ///   instead and re-aligns at the next boundary.
 /// - A chunk starting mid-block stops at the next boundary.
 /// - No chunk runs past the prompt's last boundary, so its state is cached
-///   before the unaligned tail.
+///   before the unaligned tail. Under `eagle_block_drop` that boundary backs
+///   off one quantum (`last_cache_position - block_size`).
 ///
 /// The fork's partial-tail hash stop, shared-prefix junction stop, and in-chunk
 /// prefill checkpoints are not modeled.
@@ -833,6 +857,7 @@ fn checkpoint_aligned_chunk_tokens(
     prefill_end: u32,
     chunk_tokens: u32,
     quantum: u32,
+    eagle_block_drop: bool,
     max_chunk_tokens: u32,
 ) -> u32 {
     if chunk_tokens == 0 || start >= prefill_end {
@@ -846,7 +871,10 @@ fn checkpoint_aligned_chunk_tokens(
         }
     }
     let next_boundary = (start / quantum + 1) * quantum;
-    let last_boundary = prefill_end / quantum * quantum;
+    let mut last_boundary = prefill_end / quantum * quantum;
+    if eagle_block_drop {
+        last_boundary = last_boundary.saturating_sub(quantum);
+    }
     let stops = [
         (start % quantum != 0).then_some(next_boundary),
         Some(last_boundary),
@@ -870,16 +898,16 @@ mod tests {
     fn a_non_final_chunk_ends_on_the_last_checkpoint_boundary_it_reaches() {
         // GLM-5.3-Flash at an 8192-token cap: 3 x 2176, as the trace shows.
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(0, 40_000, 8_192, BLOCK, 8_192),
+            checkpoint_aligned_chunk_tokens(0, 40_000, 8_192, BLOCK, false, 8_192),
             6_528
         );
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(6_528, 40_000, 8_192, BLOCK, 8_192),
+            checkpoint_aligned_chunk_tokens(6_528, 40_000, 8_192, BLOCK, false, 8_192),
             6_528
         );
         // Budget shared with decode still floors to a boundary.
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(0, 40_000, 3_837, BLOCK, 8_192),
+            checkpoint_aligned_chunk_tokens(0, 40_000, 3_837, BLOCK, false, 8_192),
             2_176
         );
     }
@@ -887,7 +915,7 @@ mod tests {
     #[test]
     fn a_budget_below_one_block_cannot_start_an_aligned_chunk() {
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(0, 40_000, 1_664, BLOCK, 8_192),
+            checkpoint_aligned_chunk_tokens(0, 40_000, 1_664, BLOCK, false, 8_192),
             0
         );
     }
@@ -897,11 +925,11 @@ mod tests {
         // The last 4532 tokens cross 43520 = 20 x 2176; the tail runs separately.
         let prefill_end = 43_700;
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(39_168, prefill_end, 4_532, BLOCK, 8_192),
+            checkpoint_aligned_chunk_tokens(39_168, prefill_end, 4_532, BLOCK, false, 8_192),
             4_352
         );
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(43_520, prefill_end, 180, BLOCK, 8_192),
+            checkpoint_aligned_chunk_tokens(43_520, prefill_end, 180, BLOCK, false, 8_192),
             180
         );
     }
@@ -909,7 +937,7 @@ mod tests {
     #[test]
     fn a_final_chunk_that_crosses_no_boundary_is_not_clipped() {
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(0, 1_801, 1_801, BLOCK, 8_192),
+            checkpoint_aligned_chunk_tokens(0, 1_801, 1_801, BLOCK, false, 8_192),
             1_801
         );
     }
@@ -918,15 +946,40 @@ mod tests {
     fn a_block_wider_than_the_cap_runs_sub_block_then_realigns() {
         // GLM-5.3-Flash at a 2048-token cap: 0 -> 2034 -> 2176, as the trace shows.
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(0, 5_000, 2_034, BLOCK, 2_048),
+            checkpoint_aligned_chunk_tokens(0, 5_000, 2_034, BLOCK, false, 2_048),
             2_034
         );
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(2_034, 5_000, 2_048, BLOCK, 2_048),
+            checkpoint_aligned_chunk_tokens(2_034, 5_000, 2_048, BLOCK, false, 2_048),
             142
         );
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(2_176, 5_000, 2_048, BLOCK, 2_048),
+            checkpoint_aligned_chunk_tokens(2_176, 5_000, 2_048, BLOCK, false, 2_048),
+            2_048
+        );
+    }
+
+    #[test]
+    fn eagle_block_drop_backs_the_last_chunk_end_off_one_block() {
+        // GLM-5.3-Flash H200 MTP 5: hybrid block 1152, 4096-token prompt, 8192 cap.
+        // vLLM (`use_eagle_block_drop`) stops the cacheable chunk at 2304, one
+        // block before the prompt's last boundary 3456.
+        assert_eq!(
+            checkpoint_aligned_chunk_tokens(0, 4_096, 4_096, 1_152, false, 8_192),
+            3_456
+        );
+        assert_eq!(
+            checkpoint_aligned_chunk_tokens(0, 4_096, 4_096, 1_152, true, 8_192),
+            2_304
+        );
+        // The tail after the stop runs as one chunk.
+        assert_eq!(
+            checkpoint_aligned_chunk_tokens(2_304, 4_096, 1_792, 1_152, true, 8_192),
+            1_792
+        );
+        // A prompt shorter than two blocks has no cacheable stop left.
+        assert_eq!(
+            checkpoint_aligned_chunk_tokens(0, 2_048, 2_048, 1_152, true, 8_192),
             2_048
         );
     }

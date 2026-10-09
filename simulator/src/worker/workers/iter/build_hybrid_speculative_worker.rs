@@ -135,6 +135,9 @@ pub(crate) fn build_hybrid_speculative_worker<M: SpeculativeUnifiedModel>(
         drafting_slots,
     );
     let admission = match chunk_end_quantum {
+        Some(quantum) if config.eagle_block_drop => admission
+            .with_chunk_end_quantum(quantum)
+            .with_eagle_block_drop(),
         Some(quantum) => admission.with_chunk_end_quantum(quantum),
         None => admission,
     };
