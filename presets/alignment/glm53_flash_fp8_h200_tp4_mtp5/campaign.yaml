@@ -82,7 +82,10 @@ variants:
     # nsys tracing inflates the eager host floor (~155-165 ms vs ~111-123 ms).
     worker: {type: speculative, max_batch_tokens: 8192, batch_policy: mix, draft_tokens: 5, acceptance_seed: 73,
       host_fixed_ms: 1.02, host_floor_full_graph_ms: 0.0, host_floor_piecewise_ms: 0.0,
-      host_floor_eager_prefill_ms: 153.65, host_floor_eager_decode_ms: 125.13}
+      host_floor_eager_prefill_ms: 153.65, host_floor_eager_decode_ms: 125.13,
+      # vLLM-reproduction rule (a framework constraint, not a target design): the hybrid prompt's last
+      # cacheable prefill chunk stops one block early under the MTP drafter (use_eagle_block_drop).
+      eagle_block_drop: true}
     profile_passes:
     - {kind: workload_metrics, name: profile_workload, trace: workload, warmup: true}
     - {kind: nsys, name: profile_nsys, trace: kernel, warmup: true}
@@ -236,6 +239,13 @@ cases:
     derived_from: consecutive accepted-token count ratios from this case's clean Prometheus replay delta
       (tuned host, mean acceptance length 2.621, 9400 drafts)
     evidence: logs/20261008_5_glm53_flash_h200_tuned/03_balanced_anchor_c32/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_per_request:
+    value: acceptance/03_balanced_anchor_c32.json
+    status: measured
+    derived_from: per-request conditional acceptance of draft positions 1-5 (128 requests, 9400
+      verify rounds; acceptance/extract_per_request.py). Measured on the synthetic enwik9 prompts of this
+      matrix (tokens-only replay); production traffic may have a different per-request distribution.
+    evidence: logs/20261008_5_glm53_flash_h200_tuned/03_balanced_anchor_c32/profile_workload/vllm/glm53_flash_h200_tp4_mtp5_03_balanced_anchor_c32_workload_metrics.jsonl
   provenance:
     derived_from_pack: glm53_flash_fp8_b200_tp4_ep4 case 03 (same shapes, repeats and concurrency)
 - index: 4
@@ -284,6 +294,13 @@ cases:
     derived_from: consecutive accepted-token count ratios from this case's clean Prometheus replay delta
       (tuned host, mean acceptance length 2.505, 3274 drafts)
     evidence: logs/20261008_5_glm53_flash_h200_tuned/04_prefill_spectrum_c32/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_per_request:
+    value: acceptance/04_prefill_spectrum_c32.json
+    status: measured
+    derived_from: per-request conditional acceptance of draft positions 1-5 (128 requests, 3274
+      verify rounds; acceptance/extract_per_request.py). Measured on the synthetic enwik9 prompts of this
+      matrix (tokens-only replay); production traffic may have a different per-request distribution.
+    evidence: logs/20261008_5_glm53_flash_h200_tuned/04_prefill_spectrum_c32/profile_workload/vllm/glm53_flash_h200_tp4_mtp5_04_prefill_spectrum_c32_workload_metrics.jsonl
   provenance:
     derived_from_pack: glm53_flash_fp8_b200_tp4_ep4 case 04 (same shapes, repeats and concurrency)
 - index: 5
@@ -332,6 +349,13 @@ cases:
     derived_from: consecutive accepted-token count ratios from this case's clean Prometheus replay delta
       (tuned host, mean acceptance length 4.463, 50107 drafts)
     evidence: logs/20261008_5_glm53_flash_h200_tuned/05_decode_spectrum_c64/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_per_request:
+    value: acceptance/05_decode_spectrum_c64.json
+    status: measured
+    derived_from: per-request conditional acceptance of draft positions 1-5 (128 requests, 50107
+      verify rounds; acceptance/extract_per_request.py). Measured on the synthetic enwik9 prompts of this
+      matrix (tokens-only replay); production traffic may have a different per-request distribution.
+    evidence: logs/20261008_5_glm53_flash_h200_tuned/05_decode_spectrum_c64/profile_workload/vllm/glm53_flash_h200_tp4_mtp5_05_decode_spectrum_c64_workload_metrics.jsonl
   provenance:
     derived_from_pack: glm53_flash_fp8_b200_tp4_ep4 case 05 (same shapes, repeats and concurrency)
 - index: 6
@@ -562,6 +586,13 @@ cases:
     derived_from: consecutive accepted-token count ratios from this case's clean Prometheus replay delta
       (tuned host, mean acceptance length 4.204, 202737 drafts)
     evidence: logs/20261008_5_glm53_flash_h200_tuned/10_full_saturation_rate/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_per_request:
+    value: acceptance/10_full_saturation_rate.json
+    status: measured
+    derived_from: per-request conditional acceptance of draft positions 1-5 (512 requests, 202737
+      verify rounds; acceptance/extract_per_request.py). Measured on the synthetic enwik9 prompts of this
+      matrix (tokens-only replay); production traffic may have a different per-request distribution.
+    evidence: logs/20261008_5_glm53_flash_h200_tuned/10_full_saturation_rate/profile_workload/vllm/glm53_flash_h200_tp4_mtp5_10_full_saturation_rate_workload_metrics.jsonl
   provenance:
     derived_from_pack: glm53_flash_fp8_b200_tp4_ep4 case 10 (same shapes, repeats and concurrency)
 - index: 11
@@ -707,6 +738,13 @@ cases:
     derived_from: consecutive accepted-token count ratios from this case's clean Prometheus replay delta
       (tuned host, mean acceptance length 4.217, 6378 drafts)
     evidence: logs/20261008_5_glm53_flash_h200_tuned/12_ultra_context_decode_c1/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_per_request:
+    value: acceptance/12_ultra_context_decode_c1.json
+    status: measured
+    derived_from: per-request conditional acceptance of draft positions 1-5 (15 requests, 6378
+      verify rounds; acceptance/extract_per_request.py). Measured on the synthetic enwik9 prompts of this
+      matrix (tokens-only replay); production traffic may have a different per-request distribution.
+    evidence: logs/20261008_5_glm53_flash_h200_tuned/12_ultra_context_decode_c1/profile_workload/vllm/glm53_flash_h200_tp4_mtp5_12_ultra_context_decode_c1_workload_metrics.jsonl
   provenance:
     derived_from_pack: glm53_flash_fp8_b200_tp4_ep4 case 12 (same shapes, repeats and concurrency)
 - index: 13
