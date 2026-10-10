@@ -63,9 +63,11 @@ class VllmFusedMoeArgs(KernelArgs):
 
     ``block_size`` is the FP8 activation/weight scale granularity (128 for the
     block-scale recipe), not the Triton ``BLOCK_SIZE_M``. The latter is chosen by
-    vLLM's own tuned-config lookup from (E, N, K, num_tokens, dtype) and is
-    therefore backend behavior, not an independent axis -- the runner lets vLLM
-    pick it exactly as production does.
+    vLLM's own tuned-config lookup, keyed by the layer's (E, intermediate size,
+    dtype, block shape) and num_tokens -- one config shared by both launches --
+    and is therefore backend behavior, not an independent axis. The runner
+    rebuilds the layer weight shapes from (launch_role, n, k) and lets vLLM pick
+    it exactly as production does.
     """
 
     n: int = arg(unit="elements", doc="Output features of this expert projection.")

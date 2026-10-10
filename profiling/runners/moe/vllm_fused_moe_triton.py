@@ -10,7 +10,8 @@ change the launch shape and both are easy to get subtly wrong:
 
 * ``try_get_optimal_moe_config`` picks ``BLOCK_SIZE_M/N/K`` from vLLM's tuned
   config tables. Hard-coding a block size would measure a kernel production
-  never launches.
+  never launches. The lookup is keyed by the *layer's* weights, not by this
+  launch's ``(n, k)`` -- see ``_layer_weight_shapes``.
 * ``_prepare_expert_assignment`` decides between ``moe_align_block_size`` and the
   naive no-sort path (taken when ``num_tokens * top_k * 4 <= num_experts``). The
   two produce different grids for the same shape.
@@ -174,6 +175,51 @@ def _topk_ids(torch: Any, args: _ValidatedArgs, *, device: Any) -> Any:
     return ids.reshape(args.experts_per_token, args.num_tokens).t().contiguous()
 
 
+def _block_shape(args: _ValidatedArgs) -> list[int]:
+    return [args.block_size, args.block_size]
+
+
+def _layer_weight_shapes(
+    args: _ValidatedArgs,
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """The layer's ``(w1.shape, w2.shape)`` that this launch belongs to.
+
+    ``fused_experts`` calls ``try_get_optimal_moe_config(w1.size(), w2.size(),
+    ...)`` ONCE per layer with the real weights -- ``w1 = (E, 2I, H)`` and
+    ``w2 = (E, H, I)`` -- and hands the resulting config to BOTH the w13 and
+    the w2 launch. vLLM keys the tuned-config file on ``N = w2.shape[2] = I``
+    (the per-shard intermediate size), so both roles must rebuild the layer
+    shapes from their own ``(n, k)`` rather than describe the one GEMM being
+    timed; a per-launch ``N`` (2I for w13, H for w2) names a file that does not
+    exist and silently falls back to the default config.
+
+    * w13: ``n = 2I``, ``k = H``.
+    * w2:  ``n = H``,  ``k = I``.
+    """
+    experts = args.num_local_experts
+    if args.launch_role == LAUNCH_ROLE_GATE_UP:
+        hidden, intermediate = args.k, args.n // 2
+    else:
+        hidden, intermediate = args.n, args.k
+    return (experts, 2 * intermediate, hidden), (experts, hidden, intermediate)
+
+
+def _resolve_config(optimal_config: Any, args: _ValidatedArgs) -> dict[str, int]:
+    """Resolve the Triton launch config exactly as ``fused_experts`` does.
+
+    ``M`` is the layer's token count for both roles, matching production.
+    """
+    w1_shape, w2_shape = _layer_weight_shapes(args)
+    return optimal_config(
+        w1_shape,
+        w2_shape,
+        args.experts_per_token,
+        "fp8_w8a8",
+        args.num_tokens,
+        block_shape=_block_shape(args),
+    )
+
+
 @dataclass(frozen=True)
 class _Launch:
     invoke: Any
@@ -194,9 +240,7 @@ def _build_launch(torch: Any, args: _ValidatedArgs, *, device: Any) -> _Launch:
     activation_scale = torch.ones(
         (args.a_rows, scale_blocks(args.k)), dtype=torch.float32, device=device
     )
-    weight = torch.empty(
-        (args.num_local_experts, args.n, args.k), dtype=fp8, device=device
-    )
+    weight = torch.empty((args.num_local_experts, args.n, args.k), dtype=fp8, device=device)
     weight_scale = torch.ones(
         (args.num_local_experts, scale_blocks(args.n), scale_blocks(args.k)),
         dtype=torch.float32,
@@ -217,15 +261,8 @@ def _build_launch(torch: Any, args: _ValidatedArgs, *, device: Any) -> _Launch:
     )
     topk_ids = _topk_ids(torch, args, device=device)
 
-    block_shape = [args.block_size, args.block_size]
-    config = optimal_config(
-        (args.num_local_experts, args.n, args.k),
-        (args.num_local_experts, args.k, args.n),
-        args.experts_per_token,
-        "fp8_w8a8",
-        args.num_tokens,
-        block_shape=block_shape,
-    )
+    block_shape = _block_shape(args)
+    config = _resolve_config(optimal_config, args)
     sorted_token_ids, expert_ids, num_tokens_post_padded = prepare_assignment(
         topk_ids,
         config,
@@ -284,11 +321,7 @@ def _logical_bytes(args: _ValidatedArgs) -> int:
     weight_scale_bytes = active_experts * scale_blocks(args.n) * scale_blocks(args.k) * 4
     output_bytes = rows * args.n * 2
     return (
-        activation_bytes
-        + activation_scale_bytes
-        + weight_bytes
-        + weight_scale_bytes
-        + output_bytes
+        activation_bytes + activation_scale_bytes + weight_bytes + weight_scale_bytes + output_bytes
     )
 
 
