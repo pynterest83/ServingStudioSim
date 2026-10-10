@@ -1,7 +1,10 @@
 //! End-to-end measured ↔ simulated request alignment.
 //!
 //! Client token-event TTFT/TPOT/E2E and server EngineCore TTFT/TPOT are compared as
-//! independent raw distributions. Request ids only audit whether either run lost
+//! independent raw distributions. Client TTFT pairs with the simulator's
+//! arrival-based `ttft_ms`; server TTFT pairs with its `server_ttft_ms`, measured
+//! from the simulated EngineCore `QUEUED` time (`ttft_ms` for runs that predate
+//! that column). Request ids only audit whether either run lost
 //! requests: execution order can differ even when both runs consume the same
 //! trace, so per-id latency subtraction would compare scheduler positions that
 //! are not equivalent. Completion throughput is intentionally named: req-frontend
@@ -21,7 +24,7 @@ use serde_json::{json, Value};
 use crate::alignment_input;
 use crate::cdf::{cdf_series, clean_nonnegative_sorted, stats};
 use crate::io::{resolve_artifact_path, SCHEMA_VERSION};
-use crate::session::{col, collect, register_if_exists, require_columns, value_f64};
+use crate::session::{col, collect, has_column, register_if_exists, require_columns, value_f64};
 
 const SIM_SLO_TABLE: &str = "alignment_sim_slo";
 const SIM_SLO_COLUMNS: &[&str] = &[
@@ -33,14 +36,26 @@ const SIM_SLO_COLUMNS: &[&str] = &[
     "tpot_mean_ms",
     "finish_decode_time_ms",
 ];
+/// Optional `request_slo` column: TTFT from the simulated EngineCore `QUEUED`
+/// time. Older runs lack it and fall back to `ttft_ms`.
+const SIM_SERVER_TTFT_COLUMN: &str = "server_ttft_ms";
 
 #[derive(Clone)]
 struct RequestMetrics {
     output_tokens: u64,
     completion_ms: f64,
     ttft_ms: Option<f64>,
+    /// Server-side TTFT. Measured requests leave it `None`: their server
+    /// timings come from a separate EngineCore file without request pairing.
+    server_ttft_ms: Option<f64>,
     tpot_ms: Option<f64>,
     e2e_ms: Option<f64>,
+}
+
+/// Simulated completed requests plus where their server TTFT came from.
+struct SimRequests {
+    requests: BTreeMap<String, RequestMetrics>,
+    server_ttft_column: &'static str,
 }
 
 struct ServerRequestTimings {
@@ -63,7 +78,10 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         .as_deref()
         .map(read_server_request_timings)
         .transpose()?;
-    let simulated = read_sim_requests(ctx, simulation_log_dir).await?;
+    let SimRequests {
+        requests: simulated,
+        server_ttft_column: simulated_server_ttft_column,
+    } = read_sim_requests(ctx, simulation_log_dir).await?;
     ensure!(
         !measured.is_empty(),
         "measured replay contains no successful independent requests"
@@ -83,6 +101,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
 
     let measured_ttft = latency_samples(&measured, |request| request.ttft_ms);
     let simulated_ttft = latency_samples(&simulated, |request| request.ttft_ms);
+    let simulated_server_ttft = latency_samples(&simulated, |request| request.server_ttft_ms);
     let measured_tpot = latency_samples(&measured, |request| request.tpot_ms);
     let simulated_tpot = latency_samples(&simulated, |request| request.tpot_ms);
     let measured_e2e = latency_samples(&measured, |request| request.e2e_ms);
@@ -107,7 +126,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "Server engine-core TTFT",
             "Server measured",
             &server_timings.ttft_ms,
-            &simulated_ttft,
+            &simulated_server_ttft,
         ));
     }
     latency_cdf_comparisons.push(latency_cdf_comparison(
@@ -144,7 +163,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 "reason": "profile does not contain engine-core request timing instrumentation",
             })
         },
-        |timings| latency_distribution_report(&timings.ttft_ms, &simulated_ttft),
+        |timings| latency_distribution_report(&timings.ttft_ms, &simulated_server_ttft),
     );
     let server_tpot_report = server_timings.as_ref().map_or_else(
         || {
@@ -179,6 +198,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 .and_then(|timings| timings.tpot_ms.as_ref())
                 .map(Vec::len),
             "simulated_completed_requests": simulated.len(),
+            "simulated_server_ttft_column": simulated_server_ttft_column,
             "request_id_audit": {
                 "shared_ids": shared_request_ids,
                 "measured_only_ids": measured.len().saturating_sub(shared_request_ids),
@@ -391,6 +411,7 @@ fn read_measured_requests(path: &Path) -> Result<BTreeMap<String, RequestMetrics
                         output_tokens,
                         completion_ms: (complete - origin_s) * 1000.0,
                         ttft_ms: ttft,
+                        server_ttft_ms: None,
                         tpot_ms: tpot,
                         e2e_ms: e2e,
                     },
@@ -402,21 +423,30 @@ fn read_measured_requests(path: &Path) -> Result<BTreeMap<String, RequestMetrics
     Ok(requests)
 }
 
-async fn read_sim_requests(
-    ctx: &SessionContext,
-    simulation_log_dir: &Path,
-) -> Result<BTreeMap<String, RequestMetrics>> {
+async fn read_sim_requests(ctx: &SessionContext, simulation_log_dir: &Path) -> Result<SimRequests> {
     let path = resolve_artifact_path(simulation_log_dir, "request_slo.parquet");
     ensure!(
         register_if_exists(ctx, SIM_SLO_TABLE, path).await?,
         "request_slo.parquet not found under {}",
         simulation_log_dir.display()
     );
+    read_registered_sim_requests(ctx).await
+}
+
+async fn read_registered_sim_requests(ctx: &SessionContext) -> Result<SimRequests> {
     require_columns(ctx, SIM_SLO_TABLE, SIM_SLO_COLUMNS).await?;
+    let server_ttft_column = if has_column(ctx, SIM_SLO_TABLE, SIM_SERVER_TTFT_COLUMN).await? {
+        SIM_SERVER_TTFT_COLUMN
+    } else {
+        "ttft_ms"
+    };
     let batches = collect(
         ctx,
-        "SELECT request_id, arrival_time_ms, num_output_tokens, ttft_ms, \
-         tpot_mean_ms, finish_decode_time_ms FROM alignment_sim_slo WHERE completed",
+        &format!(
+            "SELECT request_id, arrival_time_ms, num_output_tokens, ttft_ms, \
+             {server_ttft_column} AS server_ttft, tpot_mean_ms, finish_decode_time_ms \
+             FROM {SIM_SLO_TABLE} WHERE completed"
+        ),
     )
     .await?;
     let mut rows = Vec::new();
@@ -426,6 +456,7 @@ async fn read_sim_requests(
         let arrivals = col(batch, "arrival_time_ms")?;
         let tokens = col(batch, "num_output_tokens")?;
         let ttft = col(batch, "ttft_ms")?;
+        let server_ttft = col(batch, "server_ttft")?;
         let tpot = col(batch, "tpot_mean_ms")?;
         let finish = col(batch, "finish_decode_time_ms")?;
         for row in 0..batch.num_rows() {
@@ -436,13 +467,14 @@ async fn read_sim_requests(
                 arrival,
                 value_f64(tokens, row)? as u64,
                 finite(value_f64(ttft, row)?),
+                finite(value_f64(server_ttft, row)?),
                 finite(value_f64(tpot, row)?),
                 finite(value_f64(finish, row)?),
             ));
         }
     }
     let mut requests = BTreeMap::new();
-    for (id, arrival, output_tokens, ttft, tpot, finish) in rows {
+    for (id, arrival, output_tokens, ttft, server_ttft, tpot, finish) in rows {
         let e2e = finish.map(|value| value - arrival);
         let completion_ms = finish.map(|value| value - origin_ms).unwrap_or(f64::NAN);
         requests.insert(
@@ -451,12 +483,16 @@ async fn read_sim_requests(
                 output_tokens,
                 completion_ms,
                 ttft_ms: ttft,
+                server_ttft_ms: server_ttft,
                 tpot_ms: tpot,
                 e2e_ms: e2e,
             },
         );
     }
-    Ok(requests)
+    Ok(SimRequests {
+        requests,
+        server_ttft_column,
+    })
 }
 
 fn latency_samples(
@@ -571,7 +607,8 @@ fn definitions() -> Value {
         "request_id_audit": "req-frontend source.data.id and simulator request_slo.request_id are intersected only to detect missing requests; ids do not pair latency samples",
         "latency_comparison": "measured and simulated raw latency distributions are summarized independently and overlaid as two CDF curves; no per-request subtraction or division",
         "client_ttft": "req-frontend client-observed first token-ID event distribution vs simulator ttft_ms; falls back to first non-empty text only when the server returns no token IDs, and includes frontend/network response-path overhead outside EngineCore",
-        "server_ttft": "vLLM EngineCore queued timestamp to first-token EngineCore output timestamp distribution vs the same simulator ttft_ms distribution; excludes client/frontend transport",
+        "client_ttft_simulated": "simulator ttft_ms = first visible output token - arrival_time_ms; the simulator's arrival is the client send, so it has no frontend/network path",
+        "server_ttft": "vLLM EngineCore queued timestamp to first-token EngineCore output timestamp distribution vs simulator server_ttft_ms = first visible output token - queued_time_ms (the step boundary at or after arrival when the worker models EngineCore pickup); runs without that column fall back to ttft_ms, named by meta.simulated_server_ttft_column; excludes client/frontend transport",
         "tpot": "req-frontend first-to-last token-ID delivery span divided by tokens delivered after the first event, vs simulator tpot_mean_ms; schema-v1/v2 replay artifacts retain the legacy completion-amortized fallback for compatibility",
         "server_tpot": "vLLM EngineCore (last-token output timestamp - first-token output timestamp)/(num_output_tokens-1) distribution vs simulator tpot_mean_ms distribution; excludes HTTP/SSE/client completion overhead",
         "e2e": "measured total_duration_ms distribution vs simulator finish_decode_time_ms-arrival_time_ms distribution",
@@ -593,6 +630,7 @@ mod tests {
                 output_tokens: 10,
                 completion_ms: 10.0,
                 ttft_ms: None,
+                server_ttft_ms: None,
                 tpot_ms: None,
                 e2e_ms: None,
             },
@@ -603,6 +641,7 @@ mod tests {
                 output_tokens: 10,
                 completion_ms: 20.0,
                 ttft_ms: None,
+                server_ttft_ms: None,
                 tpot_ms: None,
                 e2e_ms: None,
             },
@@ -719,11 +758,77 @@ mod tests {
         assert_eq!(request.tpot_ms, Some(100.0 / 3.0));
     }
 
+    /// A `request_slo` batch with one completed request: arrival 10 ms, first
+    /// visible token 25 ms, queued 12 ms. `with_server_ttft = false` is a run
+    /// that predates the column.
+    fn sim_slo_batch(with_server_ttft: bool) -> arrow_array::RecordBatch {
+        use std::sync::Arc;
+
+        use arrow_array::{ArrayRef, BooleanArray, Float32Array, Float64Array, UInt32Array};
+
+        let mut columns: Vec<(&str, ArrayRef)> = vec![
+            ("request_id", Arc::new(UInt32Array::from(vec![0, 1]))),
+            ("completed", Arc::new(BooleanArray::from(vec![true, false]))),
+            (
+                "arrival_time_ms",
+                Arc::new(Float64Array::from(vec![10.0, 10.0])),
+            ),
+            ("num_output_tokens", Arc::new(UInt32Array::from(vec![4, 0]))),
+            (
+                "ttft_ms",
+                Arc::new(Float32Array::from(vec![Some(15.0), None])),
+            ),
+            (
+                "tpot_mean_ms",
+                Arc::new(Float32Array::from(vec![Some(2.0), None])),
+            ),
+            (
+                "finish_decode_time_ms",
+                Arc::new(Float32Array::from(vec![Some(31.0), None])),
+            ),
+        ];
+        if with_server_ttft {
+            columns.push((
+                "queued_time_ms",
+                Arc::new(Float64Array::from(vec![12.0, 10.0])),
+            ));
+            columns.push((
+                "server_ttft_ms",
+                Arc::new(Float32Array::from(vec![Some(13.0), None])),
+            ));
+        }
+        arrow_array::RecordBatch::try_from_iter(columns).unwrap()
+    }
+
+    async fn sim_requests_from(batch: arrow_array::RecordBatch) -> SimRequests {
+        let ctx = crate::session::build_session();
+        ctx.register_batch(SIM_SLO_TABLE, batch).unwrap();
+        read_registered_sim_requests(&ctx).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn simulated_server_ttft_uses_the_queued_column_and_falls_back_to_ttft() {
+        let current = sim_requests_from(sim_slo_batch(true)).await;
+        assert_eq!(current.server_ttft_column, "server_ttft_ms");
+        assert_eq!(current.requests.len(), 1, "only completed requests");
+        let request = &current.requests["0"];
+        assert_eq!(request.server_ttft_ms, Some(13.0));
+        assert_eq!(request.ttft_ms, Some(15.0), "client TTFT stays on arrival");
+        assert_eq!(request.e2e_ms, Some(21.0));
+
+        let old_run = sim_requests_from(sim_slo_batch(false)).await;
+        assert_eq!(old_run.server_ttft_column, "ttft_ms");
+        let request = &old_run.requests["0"];
+        assert_eq!(request.server_ttft_ms, Some(15.0));
+        assert_eq!(request.ttft_ms, Some(15.0));
+    }
+
     fn request_with_ttft(ttft_ms: f64) -> RequestMetrics {
         RequestMetrics {
             output_tokens: 1,
             completion_ms: 0.0,
             ttft_ms: Some(ttft_ms),
+            server_ttft_ms: None,
             tpot_ms: None,
             e2e_ms: None,
         }

@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 
 use crate::io::{read_kv_capacities, SCHEMA_VERSION};
 use crate::session::{
-    col, collect, column_f64, register_kv_snapshot, require_columns, KV_SNAPSHOT_TABLE,
+    col, collect, column_f64, has_column, register_kv_snapshot, require_columns, KV_SNAPSHOT_TABLE,
 };
 
 /// kv_snapshot columns the occupancy subject depends on (drift guard).
@@ -402,14 +402,6 @@ async fn collect_rows(
         }
     }
     Ok(out)
-}
-
-/// Soft probe for an append-only optional column. Unlike `require_columns`, this
-/// deliberately accepts old log schemas and lets the payload expose that the
-/// retained-prefix breakdown was unavailable.
-async fn has_column(ctx: &SessionContext, table: &str, column: &str) -> Result<bool> {
-    let data_frame = ctx.table(table).await?;
-    Ok(data_frame.schema().field_with_name(None, column).is_ok())
 }
 
 fn definitions() -> Value {

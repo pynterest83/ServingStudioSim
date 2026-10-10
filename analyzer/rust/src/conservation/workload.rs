@@ -77,8 +77,8 @@ use serde_json::{json, Value};
 
 use crate::io::{read_deployment, resolve_artifact_path, SCHEMA_VERSION};
 use crate::session::{
-    col, collect, column_f64, register_cost_log, register_if_exists, require_columns, value_f64,
-    COST_LOG_TABLE,
+    col, collect, column_f64, has_column, register_cost_log, register_if_exists, require_columns,
+    value_f64, COST_LOG_TABLE,
 };
 
 mod speculative;
@@ -1425,11 +1425,6 @@ async fn collect_expected(
         }
     }
     Ok(expected)
-}
-
-async fn has_column(ctx: &SessionContext, table: &str, column: &str) -> Result<bool> {
-    let data_frame = ctx.table(table).await?;
-    Ok(data_frame.schema().field_with_name(None, column).is_ok())
 }
 
 fn reprocessed_prefills_at(

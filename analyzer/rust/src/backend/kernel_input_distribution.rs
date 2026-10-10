@@ -35,7 +35,8 @@ use serde_json::{json, Value};
 use crate::io::{read_cost_manifests, SCHEMA_VERSION};
 use crate::pca::pca_project_2d;
 use crate::session::{
-    col, collect, register_cost_log, require_columns, slot_backend_none, value_f64, COST_LOG_TABLE,
+    col, collect, has_column, register_cost_log, require_columns, slot_backend_none, value_f64,
+    COST_LOG_TABLE,
 };
 
 /// cost_log columns that always exist when cost logging is on (drift guard — a
@@ -259,13 +260,6 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "definitions": definitions(),
     });
     Ok((report, payload))
-}
-
-/// Whether a registered table has a column (soft probe for the optional list
-/// columns — `require_columns` bails, which we don't want for an expected old run).
-async fn has_column(ctx: &SessionContext, table: &str, column: &str) -> Result<bool> {
-    let df = ctx.table(table).await?;
-    Ok(df.schema().field_with_name(None, column).is_ok())
 }
 
 /// Same stride policy as `kernel-throughput`: `num_iters / TARGET`, clamped to

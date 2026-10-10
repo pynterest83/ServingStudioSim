@@ -152,6 +152,14 @@ pub async fn require_columns(ctx: &SessionContext, table: &str, columns: &[&str]
     Ok(())
 }
 
+/// Soft probe for an append-only optional column. Unlike [`require_columns`],
+/// it accepts old log schemas so the caller can fall back or report the
+/// breakdown unavailable.
+pub async fn has_column(ctx: &SessionContext, table: &str, column: &str) -> Result<bool> {
+    let df = ctx.table(table).await?;
+    Ok(df.schema().field_with_name(None, column).is_ok())
+}
+
 pub async fn collect(ctx: &SessionContext, sql: &str) -> Result<Vec<RecordBatch>> {
     ctx.sql(sql)
         .await
