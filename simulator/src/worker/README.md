@@ -194,16 +194,28 @@ together by both speculative recipes:
 - lifecycle (`ChunkedPrefillAdmission::with_async_scheduling`): a request that
   finishes at N with more than one output token left before N (so accepted
   drafts, not the guaranteed target token, finished it) keeps one trailing
-  verify row at N+1. `DecodeCompletion` reports those requests; KV keeps them
-  in live decode membership without advancing (`hold_trailing_decode_row`), the
-  batch plan declares the count, execution bills the row, and the lifecycle
-  releases it at the end of N+1. The completion event still fires at N, and the
-  row is not a verify round.
-- shell (`IterBatchWorker::with_async_scheduling`): a message that arrives
-  while iteration j runs reaches admission only after the decision that forms
-  j+1, so a closed-loop replacement starts at N+3; when that decision finds
-  nothing runnable the shell delivers the held messages and decides again at
-  once (N+2 behind a trailing row into an otherwise idle engine).
+  verify row at N+1 (`scheduler.py:635-647`). `DecodeCompletion` reports those
+  requests; KV keeps them in live decode membership without advancing
+  (`hold_trailing_decode_row`), the batch plan declares the count, execution
+  bills the row, and the lifecycle releases it at the end of N+1. The row emits
+  nothing and is not a verify round. The lifecycle also stamps each request's
+  `queued_time`, vLLM's EngineCore `QUEUED`: the end of the step running when
+  it arrived, or its arrival at an idle engine. It is not the admission time:
+  waiting for KV or budget afterwards stays in server TTFT.
+- shell (`IterBatchWorker::with_async_scheduling`, private `OutputLag`): vLLM
+  processes step k's sampled output only after it launched k+1
+  (`core.py` ~L760-876, `step_with_batch_queue`), so k's client-visible token
+  times and `RequestComplete` events move to the end of k+1, or stay at the
+  end of k when nothing runs after it. Progress and KV release still happen at
+  the end of k. A closed-loop replacement therefore sees its predecessor's
+  final round N complete at the end of N+1, arrives while N+2 runs, and starts
+  at N+3 (N+2 into an otherwise idle engine). Arrivals reach admission at once,
+  as with the option off.
+
+`request_slo` carries `queued_time_ms` and `server_ttft_ms` (first visible
+token minus `queued_time_ms`). With the option off both stay at the arrival
+and the client TTFT. A synchronous vLLM also picks requests up only between
+steps; that is a possible follow-up and is not applied with the option off.
 
 It is a framework limitation reproduced for a vLLM baseline, off by default,
 and requires `full-footprint` KV admission.

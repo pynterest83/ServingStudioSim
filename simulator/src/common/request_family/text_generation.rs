@@ -44,6 +44,22 @@ impl ActiveRequest<TextGenerationDefinition> {
         }
     }
 
+    /// Re-stamp the latest `tokens` output tokens as observed at `visible`. An
+    /// engine that processes a step's output only after it launched the next
+    /// step shows those tokens late; progress already counted them when the
+    /// step ended. `includes_first` moves the first-token time with them.
+    pub fn delay_latest_outputs(&mut self, tokens: u32, includes_first: bool, visible: Time) {
+        self.telemetry.last_output_time = Some(visible);
+        if includes_first {
+            self.telemetry.first_output_time = Some(visible);
+        }
+        let logged = self.telemetry.output_times.len();
+        let delayed = logged.saturating_sub(tokens as usize);
+        for time in &mut self.telemetry.output_times[delayed..] {
+            *time = visible;
+        }
+    }
+
     pub fn record_token(&mut self, now: Time, log_tokens: bool) {
         self.progress.output_tokens_emitted += 1;
         self.telemetry.last_output_time = Some(now);

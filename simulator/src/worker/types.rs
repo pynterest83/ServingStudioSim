@@ -533,8 +533,9 @@ pub struct WorkerConfig {
     /// `speculative` selector). Only the hybrid speculative recipe reads it.
     pub eagle_block_drop: bool,
     /// Reproduce vLLM's async scheduling (from the `speculative` selector): a
-    /// trailing verify row after a request finished by accepted drafts, and a
-    /// one-decision admission lag. Only the speculative recipes read it.
+    /// trailing verify row after a request finished by accepted drafts, a
+    /// one-step output lag, and the between-step `QUEUED` stamp. Only the
+    /// speculative recipes read it.
     pub async_scheduling: bool,
 }
 

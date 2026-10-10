@@ -109,6 +109,10 @@ pub struct RequestTelemetry {
     pub first_output_time: Option<Time>,
     pub last_output_time: Option<Time>,
     pub output_times: Vec<Time>,
+    /// When the engine loop picked the request up between steps (vLLM's
+    /// EngineCore `QUEUED` stamp), the origin of server-side TTFT. `None`
+    /// means at arrival: only a worker that models that pickup sets it.
+    pub queued_time: Option<Time>,
     /// Prefix tokens physically found when this request was admitted. `None`
     /// means admission never resolved a prefix context; `Some(0)` is a real
     /// cold/disabled-cache result rather than missing telemetry.

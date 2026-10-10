@@ -96,6 +96,13 @@ pub struct RequestSloEntry {
     /// Immutable output length the request asks for. `num_output_tokens` is
     /// what it produced, short of this for a request the run stopped.
     pub target_output_tokens: u32,
+    /// When the engine loop picked the request up between steps (vLLM's
+    /// EngineCore `QUEUED`); equals `arrival_time_ms` unless the worker models
+    /// that pickup (async scheduling).
+    pub queued_time_ms: f64,
+    /// Server-side TTFT: first visible output token minus `queued_time_ms`.
+    /// `None` exactly when `ttft_ms` is.
+    pub server_ttft_ms: Option<f32>,
     pub retraction_count: u32,
     pub reprocessed_prefill_output_tokens_before: Vec<u32>,
     pub reprocessed_prefill_prefix_hit_tokens: Vec<u32>,
@@ -727,6 +734,8 @@ pub(crate) fn slo_to_record_batch(
     let target_output_tokens: Vec<u32> = entries.iter().map(|e| e.target_output_tokens).collect();
     let retraction_count: Vec<u32> = entries.iter().map(|e| e.retraction_count).collect();
     let ttft: Vec<Option<f32>> = entries.iter().map(|e| e.ttft_ms).collect();
+    let queued_time: Vec<f64> = entries.iter().map(|e| e.queued_time_ms).collect();
+    let server_ttft: Vec<Option<f32>> = entries.iter().map(|e| e.server_ttft_ms).collect();
     let finish_decode: Vec<Option<f32>> = entries.iter().map(|e| e.finish_decode_time_ms).collect();
     let tpot_mean: Vec<Option<f32>> = entries.iter().map(|e| e.tpot_mean_ms).collect();
     // Per-request TPOT percentiles need the per-token series, so they are derived
@@ -876,6 +885,8 @@ pub(crate) fn slo_to_record_batch(
                     .collect::<Vec<_>>(),
             )),
             Arc::new(UInt32Array::from(target_output_tokens)),
+            Arc::new(Float64Array::from(queued_time)),
+            Arc::new(Float32Array::from(server_ttft)),
         ],
     )?)
 }
@@ -990,6 +1001,8 @@ mod tests {
             prefix_cache_hit_tokens: Some(0),
             fresh_prompt_tokens: 0,
             target_output_tokens: 0,
+            queued_time_ms: 0.0,
+            server_ttft_ms: Some(1.0),
             retraction_count: 0,
             reprocessed_prefill_output_tokens_before: Vec::new(),
             reprocessed_prefill_prefix_hit_tokens: Vec::new(),

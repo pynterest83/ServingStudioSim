@@ -23,9 +23,11 @@
 //! Under async scheduling (`with_async_scheduling`, vLLM's scheduler building
 //! step N+1 while step N runs), a request that finishes at N only because drafts
 //! were accepted keeps one trailing verify row in N+1: it stays KV-resident and
-//! billed for that iteration, emits nothing, and is released at its end. Its
-//! completion event still fires at N. The shell models the matching admission
-//! lag.
+//! billed for that iteration, emits nothing, and is released at its end. The
+//! lifecycle also stamps each request's EngineCore `QUEUED` time: the first
+//! step boundary at or after its arrival. The shell models the matching output
+//! lag, which delays the visible tokens and completion of every step by one
+//! step.
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -84,6 +86,12 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     trailing_decode_rows: Vec<Vec<RequestId>>,
     /// Scratch for `DecodeCompletion::complete_decodes`.
     finished_by_accepted_drafts: Vec<RequestId>,
+    /// Async scheduling only: an iteration was formed and has not completed.
+    step_in_flight: bool,
+    /// Async scheduling only: requests that arrived while a step was in
+    /// flight, whose `queued_time` the next batch decision stamps. Telemetry
+    /// only; pending membership stays in the policy.
+    awaiting_engine_pickup: Vec<RequestId>,
 }
 
 impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P, SingleTokenDecodeCompletion> {
@@ -156,6 +164,8 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             async_scheduling: false,
             trailing_decode_rows: Vec::new(),
             finished_by_accepted_drafts: Vec::new(),
+            step_in_flight: false,
+            awaiting_engine_pickup: Vec::new(),
         }
     }
 
@@ -184,6 +194,13 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
     /// to finish at N even with every draft rejected (at most one output token
     /// left). That N+1 row is billed and holds its KV through N+1 but retires
     /// nothing and is not a verify round.
+    ///
+    /// It also stamps `queued_time` as EngineCore does: its loop picks new
+    /// requests up between steps, so a request that arrives while a step runs
+    /// is queued when that step ends, and one that arrives at an idle engine
+    /// at its arrival. Waiting for KV or budget after that stays in server
+    /// TTFT. (A synchronous vLLM picks requests up the same way; that is not
+    /// applied with the option off, where `queued_time` is the arrival.)
     ///
     /// Full-footprint KV only: retracting a finished trailing row is not a
     /// modeled transition.
@@ -420,6 +437,11 @@ where
             let record = &mut store[request];
             let arrival_time = record.request.core.arrival_time;
             context.stamp_stage(record, arrival_time, UnifiedStage::Pending as u16);
+            // An idle engine picks the request up on arrival (`queued_time`
+            // left unset means the arrival); a running step defers it.
+            if self.async_scheduling && self.step_in_flight {
+                self.awaiting_engine_pickup.push(request);
+            }
             (
                 record.request.definition.prompt_tokens,
                 record.request.definition.target_output_tokens,
@@ -457,6 +479,12 @@ where
     ) -> bool {
         let num_partitions = kv_store.num_partitions();
         debug_assert_eq!(self.partition_policies.len(), num_partitions);
+        if !self.awaiting_engine_pickup.is_empty() {
+            let mut store = context.requests.borrow_mut();
+            for request in self.awaiting_engine_pickup.drain(..) {
+                store[request].telemetry.queued_time = Some(now);
+            }
+        }
         self.started_prefills.resize_with(num_partitions, Vec::new);
         self.trailing_decode_rows
             .resize_with(num_partitions, Vec::new);
@@ -730,6 +758,7 @@ where
                 }
             }
         }
+        self.step_in_flight = has_batch;
         has_batch
     }
 
@@ -741,6 +770,7 @@ where
         events: &mut Vec<Self::Event>,
         now: Time,
     ) {
+        self.step_in_flight = false;
         for partition in 0..kv_store.num_partitions() as u16 {
             let mut completed = Vec::new();
             self.finished_by_accepted_drafts.clear();

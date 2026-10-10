@@ -96,6 +96,12 @@ Once a request has produced its first output token, conservation therefore has
 the exact request-level invariant
 `prefix_cache_hit_tokens + prefill_processed = fresh_prompt_tokens + declared_prefix_tokens`.
 
+`queued_time_ms` is when the engine loop picked the request up between steps
+(vLLM's EngineCore `QUEUED`), and `server_ttft_ms` is the first visible output
+token minus it. Only a worker that models that pickup (the speculative
+worker's `async_scheduling`) moves `queued_time_ms` off `arrival_time_ms`;
+otherwise `server_ttft_ms` equals `ttft_ms`.
+
 The nullable `declared_ttft_slo_ms`, `declared_tpot_slo_ms`, and
 `declared_e2e_slo_ms` columns preserve the trace's per-request obligations.
 Null means that metric was not bounded for that request; the three columns are

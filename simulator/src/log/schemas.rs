@@ -395,6 +395,11 @@ pub fn request_slo_schema() -> Arc<Schema> {
         // The immutable output length the request asks for. Appended last to
         // keep the schema append-only.
         Field::new("target_output_tokens", DataType::UInt32, false),
+        // EngineCore `QUEUED` time (= arrival unless the worker models the
+        // engine loop's between-step pickup) and server TTFT measured from
+        // it. Appended last to keep the schema append-only.
+        Field::new("queued_time_ms", DataType::Float64, false),
+        Field::new("server_ttft_ms", DataType::Float32, true),
     ]))
 }
 

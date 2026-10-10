@@ -423,6 +423,14 @@ fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
     let last_ms = rec.telemetry.last_output_time.map(|time| time.as_ms());
     let ttft_ms =
         first_ms.map(|first_time| (first_time - rec.request.core.arrival_time.as_ms()) as f32);
+    // Server TTFT starts when the engine picked the request up; a worker that
+    // does not model that pickup leaves it at the arrival.
+    let queued_time_ms = rec
+        .telemetry
+        .queued_time
+        .unwrap_or(rec.request.core.arrival_time)
+        .as_ms();
+    let server_ttft_ms = first_ms.map(|first_time| (first_time - queued_time_ms) as f32);
     let finish_decode_time_ms = last_ms.map(|l| l as f32);
     // Mean inter-token gap = total decode span / number of gaps (tokens − 1).
     let tpot_mean_ms = match (first_ms, last_ms) {
@@ -478,6 +486,8 @@ fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
         prefix_cache_hit_tokens: rec.telemetry.prefix_cache_hit_tokens,
         fresh_prompt_tokens: rec.request.definition.prompt_tokens,
         target_output_tokens: rec.request.definition.target_output_tokens,
+        queued_time_ms,
+        server_ttft_ms,
         retraction_count: rec.telemetry.retraction_count,
         reprocessed_prefill_output_tokens_before: rec
             .telemetry
@@ -535,6 +545,22 @@ mod tests {
 
     fn write_trace(dir: &std::path::Path, n: u32) -> PathBuf {
         write_trace_with_output_len(dir, n, 3)
+    }
+
+    #[test]
+    fn server_ttft_starts_at_the_queued_time_and_defaults_to_the_arrival() {
+        let mut record =
+            RequestRecord::from_request(text_request(RequestId(0), 8, 2, Time::from_ms(10.0)));
+        record.record_first_token(Time::from_ms(25.0), false);
+        let at_arrival = slo_entry(RequestId(0), Time::from_ms(30.0), &record);
+        assert_eq!(at_arrival.queued_time_ms, 10.0);
+        assert_eq!(at_arrival.server_ttft_ms, at_arrival.ttft_ms);
+
+        record.telemetry.queued_time = Some(Time::from_ms(12.0));
+        let picked_up = slo_entry(RequestId(0), Time::from_ms(30.0), &record);
+        assert_eq!(picked_up.queued_time_ms, 12.0);
+        assert_eq!(picked_up.ttft_ms, Some(15.0));
+        assert_eq!(picked_up.server_ttft_ms, Some(13.0));
     }
 
     #[test]

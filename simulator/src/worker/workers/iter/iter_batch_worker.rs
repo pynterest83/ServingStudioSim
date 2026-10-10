@@ -3,15 +3,14 @@
 //! The shell owns cadence and cross-axis sequencing. KV, Admission, and Execution
 //! are statically composed; the FSM itself is deliberately not an axis.
 //!
-//! Synchronous by default: a message that arrives while an iteration runs is
-//! handed to admission at once and can join the next iteration. Under async
-//! scheduling (`with_async_scheduling`) the shell reproduces an engine whose
-//! scheduler builds iteration j+1 while j runs (vLLM's batch queue,
-//! `core.py:760-876`): j+1 was already built when j launched, so a message that
-//! arrives while j runs first reaches admission after the decision that forms
-//! j+1, and can join j+2 at the earliest. When that decision finds nothing to
-//! run, the engine waits for the in-flight output instead and decides again
-//! with the held messages.
+//! A message that arrives while an iteration runs is handed to admission at
+//! once and can join the next iteration. Synchronous by default: a finished
+//! iteration's tokens and completion events are visible at its end. Under
+//! async scheduling (`with_async_scheduling`) the shell reproduces an engine
+//! that launches iteration k+1 before it processes k's output (vLLM's
+//! `step_with_batch_queue`, `core.py` ~L760-876): k's tokens and completions
+//! become visible at the end of k+1, or at the end of k when nothing runs
+//! after it. Progress and KV still retire at the end of k (see `OutputLag`).
 
 use crate::common::{RequestId, Time, WorkerId};
 use crate::worker::admission::{
@@ -27,6 +26,8 @@ use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{
     BatchFsmState, IterBatchPlan, IterCursor, WorkerFsmState, WorkerStatus,
 };
+
+use super::output_lag::OutputLag;
 
 struct IterationFsm {
     worker_state: WorkerFsmState,
@@ -60,10 +61,10 @@ where
     input: E::Input,
     batch_plan: IterBatchPlan,
     iteration_fsm: IterationFsm,
-    /// Async scheduling only: messages that arrived since the last batch
-    /// decision, held back from admission for one decision. `None` delivers
-    /// every message immediately.
-    async_ingress: Option<Vec<A::Msg>>,
+    /// Async scheduling only: the finished step's output, held until the
+    /// step launched after it ends. `None` publishes every step's output at
+    /// its own end.
+    output_lag: Option<OutputLag<A::Event>>,
 }
 
 /// Compatibility name retained for L6 factories and deployment selectors.
@@ -130,25 +131,21 @@ where
             input: Default::default(),
             batch_plan: IterBatchPlan::default(),
             iteration_fsm: IterationFsm::new(),
-            async_ingress: None,
+            output_lag: None,
         }
     }
 
-    /// Hold each arriving message back from admission for one batch decision,
-    /// as an engine that schedules one iteration ahead does. See the module
-    /// docs; a framework constraint enabled only to reproduce such an engine.
+    /// Publish each step's output at the end of the step launched after it, as
+    /// an engine that schedules one step ahead does. See the module docs; a
+    /// framework constraint enabled only to reproduce such an engine.
     pub(super) fn with_async_scheduling(mut self) -> Self {
-        self.async_ingress = Some(Vec::new());
+        self.output_lag = Some(OutputLag::new());
         self
     }
 
     pub fn enqueue(&mut self, msg: A::Msg) {
-        match &mut self.async_ingress {
-            Some(ingress) => ingress.push(msg),
-            None => self
-                .admission
-                .accept_message(&mut self.kv_store, msg, &self.context),
-        }
+        self.admission
+            .accept_message(&mut self.kv_store, msg, &self.context);
     }
 
     pub fn tick(&mut self, now: Time, events: &mut Vec<A::Event>) -> Option<Time> {
@@ -159,6 +156,11 @@ where
             match self.iteration_fsm.worker_state {
                 Idle => {
                     if !self.form_batch(now) {
+                        // Nothing runs next, so the engine processes the last
+                        // step's output now.
+                        if let Some(output_lag) = self.output_lag.as_mut() {
+                            output_lag.publish_held_now(events);
+                        }
                         break;
                     }
                     self.iteration_fsm.worker_state = Active;
@@ -177,13 +179,7 @@ where
                         self.iteration_fsm.batch_state.cursor = Done;
                     }
                     Done => {
-                        self.admission.complete_iteration(
-                            &mut self.kv_store,
-                            &self.context,
-                            &self.batch_plan,
-                            events,
-                            now,
-                        );
+                        self.complete_iteration(now, events);
                         self.iteration_fsm.worker_state = Idle;
                     }
                 },
@@ -194,29 +190,10 @@ where
     }
 
     fn form_batch(&mut self, now: Time) -> bool {
-        let mut formed =
-            self.admission
-                .form_batch(&mut self.kv_store, &self.context, &mut self.batch_plan, now);
-        if let Some(ingress) = self.async_ingress.as_mut() {
-            // Messages that arrived while the last iteration ran were not
-            // visible to this decision. They reach admission now, for the next
-            // one; if this one found nothing to run, the engine waits for them
-            // instead and decides again at once.
-            let delivered = !ingress.is_empty();
-            for msg in ingress.drain(..) {
-                self.admission
-                    .accept_message(&mut self.kv_store, msg, &self.context);
-            }
-            if !formed && delivered {
-                formed = self.admission.form_batch(
-                    &mut self.kv_store,
-                    &self.context,
-                    &mut self.batch_plan,
-                    now,
-                );
-            }
-        }
-        if !formed {
+        if !self
+            .admission
+            .form_batch(&mut self.kv_store, &self.context, &mut self.batch_plan, now)
+        {
             return false;
         }
         self.iteration_fsm.iteration += 1;
@@ -238,6 +215,33 @@ where
         now + cost
     }
 
+    /// Retire the finished step. Under async scheduling the previous step's
+    /// held output is published first, then this step's output is held: the
+    /// lifecycle still retires it now, so the next decision sees its progress
+    /// and freed KV.
+    fn complete_iteration(&mut self, now: Time, events: &mut Vec<A::Event>) {
+        let Some(output_lag) = self.output_lag.as_mut() else {
+            self.admission.complete_iteration(
+                &mut self.kv_store,
+                &self.context,
+                &self.batch_plan,
+                events,
+                now,
+            );
+            return;
+        };
+        output_lag.publish_held(&self.context.requests, now, events);
+        output_lag.snapshot_members(&self.kv_store, &self.batch_plan, &self.context.requests);
+        self.admission.complete_iteration(
+            &mut self.kv_store,
+            &self.context,
+            &self.batch_plan,
+            &mut output_lag.step_events,
+            now,
+        );
+        output_lag.hold_step_output(&self.context.requests);
+    }
+
     fn next_wakeup(&self, now: Time) -> Option<Time> {
         match self.iteration_fsm.worker_state {
             WorkerFsmState::Idle => {
@@ -255,22 +259,13 @@ where
         let active_requests = (0..self.kv_store.num_partitions() as u16)
             .map(|partition| self.kv_store.status_active(partition))
             .sum();
-        let held_messages = self.async_ingress.as_ref().map_or(0, Vec::len) as u32;
         WorkerStatus {
-            queued_requests: self.admission.queued_requests() + held_messages,
+            queued_requests: self.admission.queued_requests(),
             active_requests,
         }
     }
 
     pub fn release_request(&mut self, request: RequestId, current_kv: u64) -> Option<u16> {
-        // A held arrival is still a pending request; hand held messages over so
-        // cancellation can find it (they become eligible one decision early).
-        if let Some(ingress) = self.async_ingress.as_mut() {
-            for msg in ingress.drain(..) {
-                self.admission
-                    .accept_message(&mut self.kv_store, msg, &self.context);
-            }
-        }
         if self.admission.cancel_pending(request) {
             return None;
         }

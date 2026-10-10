@@ -91,7 +91,7 @@ variants:
       # cacheable prefill chunk stops one block early under the MTP drafter (use_eagle_block_drop).
       eagle_block_drop: true,
       # vLLM framework limitation reproduced for the baseline, not an optimization target: async scheduling's
-      # trailing verify row after a draft-finished request and its one-decision admission lag.
+      # trailing verify row after a draft-finished request and its one-step output lag.
       async_scheduling: true}
     profile_passes:
     - {kind: workload_metrics, name: profile_workload, trace: workload, warmup: true}
