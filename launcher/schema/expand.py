@@ -223,6 +223,8 @@ def _coerce_scalar(value: Any, ptype: str) -> Any:
 
 
 def _coerce(value: Any, ptype: str) -> Any:
+    if ptype == "match_factor_list":
+        return [{"match": str(v["match"]), "factor": float(v["factor"])} for v in value]
     if ptype in _LIST_TYPES:
         elem = _LIST_ELEM[ptype]
         return [_coerce_scalar(v, elem) for v in value]

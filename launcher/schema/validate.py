@@ -102,6 +102,15 @@ def _type_ok(value: Any, ptype: str) -> bool:
             return False
         elem = ptype[: -len("_list")]
         return all(_is_placeholder(v) or _type_ok(v, elem) for v in value)
+    if ptype == "match_factor_list":
+        # `[{match: str, factor: number}, ...]`; Rust validates the values.
+        return isinstance(value, list) and all(
+            isinstance(v, dict)
+            and set(v) == {"match", "factor"}
+            and (_is_placeholder(v["match"]) or isinstance(v["match"], str))
+            and (_is_placeholder(v["factor"]) or _type_ok(v["factor"], "float"))
+            for v in value
+        )
     return True  # unknown type → don't block (forward-compatible)
 
 

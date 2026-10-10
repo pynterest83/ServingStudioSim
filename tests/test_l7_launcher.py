@@ -12,6 +12,7 @@ metadata, and the sweep aggregator contract.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import sys
 
@@ -1454,6 +1455,43 @@ def test_normalize_coerces_types(schema):
     preset = _base(arch={"type": "llama3_dense_tp", "tp_size": "2"})
     out = normalize_params(preset, schema)
     assert _arch(out)["tp_size"] == 2 and isinstance(_arch(out)["tp_size"], int)
+
+
+def test_match_factor_list_validates_and_coerces_rule_objects():
+    fixture = copy.deepcopy(_FIXTURE)
+    fixture["providers"]["worker"]["iter_wise"]["speculative"] = {
+        "params": [
+            {
+                "name": "what_if_kernel_time_scale",
+                "type": "match_factor_list",
+                "required": False,
+                "description": "",
+            },
+        ]
+    }
+    schema = schema_from_dict(fixture)
+
+    def worker(rules):
+        return _base(worker={"type": "speculative", "what_if_kernel_time_scale": rules})
+
+    rules = [{"match": "moe.routed.down", "factor": 1}]
+    assert validate_params(worker(rules), schema) == []
+    out = normalize_params(worker(rules), schema)
+    coerced = out["pools"]["main"]["groups"][0]["worker"]["what_if_kernel_time_scale"]
+    assert coerced == [{"match": "moe.routed.down", "factor": 1.0}]
+    assert isinstance(coerced[0]["factor"], float)
+    absent = normalize_params(_base(worker={"type": "speculative"}), schema)
+    assert "what_if_kernel_time_scale" not in absent["pools"]["main"]["groups"][0]["worker"]
+
+    for bad in (
+        {"match": "moe.routed.down"},
+        {"match": "moe.routed.down", "factor": True},
+        {"match": 3, "factor": 0.8},
+        {"match": "moe.routed.down", "factor": 0.8, "scale": 2},
+        "moe.routed.down",
+    ):
+        errors = validate_params(worker([bad]), schema)
+        assert any("not a valid match_factor_list" in e for e in errors), (bad, errors)
 
 
 def test_normalize_omits_absent_optionals(schema):

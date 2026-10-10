@@ -21,6 +21,9 @@
 //!   - `#[param(string)]`           → treat the field as a `string` param even
 //!                                     though its Rust type is a foreign enum
 //!                                     (`placement`, `log_level`, `batch_policy`).
+//!   - `#[param(match_factor_list)]` → a `match_factor_list` param: the field
+//!                                     is a list of `{match, factor}` objects
+//!                                     (`what_if_kernel_time_scale`).
 //!
 //! `#[serde(flatten)]` fields are skipped automatically (the flattened struct
 //! contributes its own `PARAMS` block). A `bool` with no explicit default gets an
@@ -61,6 +64,7 @@ struct Classified {
 struct ParamAttr {
     skip: bool,
     force_string: bool,
+    match_factor_list: bool,
     cache_key: bool,
     default: Option<Lit>,
     choices: Option<Expr>,
@@ -170,6 +174,13 @@ fn param_defs<'a>(
             Classified {
                 ctor: "string",
                 default_method: "default_string",
+                optional: false,
+                is_bool: false,
+            }
+        } else if attr.match_factor_list {
+            Classified {
+                ctor: "match_factor_list",
+                default_method: "",
                 optional: false,
                 is_bool: false,
             }
@@ -388,6 +399,7 @@ fn parse_param_attr(attrs: &[Attribute]) -> syn::Result<ParamAttr> {
             match m {
                 Meta::Path(p) if p.is_ident("skip") => out.skip = true,
                 Meta::Path(p) if p.is_ident("string") => out.force_string = true,
+                Meta::Path(p) if p.is_ident("match_factor_list") => out.match_factor_list = true,
                 Meta::Path(p) if p.is_ident("cache_key") => out.cache_key = true,
                 Meta::NameValue(nv) if nv.path.is_ident("default") => {
                     if let Expr::Lit(ExprLit { lit, .. }) = nv.value {

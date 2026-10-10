@@ -265,6 +265,12 @@ Execution owns the model, reusable input buffer shape, and `CostBuffers`:
   per engine step, over the verify pass and every draft step together,
   `max(kernel × multiplier + fixed, floor[model.graph_mode])`. Unset, the clock
   is the multiplier-only one.
+  The selector's `what_if_kernel_time_scale` is an **exploration-only**
+  counterfactual that no reproduction preset or alignment pack sets: when
+  given, the unified deployment hands the worker the arch model wrapped in
+  `arch::WhatIfKernelTimeScaled`, so every slot time, the folded iteration and
+  this clock see the scaled kernels (see the arch README). Empty, the worker
+  drives the arch model itself.
   The complete verify window must fit within `max_model_len`. A boundary batch
   that requires fewer query rows fails explicitly; clipping only the context
   would discard resident keys and invalidate necessary-work conservation.

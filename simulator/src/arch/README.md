@@ -154,6 +154,43 @@ wiring a deployment.
 See [`doc/architecture_compatibility.md`](../../../doc/architecture_compatibility.md)
 for selector compatibility and migration rules.
 
+## What-if kernel time scale (exploration only)
+
+`what_if.rs` holds a counterfactual for bounding a kernel improvement before
+anyone profiles it: "what would the iteration cost if the routed MoE `down`
+GEMM reached 75% instead of 60% of the HBM roof?" is a `0.8` scale on that
+slot. The scaled number is not a measurement — it deliberately breaks "L1 is
+the only source of numbers" — so the knob is **never** set by a reproduction
+preset or an alignment pack, and no result produced with it is a prediction.
+
+It is the `speculative` worker selector's `what_if_kernel_time_scale`:
+
+```yaml
+worker:
+  type: speculative
+  # ...
+  what_if_kernel_time_scale:
+    - {match: moe.routed.down, factor: 0.8}
+    - {match: moe.routed.gate_up, factor: 0.918}
+```
+
+Each `match` is a dotted fragment of a compiled slot name (the manifest's
+`LeafDesc::name`, e.g. `unified.kda_moe.moe.routed.down`), compared on whole
+`.` segments — `moe.routed.down` does not hit `moe.routed.down_quant`. Rules
+are tried in order and the first match sets a slot's factor. The build rejects
+an empty or malformed `match`, a factor that is not finite and positive, and a
+rule that scales no slot (it matches none, or only slots an earlier rule
+claimed).
+
+The unified deployment wraps the arch model in `WhatIfKernelTimeScaled` only
+when rules are given. The wrapper lets the arch fill its leaves, multiplies the
+matched slots' `time_ms`, and folds the flat CostTree again, so `Max` /
+`Parallel` / `Scale` see the scaled child, the worker's multiplier and
+host-time floor see the scaled iteration, and `cost_log` rows record the scaled
+slot times (they still fold to `total_time_ms`). FLOPs, bytes and energy stay
+as measured. Without rules no wrapper exists, so the default path is the
+measured model bit for bit.
+
 ## MoE routing configuration
 
 `routing` names where a MoE arch's routed demand comes from.

@@ -29,6 +29,7 @@ pub mod qwen3_fp8_ffn_moe_layerwise;
 pub mod qwen3_moe_dp_attn_ep_ffn;
 pub mod qwen3_moe_fp8_dp_attn_ep_ffn;
 pub mod qwen3_vllm_moe_dp_attn_ep_ffn;
+pub mod what_if;
 
 pub use config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
 pub use contract::{
@@ -79,3 +80,4 @@ pub use qwen3_fp8_ffn_moe_layerwise::{Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnM
 pub use qwen3_moe_dp_attn_ep_ffn::{Qwen3MoeDpAttnEpFfnModel, Qwen3MoeParallel};
 pub use qwen3_moe_fp8_dp_attn_ep_ffn::{Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel};
 pub use qwen3_vllm_moe_dp_attn_ep_ffn::{Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel};
+pub use what_if::{KernelTimeScale, KernelTimeScaleRule, WhatIfKernelTimeScaled};

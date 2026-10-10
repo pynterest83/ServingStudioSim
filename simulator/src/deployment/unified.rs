@@ -29,7 +29,8 @@ use anyhow::{bail, ensure};
 
 use crate::arch::build as arch_build;
 use crate::arch::contract::IterwiseUnifiedModel;
-use crate::arch::{Glm52MtpMode, IterArchSel};
+use crate::arch::contract::SpeculativeUnifiedModel;
+use crate::arch::{Glm52MtpMode, IterArchSel, KernelTimeScaleRule, WhatIfKernelTimeScaled};
 use crate::common::{PoolId, SharedRequests};
 use crate::deployment::UnifiedConfig;
 use crate::orchestrator::common::WorkerBuildFn;
@@ -302,31 +303,31 @@ impl Deployment for UnifiedDeployment {
                 ..
             } => {
                 ensure_speculative(&g.worker, *draft_tokens)?;
-                let model = Arc::new(
-                    arch_build::glm53_flash_vllm_fp8_kda_dsa_moe_speculative_model(
-                        model_spec,
-                        *tp_size,
-                        *max_model_len,
-                        *routing,
-                        *routing_seed,
-                        expert_popularity_file.as_deref(),
-                        token_corpus_file.as_deref(),
-                        cudagraph_capture_sizes,
-                        *draft_tokens,
-                        &gpu_name,
-                        MODEL_NAME,
-                        bridge,
-                    )?,
-                );
-                Ok(assemble_flow(
+                let model = arch_build::glm53_flash_vllm_fp8_kda_dsa_moe_speculative_model(
+                    model_spec,
+                    *tp_size,
+                    *max_model_len,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    cudagraph_capture_sizes,
+                    *draft_tokens,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?;
+                assemble_speculative_flow(
                     model,
+                    what_if_kernel_time_scale(&g.worker),
                     store,
                     worker_config,
                     log_dir,
                     gpu_name,
                     dp_cfg,
                     build_hybrid_speculative_worker,
-                ))
+                    build_hybrid_speculative_worker,
+                )
             }
             IterArchSel::Llama3Dense { .. } => {
                 ensure_barebone(&g.worker)?;
@@ -658,7 +659,7 @@ impl Deployment for UnifiedDeployment {
                     "unified: a speculative GLM must run its MTP layer; mtp_mode=off \
                      leaves it with nothing to draft with"
                 );
-                let model = Arc::new(arch_build::glm52_vllm_nvfp4_dsa_moe_speculative(
+                let model = arch_build::glm52_vllm_nvfp4_dsa_moe_speculative(
                     model_spec,
                     *ep_size,
                     *nvl_num_gpu,
@@ -672,16 +673,18 @@ impl Deployment for UnifiedDeployment {
                     &gpu_name,
                     MODEL_NAME,
                     bridge,
-                )?);
-                Ok(assemble_flow(
+                )?;
+                assemble_speculative_flow(
                     model,
+                    what_if_kernel_time_scale(&g.worker),
                     store,
                     worker_config,
                     log_dir,
                     gpu_name,
                     dp_cfg,
                     build_speculative_worker,
-                ))
+                    build_speculative_worker,
+                )
             }
             IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 {
                 ep_size,
@@ -696,7 +699,7 @@ impl Deployment for UnifiedDeployment {
                 ..
             } => {
                 ensure_speculative(&g.worker, *draft_tokens)?;
-                let model = Arc::new(arch_build::glm53_vllm_nvfp4_dsa_moe_dflash2(
+                let model = arch_build::glm53_vllm_nvfp4_dsa_moe_dflash2(
                     model_spec,
                     *ep_size,
                     *nvl_num_gpu,
@@ -710,16 +713,18 @@ impl Deployment for UnifiedDeployment {
                     &gpu_name,
                     MODEL_NAME,
                     bridge,
-                )?);
-                Ok(assemble_flow(
+                )?;
+                assemble_speculative_flow(
                     model,
+                    what_if_kernel_time_scale(&g.worker),
                     store,
                     worker_config,
                     log_dir,
                     gpu_name,
                     dp_cfg,
                     build_speculative_worker,
-                ))
+                    build_speculative_worker,
+                )
             }
             IterArchSel::Glm52SglangNvfp4TpDsaMoe {
                 tp_size,
@@ -1024,6 +1029,66 @@ where
     }
 }
 
+/// The speculative selector's exploration-only kernel-time counterfactual;
+/// empty for every other worker and whenever it is unset.
+fn what_if_kernel_time_scale(worker: &IterWorkerSel) -> &[KernelTimeScaleRule] {
+    match worker {
+        IterWorkerSel::Speculative {
+            what_if_kernel_time_scale,
+            ..
+        } => what_if_kernel_time_scale,
+        _ => &[],
+    }
+}
+
+/// [`assemble_flow`] for a speculative arm. With no `what_if_kernel_time_scale`
+/// rules the worker drives the arch model itself, so the default path is the
+/// measured model unchanged; with rules it drives the model wrapped in
+/// [`WhatIfKernelTimeScaled`], and a rule that fails against the model's slots
+/// fails the build. The arm passes its recipe twice because each branch
+/// instantiates it at a different model type.
+#[allow(clippy::too_many_arguments)]
+fn assemble_speculative_flow<M, W, Ws>(
+    model: M,
+    what_if: &[KernelTimeScaleRule],
+    store: SharedRequests,
+    worker_config: WorkerConfig,
+    log_dir: Option<PathBuf>,
+    gpu_name: String,
+    dp_cfg: SimpleDpConfig,
+    build_fn: WorkerBuildFn<M, W>,
+    build_what_if_fn: WorkerBuildFn<WhatIfKernelTimeScaled<M>, Ws>,
+) -> anyhow::Result<Box<dyn Flow>>
+where
+    M: SpeculativeUnifiedModel,
+    W: IterWorker<Event = crate::worker::WorkerEventCommon> + 'static,
+    W::Msg: From<crate::common::RequestId>,
+    Ws: IterWorker<Event = crate::worker::WorkerEventCommon> + 'static,
+    Ws::Msg: From<crate::common::RequestId>,
+{
+    if what_if.is_empty() {
+        return Ok(assemble_flow(
+            Arc::new(model),
+            store,
+            worker_config,
+            log_dir,
+            gpu_name,
+            dp_cfg,
+            build_fn,
+        ));
+    }
+    let model = WhatIfKernelTimeScaled::new(model, what_if).map_err(anyhow::Error::msg)?;
+    Ok(assemble_flow(
+        Arc::new(model),
+        store,
+        worker_config,
+        log_dir,
+        gpu_name,
+        dp_cfg,
+        build_what_if_fn,
+    ))
+}
+
 /// Wrap a built iter-wise model in a `simple_dp` flow. Generic over the concrete
 /// model `M` and worker `W`; `build_fn` is the chosen worker's `new`. The returned
 /// `Box<dyn Flow>` is the only `dyn` erasure point.
@@ -1310,7 +1375,109 @@ pools:
             eagle_block_drop: false,
             async_scheduling: false,
             async_output_processing_ms: 0.0,
+            what_if_kernel_time_scale: Vec::new(),
         }
+    }
+
+    /// The smallest speculative model the recipe accepts: a routed-MoE down
+    /// GEMM after its input quant.
+    struct TwoSlotSpeculativeModel;
+
+    impl SpeculativeUnifiedModel for TwoSlotSpeculativeModel {
+        fn eval_speculative_iter(
+            &self,
+            _batch: &crate::arch::SpeculativeArchInput,
+            _slots: &mut Vec<crate::timing::LeafMetrics>,
+            _scratch: &mut Vec<crate::timing::LeafMetrics>,
+        ) -> crate::timing::LeafMetrics {
+            crate::timing::LeafMetrics::ZERO
+        }
+
+        fn cost_log_manifest(&self) -> crate::timing::CostManifest {
+            let mut builder = crate::timing::CostTreeBuilder::new();
+            let quant = builder.leaf(
+                "unified.moe.routed.down_quant",
+                "k",
+                serde_json::Value::Null,
+            );
+            let down = builder.leaf("unified.moe.routed.down", "k", serde_json::Value::Null);
+            builder
+                .finish(crate::timing::CostNode::Sum(vec![quant, down]))
+                .manifest()
+        }
+
+        fn total_kv_bytes_per_token(&self) -> u64 {
+            1
+        }
+
+        fn max_model_len(&self) -> u32 {
+            4096
+        }
+
+        fn gpus_per_replica(&self) -> u16 {
+            1
+        }
+    }
+
+    #[test]
+    fn the_what_if_scale_rides_the_speculative_selector_into_the_model_build() {
+        let worker: IterWorkerSel = serde_yaml::from_str(
+            "type: speculative\nattn_gpu_memory_gb: 80.0\nmax_batch_tokens: 8192\n\
+             draft_tokens: 3\nwhat_if_kernel_time_scale:\n\
+             - {match: moe.routed.down, factor: 0.8}\n",
+        )
+        .expect("parse speculative worker");
+        let rules = what_if_kernel_time_scale(&worker).to_vec();
+        assert_eq!(
+            rules,
+            vec![KernelTimeScaleRule {
+                pattern: "moe.routed.down".to_string(),
+                factor: 0.8,
+            }]
+        );
+        assert!(what_if_kernel_time_scale(&speculative_worker(3)).is_empty());
+        assert!(what_if_kernel_time_scale(&barebone_worker()).is_empty());
+
+        let assemble = |rules: &[KernelTimeScaleRule]| {
+            assemble_speculative_flow(
+                TwoSlotSpeculativeModel,
+                rules,
+                crate::test_helpers::shared_with(&[]),
+                WorkerConfig {
+                    attn_kv_bytes: 1_000_000,
+                    max_batch_tokens: Some(64),
+                    speculative_draft_tokens: 3,
+                    ..WorkerConfig::default()
+                },
+                None,
+                "NVIDIA H200".to_string(),
+                SimpleDpConfig {
+                    dp_pool: SimpleDpPoolConfig {
+                        pool: PoolId(0),
+                        num_workers: 1,
+                        placement: DpPlacementPolicy::LeastQueued,
+                    },
+                },
+                build_speculative_worker,
+                build_speculative_worker,
+            )
+        };
+        assemble(&[]).expect("no rules runs the measured model");
+        assemble(&rules).expect("a rule that scales a slot builds");
+        let error = assemble(&[KernelTimeScaleRule {
+            pattern: "moe.routed.gate_up".to_string(),
+            factor: 0.9,
+        }])
+        .err()
+        .expect("a rule that scales no slot fails the build")
+        .to_string();
+        assert!(error.contains("\"moe.routed.gate_up\""), "{error}");
+        assert!(error.contains("hits no kernel slot"), "{error}");
+        assert_iter_worker_contract::<
+            crate::worker::HybridSpeculativeWorker<
+                WhatIfKernelTimeScaled<crate::arch::Glm53FlashSpecModel>,
+            >,
+        >();
     }
 
     #[test]

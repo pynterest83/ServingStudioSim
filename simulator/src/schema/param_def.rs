@@ -62,6 +62,9 @@ pub enum ParamType {
     PathList,
     /// A list of two-int pairs (`Vec<[u32; 2]>`), e.g. `[[prefix_len, append_len], ...]`.
     IntPairList,
+    /// A list of `{match: string, factor: float}` objects, e.g. the
+    /// exploration-only `what_if_kernel_time_scale`.
+    MatchFactorList,
 }
 
 /// Default value carried inline on a `ParamDef`. Serializes as a **bare**
@@ -183,6 +186,10 @@ impl ParamDef {
 
     pub const fn int_pair_list(name: &'static str) -> Self {
         Self::bare(name, ParamType::IntPairList)
+    }
+
+    pub const fn match_factor_list(name: &'static str) -> Self {
+        Self::bare(name, ParamType::MatchFactorList)
     }
 
     pub const fn default_int(mut self, v: i64) -> Self {

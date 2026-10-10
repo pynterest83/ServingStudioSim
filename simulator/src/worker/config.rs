@@ -18,7 +18,7 @@ use schema_derive::{ParamStruct, ProviderSchema};
 
 use super::admission::PendingOrderKind;
 use super::kv::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
-use crate::arch::GraphMode;
+use crate::arch::{GraphMode, KernelTimeScaleRule};
 
 /// Batch-composition policy for the chunked-prefill worker. Closed set → serde
 /// enum (kebab-case matches the historical CLI spelling).
@@ -510,6 +510,16 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(default = 0.0)]
         async_output_processing_ms: f64,
+        /// EXPLORATION ONLY — a counterfactual, never set in a reproduction
+        /// preset or alignment pack. A list of `{match, factor}` rules: every
+        /// kernel slot whose dotted name contains `match` on whole `.` segments
+        /// (e.g. `moe.routed.down`) has its modeled time multiplied by `factor`
+        /// (> 0) before the CostTree folds the iteration; the first matching rule
+        /// wins and a rule that scales no slot is an error. Empty (the default)
+        /// runs the measured model unchanged. See `arch/what_if.rs`.
+        #[serde(default)]
+        #[param(match_factor_list)]
+        what_if_kernel_time_scale: Vec<KernelTimeScaleRule>,
     },
     /// PD prefill half: prefills then hands off to a decode pool (no local decode).
     PdPrefill {
