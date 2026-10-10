@@ -20,8 +20,9 @@ recorded_on:
   # Baselines measured before it (logs/20261007_0_glm53_flash_h200_campaign, untuned: default governor,
   # C-states on) are not comparable with baselines measured under it. Before every GPU pass: no other process
   # on GPUs 4-7 and the CPU governor below, else stop. During it: clocks.sm, power.draw, temperature.gpu and
-  # clocks_event_reasons are sampled; any HW slowdown, thermal or power-cap throttle makes the pass unclean
-  # and it is re-measured. Each pass's provenance records the clock policy.
+  # clocks_event_reasons are sampled. A HW slowdown, thermal (HW or SW) or HW power-brake event makes the pass
+  # unclean and it is re-measured. SW power cap at the 700 W limit is part of the default boost policy: its share of
+  # loaded samples and the median SM clock while capped are recorded in each pass's provenance, not rejected.
   host_conditions:
     since: '2026-10-08'
     # Never locked, from the first measurement on (corrected 2026-10-09: the 1980 MHz read earlier was the
