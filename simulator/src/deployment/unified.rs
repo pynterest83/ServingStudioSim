@@ -189,6 +189,7 @@ impl Deployment for UnifiedDeployment {
             speculative_acceptance_seed: speculative_acceptance_seed(&g.worker),
             eagle_block_drop: eagle_block_drop(&g.worker),
             async_scheduling: async_scheduling(&g.worker),
+            async_output_processing: async_output_processing(&g.worker)?,
             ..WorkerConfig::default()
         };
 
@@ -893,6 +894,30 @@ fn async_scheduling(worker: &IterWorkerSel) -> bool {
     }
 }
 
+/// vLLM's async output-processing delay, carried by the `speculative` selector
+/// only and meaningful only with `async_scheduling`.
+fn async_output_processing(worker: &IterWorkerSel) -> anyhow::Result<crate::common::Time> {
+    match worker {
+        IterWorkerSel::Speculative {
+            async_scheduling,
+            async_output_processing_ms,
+            ..
+        } => {
+            let delay_ms = *async_output_processing_ms;
+            ensure!(
+                delay_ms.is_finite() && delay_ms >= 0.0,
+                "unified: async_output_processing_ms must be finite and >= 0, got {delay_ms}"
+            );
+            ensure!(
+                *async_scheduling || delay_ms == 0.0,
+                "unified: async_output_processing_ms={delay_ms} needs async_scheduling: true"
+            );
+            Ok(crate::common::Time::from_ms(delay_ms))
+        }
+        _ => Ok(crate::common::Time::ZERO),
+    }
+}
+
 /// Draft candidate count, carried by the `speculative` selector only. Every other
 /// worker leaves it at `0`, which is what marks it as not speculating.
 fn speculative_draft_tokens(worker: &IterWorkerSel) -> u32 {
@@ -1284,6 +1309,7 @@ pools:
             host_time: Default::default(),
             eagle_block_drop: false,
             async_scheduling: false,
+            async_output_processing_ms: 0.0,
         }
     }
 
@@ -1314,6 +1340,35 @@ pools:
         assert!(async_scheduling(&reproduce_vllm));
         assert!(!eagle_block_drop(&reproduce_vllm));
         assert!(!async_scheduling(&barebone_worker()));
+    }
+
+    #[test]
+    fn the_output_processing_delay_needs_async_scheduling() {
+        let with_delay = |async_on: bool, delay_ms: f64| {
+            let mut worker = speculative_worker(5);
+            if let IterWorkerSel::Speculative {
+                async_scheduling,
+                async_output_processing_ms,
+                ..
+            } = &mut worker
+            {
+                *async_scheduling = async_on;
+                *async_output_processing_ms = delay_ms;
+            }
+            async_output_processing(&worker)
+        };
+        assert_eq!(
+            with_delay(true, 0.4).unwrap(),
+            crate::common::Time::from_ms(0.4)
+        );
+        assert_eq!(with_delay(false, 0.0).unwrap(), crate::common::Time::ZERO);
+        assert!(with_delay(false, 0.4).is_err());
+        assert!(with_delay(true, -1.0).is_err());
+        assert!(with_delay(true, f64::NAN).is_err());
+        assert_eq!(
+            async_output_processing(&barebone_worker()).unwrap(),
+            crate::common::Time::ZERO
+        );
     }
 
     #[test]

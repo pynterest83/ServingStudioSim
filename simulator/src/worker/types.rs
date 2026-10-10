@@ -532,11 +532,14 @@ pub struct WorkerConfig {
     /// Reproduce vLLM's `use_eagle_block_drop` chunk split (from the
     /// `speculative` selector). Only the hybrid speculative recipe reads it.
     pub eagle_block_drop: bool,
-    /// Reproduce vLLM's async scheduling (from the `speculative` selector): a
-    /// trailing verify row after a request finished by accepted drafts, a
-    /// one-step output lag, and the between-step `QUEUED` stamp. Only the
-    /// speculative recipes read it.
+    /// Reproduce vLLM's async scheduling (from the `speculative` selector):
+    /// one-step-ahead batch formation, a trailing verify row after a request
+    /// finished by accepted drafts, the idle engine's first-input step, and
+    /// the between-step `QUEUED` stamp. Only the speculative recipes read it.
     pub async_scheduling: bool,
+    /// Async scheduling only: delay from a step's end to the moment its tokens
+    /// and completions are visible.
+    pub async_output_processing: Time,
 }
 
 impl Default for WorkerConfig {
@@ -560,6 +563,7 @@ impl Default for WorkerConfig {
             speculative_acceptance_seed: None,
             eagle_block_drop: false,
             async_scheduling: false,
+            async_output_processing: Time::ZERO,
         }
     }
 }

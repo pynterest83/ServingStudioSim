@@ -188,29 +188,40 @@ chain no matter which requests it was batched with. Comparing two schedulers on
 one trace therefore measures the schedulers, not a reshuffled random stream.
 
 The `speculative` selector's opt-in `async_scheduling` reproduces vLLM's async
-scheduler, which builds iteration N+1 while N runs. It has two halves, enabled
-together by both speculative recipes:
+scheduler. `EngineCore.step_with_batch_queue` (`core.py` ~L760-876) forms the
+batch for step k+1 right after it launches step k, and processes k's output
+only afterwards. The shell still forms k+1 at the end of k; the two halves,
+enabled together by both speculative recipes, make that decision the one vLLM
+made at k's launch:
 
-- lifecycle (`ChunkedPrefillAdmission::with_async_scheduling`): a request that
-  finishes at N with more than one output token left before N (so accepted
-  drafts, not the guaranteed target token, finished it) keeps one trailing
-  verify row at N+1 (`scheduler.py:635-647`). `DecodeCompletion` reports those
-  requests; KV keeps them in live decode membership without advancing
+- lifecycle (`ChunkedPrefillAdmission::with_async_scheduling`) answers from
+  the state known at k's launch. A request that finishes at k with more than
+  one output token left before k (so accepted drafts, not the guaranteed
+  target token, finished it) keeps one trailing verify row at k+1
+  (`scheduler.py:635-647`). `DecodeCompletion` reports those requests; KV
+  keeps them in live decode membership without advancing
   (`hold_trailing_decode_row`), the batch plan declares the count, execution
-  bills the row, and the lifecycle releases it at the end of N+1. The row emits
-  nothing and is not a verify round. The lifecycle also stamps each request's
-  `queued_time`, vLLM's EngineCore `QUEUED`: the end of the step running when
-  it arrived, or its arrival at an idle engine. It is not the admission time:
-  waiting for KV or budget afterwards stays in server TTFT.
-- shell (`IterBatchWorker::with_async_scheduling`, private `OutputLag`): vLLM
-  processes step k's sampled output only after it launched k+1
-  (`core.py` ~L760-876, `step_with_batch_queue`), so k's client-visible token
-  times and `RequestComplete` events move to the end of k+1, or stay at the
-  end of k when nothing runs after it. Progress and KV release still happen at
-  the end of k. A closed-loop replacement therefore sees its predecessor's
-  final round N complete at the end of N+1, arrives while N+2 runs, and starts
-  at N+3 (N+2 into an otherwise idle engine). Arrivals reach admission at once,
-  as with the option off.
+  bills the row, and the lifecycle releases it at the end of k+1. The row emits
+  nothing and is not a verify round. KV that k's other completions free is
+  released only after the decision for k+1, so it first serves k+2. Requests
+  the decision admits are stamped first scheduled (stage 1) at k's launch.
+  Each request's `queued_time`, vLLM's EngineCore `QUEUED`, is the decision
+  boundary at which the shell delivered it, or its arrival at an idle engine.
+  Waiting for KV or budget afterwards stays in server TTFT.
+- shell (`IterBatchWorker::with_async_scheduling`, private
+  `AsyncEngineLoop`) owns message pickup and output visibility. A message that
+  arrives while k runs reaches admission only after the decision for k+1, so
+  it first runs in k+2. An idle engine runs its first input (trace order on
+  ties) alone in step 1; messages that arrive while it runs, including ones at
+  the same instant, are queued when it ends and first run in step 3. When the
+  decision for k+1 launches nothing, the engine waits for k, picks every
+  message up and decides again at once. Step k's tokens and `RequestComplete`
+  events become visible at the end of k plus `async_output_processing_ms`
+  (`WorkerConfig::async_output_processing`, default 0). A closed-loop
+  replacement therefore sees its predecessor's final round N complete at the
+  end of N plus processing, arrives while N+1 runs, is queued at its end, and
+  starts at N+3 (N+2 when N+1 holds only the trailing row, at once into an
+  idle engine).
 
 `request_slo` carries `queued_time_ms` and `server_ttft_ms` (first visible
 token minus `queued_time_ms`). With the option off both stay at the arrival

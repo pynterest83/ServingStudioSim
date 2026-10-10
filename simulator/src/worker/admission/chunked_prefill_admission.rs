@@ -20,14 +20,23 @@
 //! mechanism selected by SGLang when `enable_mixed_chunk` is false; admission
 //! capacity estimation and decode retraction are separate policies.
 //!
-//! Under async scheduling (`with_async_scheduling`, vLLM's scheduler building
-//! step N+1 while step N runs), a request that finishes at N only because drafts
-//! were accepted keeps one trailing verify row in N+1: it stays KV-resident and
-//! billed for that iteration, emits nothing, and is released at its end. The
-//! lifecycle also stamps each request's EngineCore `QUEUED` time: the first
-//! step boundary at or after its arrival. The shell models the matching output
-//! lag, which delays the visible tokens and completion of every step by one
-//! step.
+//! Under async scheduling (`with_async_scheduling`) vLLM forms the batch for
+//! step k+1 when step k launches, without k's output. The whole-iteration shell
+//! still asks for that batch at the end of k, so this lifecycle answers from
+//! what was known when k launched:
+//!
+//! - a request that finishes at k only because drafts were accepted keeps one
+//!   trailing verify row in k+1: it stays KV-resident and billed for that
+//!   iteration, emits nothing, and is released at its end;
+//! - KV that k's other completions free is released only after the decision
+//!   for k+1, so it first serves k+2;
+//! - a request admitted by that decision is stamped first scheduled when k
+//!   launched, the moment vLLM made it;
+//! - each request's EngineCore `QUEUED` time is the decision boundary at which
+//!   the shell delivered it, or its arrival at an idle engine.
+//!
+//! The shell owns the other half: it delivers a request that arrived during k
+//! only after the decision for k+1, so it first runs in k+2.
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -86,12 +95,18 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     trailing_decode_rows: Vec<Vec<RequestId>>,
     /// Scratch for `DecodeCompletion::complete_decodes`.
     finished_by_accepted_drafts: Vec<RequestId>,
-    /// Async scheduling only: an iteration was formed and has not completed.
-    step_in_flight: bool,
-    /// Async scheduling only: requests that arrived while a step was in
-    /// flight, whose `queued_time` the next batch decision stamps. Telemetry
-    /// only; pending membership stays in the policy.
-    awaiting_engine_pickup: Vec<RequestId>,
+    /// Async scheduling only: the latest batch decision boundary. The shell
+    /// delivers a request either right after a decision, which is then its
+    /// `QUEUED` time, or to an idle engine at its arrival.
+    last_decision_boundary: Time,
+    /// Async scheduling only: when the previous decision launched a step, the
+    /// time it did. The next decision is the one vLLM made at that launch, so
+    /// it stamps its admissions first scheduled then. `None` after a decision
+    /// that launched nothing: the next one is made at once.
+    pipelined_decision_time: Option<Time>,
+    /// Async scheduling only: per request and partition, completions whose KV
+    /// the next decision must still see held. Released when it is made.
+    deferred_releases: Vec<(RequestId, u16)>,
 }
 
 impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P, SingleTokenDecodeCompletion> {
@@ -164,8 +179,9 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             async_scheduling: false,
             trailing_decode_rows: Vec::new(),
             finished_by_accepted_drafts: Vec::new(),
-            step_in_flight: false,
-            awaiting_engine_pickup: Vec::new(),
+            last_decision_boundary: Time::ZERO,
+            pipelined_decision_time: None,
+            deferred_releases: Vec::new(),
         }
     }
 
@@ -188,19 +204,29 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
         self
     }
 
-    /// Reproduce vLLM's async scheduling (`scheduler.py:635-647`): the
-    /// scheduler builds iteration N+1 before seeing N's output, so a decoding
-    /// request whose round N finished it is scheduled again unless it was sure
-    /// to finish at N even with every draft rejected (at most one output token
-    /// left). That N+1 row is billed and holds its KV through N+1 but retires
-    /// nothing and is not a verify round.
+    /// Reproduce vLLM's async scheduling: `EngineCore.step_with_batch_queue`
+    /// (`core.py` ~L760-876) schedules step k+1 right after it launched step
+    /// k and processes k's output only afterwards. Each `form_batch` called at
+    /// the end of k therefore answers from what was known when k launched:
+    ///
+    /// - A decoding request whose round k finished it is scheduled again at
+    ///   k+1 unless it was sure to finish at k even with every draft rejected
+    ///   (`scheduler.py:635-647`: at most one output token left). That row is
+    ///   billed and holds its KV through k+1 but retires nothing and is not a
+    ///   verify round.
+    /// - KV freed by k's other completions is released after the decision, so
+    ///   a request waiting for it starts in k+2.
+    /// - Admissions are stamped first scheduled (`UnifiedStage::Prefill`) at
+    ///   k's launch, when vLLM decided them; after a decision that launched
+    ///   nothing, the next one is made, and stamped, at once.
     ///
     /// It also stamps `queued_time` as EngineCore does: its loop picks new
-    /// requests up between steps, so a request that arrives while a step runs
-    /// is queued when that step ends, and one that arrives at an idle engine
-    /// at its arrival. Waiting for KV or budget after that stays in server
-    /// TTFT. (A synchronous vLLM picks requests up the same way; that is not
-    /// applied with the option off, where `queued_time` is the arrival.)
+    /// requests up only between steps, so the async shell hands a request that
+    /// arrived while a step ran over at that step's end boundary, and one that
+    /// arrived at an idle engine at its arrival. Waiting for KV or budget after
+    /// that stays in server TTFT. (A synchronous vLLM picks requests up the
+    /// same way; that is not applied with the option off, where `queued_time`
+    /// is the arrival.)
     ///
     /// Full-footprint KV only: retracting a finished trailing row is not a
     /// modeled transition.
@@ -437,10 +463,11 @@ where
             let record = &mut store[request];
             let arrival_time = record.request.core.arrival_time;
             context.stamp_stage(record, arrival_time, UnifiedStage::Pending as u16);
-            // An idle engine picks the request up on arrival (`queued_time`
-            // left unset means the arrival); a running step defers it.
-            if self.async_scheduling && self.step_in_flight {
-                self.awaiting_engine_pickup.push(request);
+            // The async shell delivers right after a decision, which queues
+            // the request at that boundary, or to an idle engine on arrival
+            // (`queued_time` left unset means the arrival).
+            if self.async_scheduling && self.last_decision_boundary > arrival_time {
+                record.telemetry.queued_time = Some(self.last_decision_boundary);
             }
             (
                 record.request.definition.prompt_tokens,
@@ -479,12 +506,13 @@ where
     ) -> bool {
         let num_partitions = kv_store.num_partitions();
         debug_assert_eq!(self.partition_policies.len(), num_partitions);
-        if !self.awaiting_engine_pickup.is_empty() {
-            let mut store = context.requests.borrow_mut();
-            for request in self.awaiting_engine_pickup.drain(..) {
-                store[request].telemetry.queued_time = Some(now);
-            }
-        }
+        // When vLLM made this decision: the launch of the step that just ended
+        // under async scheduling, else now.
+        let decision_time = if self.async_scheduling {
+            self.pipelined_decision_time.unwrap_or(now)
+        } else {
+            now
+        };
         self.started_prefills.resize_with(num_partitions, Vec::new);
         self.trailing_decode_rows
             .resize_with(num_partitions, Vec::new);
@@ -680,7 +708,7 @@ where
                             resolved_prefill.resident_prefix_tokens(),
                         );
                     }
-                    context.stamp_stage(record, now, UnifiedStage::Prefill as u16);
+                    context.stamp_stage(record, decision_time, UnifiedStage::Prefill as u16);
                 }
                 assert!(
                     self.prefill_episodes
@@ -758,7 +786,15 @@ where
                 }
             }
         }
-        self.step_in_flight = has_batch;
+        if self.async_scheduling {
+            self.last_decision_boundary = now;
+            self.pipelined_decision_time = has_batch.then_some(now);
+            // The decision has been made: the KV it could not see is free for
+            // the next one.
+            for (request, partition) in self.deferred_releases.drain(..) {
+                kv_store.release_retaining_prefix(request, partition, now);
+            }
+        }
         has_batch
     }
 
@@ -770,7 +806,6 @@ where
         events: &mut Vec<Self::Event>,
         now: Time,
     ) {
-        self.step_in_flight = false;
         for partition in 0..kv_store.num_partitions() as u16 {
             let mut completed = Vec::new();
             self.finished_by_accepted_drafts.clear();
@@ -871,6 +906,11 @@ where
                     // row: it stays resident for one trailing verify.
                     kv_store.hold_trailing_decode_row(request, partition);
                     self.trailing_decode_rows[partition as usize].push(request);
+                } else if self.async_scheduling {
+                    // No row next step, but the decision for it was made
+                    // before this completion: its KV stays held until then.
+                    self.admission_order.remove(&request);
+                    self.deferred_releases.push((request, partition));
                 } else {
                     self.admission_order.remove(&request);
                     kv_store.release_retaining_prefix(request, partition, now);

@@ -493,16 +493,23 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(default = false)]
         eagle_block_drop: bool,
-        /// vLLM's async scheduling: the scheduler builds iteration N+1 while N
-        /// runs. A request finished at N by accepted drafts still runs one
-        /// billed, token-less verify row at N+1, and N's tokens and completions
-        /// become visible at the end of N+1 (at the end of N when nothing runs
-        /// next). Server TTFT then starts at the step boundary that picked the
-        /// request up. A framework limitation, turned on only to reproduce a
-        /// vLLM baseline; off by default.
+        /// vLLM's async scheduling: the batch for step k+1 is formed when step k
+        /// launches, without k's output. A request queued while k runs first
+        /// runs in k+2, a request finished at N by accepted drafts still runs
+        /// one billed, token-less verify row at N+1, and an idle engine runs
+        /// its first input alone. Server TTFT starts at the step boundary that
+        /// queued the request. A framework limitation, turned on only to
+        /// reproduce a vLLM baseline; off by default.
         #[serde(default)]
         #[param(default = false)]
         async_scheduling: bool,
+        /// Async scheduling only: time (ms) from the end of the step that
+        /// computed a token to the moment it and the step's completions are
+        /// visible (vLLM processes the step's output after the next step
+        /// launched). Zero shows them at the end of the step.
+        #[serde(default)]
+        #[param(default = 0.0)]
+        async_output_processing_ms: f64,
     },
     /// PD prefill half: prefills then hands off to a decode pool (no local decode).
     PdPrefill {

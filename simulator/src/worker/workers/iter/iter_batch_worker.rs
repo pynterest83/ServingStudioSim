@@ -3,14 +3,20 @@
 //! The shell owns cadence and cross-axis sequencing. KV, Admission, and Execution
 //! are statically composed; the FSM itself is deliberately not an axis.
 //!
-//! A message that arrives while an iteration runs is handed to admission at
-//! once and can join the next iteration. Synchronous by default: a finished
-//! iteration's tokens and completion events are visible at its end. Under
-//! async scheduling (`with_async_scheduling`) the shell reproduces an engine
-//! that launches iteration k+1 before it processes k's output (vLLM's
-//! `step_with_batch_queue`, `core.py` ~L760-876): k's tokens and completions
-//! become visible at the end of k+1, or at the end of k when nothing runs
-//! after it. Progress and KV still retire at the end of k (see `OutputLag`).
+//! Synchronous by default: a message that arrives while an iteration runs is
+//! handed to admission at once and can join the next iteration, and a finished
+//! iteration's tokens and completion events are visible at its end.
+//!
+//! Under async scheduling (`with_async_scheduling`) the shell reproduces an
+//! engine that forms iteration k+1 when it launches k (vLLM's
+//! `step_with_batch_queue`, `core.py` ~L760-876; see `AsyncEngineLoop`). The
+//! shell still forms k+1 at the end of k, and the lifecycle answers from what
+//! was known at k's launch. The shell's part: a message that arrives during k
+//! reaches admission only after that decision, so it first runs in k+2; an
+//! idle engine runs its first input alone; when the decision for k+1 launches
+//! nothing, the engine decides again at once with everything that arrived;
+//! and k's tokens and completions become visible after the output processing
+//! delay. Progress and KV still retire at the end of k.
 
 use crate::common::{RequestId, Time, WorkerId};
 use crate::worker::admission::{
@@ -27,7 +33,7 @@ use crate::worker::types::{
     BatchFsmState, IterBatchPlan, IterCursor, WorkerFsmState, WorkerStatus,
 };
 
-use super::output_lag::OutputLag;
+use super::async_engine_loop::AsyncEngineLoop;
 
 struct IterationFsm {
     worker_state: WorkerFsmState,
@@ -61,10 +67,10 @@ where
     input: E::Input,
     batch_plan: IterBatchPlan,
     iteration_fsm: IterationFsm,
-    /// Async scheduling only: the finished step's output, held until the
-    /// step launched after it ends. `None` publishes every step's output at
-    /// its own end.
-    output_lag: Option<OutputLag<A::Event>>,
+    /// Async scheduling only: message pickup between steps and deferred step
+    /// output. `None` delivers every message at once and publishes every
+    /// step's output at its own end.
+    async_engine: Option<AsyncEngineLoop<A::Msg, A::Event>>,
 }
 
 /// Compatibility name retained for L6 factories and deployment selectors.
@@ -131,19 +137,30 @@ where
             input: Default::default(),
             batch_plan: IterBatchPlan::default(),
             iteration_fsm: IterationFsm::new(),
-            output_lag: None,
+            async_engine: None,
         }
     }
 
-    /// Publish each step's output at the end of the step launched after it, as
-    /// an engine that schedules one step ahead does. See the module docs; a
-    /// framework constraint enabled only to reproduce such an engine.
-    pub(super) fn with_async_scheduling(mut self) -> Self {
-        self.output_lag = Some(OutputLag::new());
+    /// Run the engine loop of a scheduler that forms each step's batch when
+    /// the previous step launches, showing a step's output `output_processing`
+    /// after its end. See the module docs; a framework constraint enabled only
+    /// to reproduce such an engine, together with the lifecycle's half.
+    pub(super) fn with_async_scheduling(mut self, output_processing: Time) -> Self {
+        self.async_engine = Some(AsyncEngineLoop::new(output_processing));
         self
     }
 
     pub fn enqueue(&mut self, msg: A::Msg) {
+        let msg = match self.async_engine.as_mut() {
+            Some(engine) => {
+                let step_running = self.iteration_fsm.worker_state == WorkerFsmState::Active;
+                match engine.pass_or_hold(msg, step_running) {
+                    Some(msg) => msg,
+                    None => return,
+                }
+            }
+            None => msg,
+        };
         self.admission
             .accept_message(&mut self.kv_store, msg, &self.context);
     }
@@ -152,17 +169,19 @@ where
         use IterCursor::{Computing, Done, NotStarted};
         use WorkerFsmState::{Active, Idle};
 
+        if let Some(engine) = self.async_engine.as_mut() {
+            engine.publish_processed(now, events);
+        }
         loop {
             match self.iteration_fsm.worker_state {
                 Idle => {
                     if !self.form_batch(now) {
-                        // Nothing runs next, so the engine processes the last
-                        // step's output now.
-                        if let Some(output_lag) = self.output_lag.as_mut() {
-                            output_lag.publish_held_now(events);
+                        if self.pick_up_messages_to_redecide() {
+                            continue;
                         }
                         break;
                     }
+                    self.pick_up_messages_after_launch();
                     self.iteration_fsm.worker_state = Active;
                     self.iteration_fsm.batch_state.cursor = NotStarted;
                     self.iteration_fsm.batch_state.compute_end = Time::ZERO;
@@ -200,6 +219,37 @@ where
         true
     }
 
+    /// Async scheduling: the decision launched a step. The messages that
+    /// arrived during the step that just ended are queued now and first
+    /// eligible for the next decision, i.e. the step after the one launched.
+    fn pick_up_messages_after_launch(&mut self) {
+        let Some(engine) = self.async_engine.as_mut() else {
+            return;
+        };
+        for msg in engine.messages_after_launch() {
+            self.admission
+                .accept_message(&mut self.kv_store, msg, &self.context);
+        }
+    }
+
+    /// Async scheduling: the decision launched nothing. When a step just
+    /// ended, the engine waits for its output instead, picks up everything
+    /// that arrived, and decides again at once. Returns whether to decide
+    /// again.
+    fn pick_up_messages_to_redecide(&mut self) -> bool {
+        let Some(engine) = self.async_engine.as_mut() else {
+            return false;
+        };
+        let Some(messages) = engine.messages_for_redecision() else {
+            return false;
+        };
+        for msg in messages {
+            self.admission
+                .accept_message(&mut self.kv_store, msg, &self.context);
+        }
+        true
+    }
+
     fn start_iteration(&mut self, now: Time) -> Time {
         self.execution.build_iteration_input(
             &self.kv_store,
@@ -215,12 +265,12 @@ where
         now + cost
     }
 
-    /// Retire the finished step. Under async scheduling the previous step's
-    /// held output is published first, then this step's output is held: the
-    /// lifecycle still retires it now, so the next decision sees its progress
-    /// and freed KV.
+    /// Retire the finished step. Under async scheduling with an output
+    /// processing delay, the step's tokens are restamped and its events
+    /// deferred to the end of the step plus that delay; the lifecycle still
+    /// retires the step now.
     fn complete_iteration(&mut self, now: Time, events: &mut Vec<A::Event>) {
-        let Some(output_lag) = self.output_lag.as_mut() else {
+        let Some(engine) = self.async_engine.as_mut() else {
             self.admission.complete_iteration(
                 &mut self.kv_store,
                 &self.context,
@@ -230,20 +280,30 @@ where
             );
             return;
         };
-        output_lag.publish_held(&self.context.requests, now, events);
-        output_lag.snapshot_members(&self.kv_store, &self.batch_plan, &self.context.requests);
+        engine.note_step_end();
+        if !engine.delays_output() {
+            self.admission.complete_iteration(
+                &mut self.kv_store,
+                &self.context,
+                &self.batch_plan,
+                events,
+                now,
+            );
+            return;
+        }
+        engine.snapshot_members(&self.kv_store, &self.batch_plan, &self.context.requests);
         self.admission.complete_iteration(
             &mut self.kv_store,
             &self.context,
             &self.batch_plan,
-            &mut output_lag.step_events,
+            engine.step_events(),
             now,
         );
-        output_lag.hold_step_output(&self.context.requests);
+        engine.defer_step_output(&self.context.requests, now);
     }
 
     fn next_wakeup(&self, now: Time) -> Option<Time> {
-        match self.iteration_fsm.worker_state {
+        let cadence = match self.iteration_fsm.worker_state {
             WorkerFsmState::Idle => {
                 let status = self.status();
                 (status.queued_requests > 0 || status.active_requests > 0).then_some(now)
@@ -252,6 +312,14 @@ where
                 IterCursor::NotStarted | IterCursor::Done => Some(now),
                 IterCursor::Computing => Some(self.iteration_fsm.batch_state.compute_end),
             },
+        };
+        let publication = self
+            .async_engine
+            .as_ref()
+            .and_then(AsyncEngineLoop::next_publication);
+        match (cadence, publication) {
+            (Some(cadence), Some(publication)) => Some(cadence.min(publication)),
+            (cadence, publication) => cadence.or(publication),
         }
     }
 
@@ -259,13 +327,25 @@ where
         let active_requests = (0..self.kv_store.num_partitions() as u16)
             .map(|partition| self.kv_store.status_active(partition))
             .sum();
+        let held_messages = self
+            .async_engine
+            .as_ref()
+            .map_or(0, AsyncEngineLoop::held_messages) as u32;
         WorkerStatus {
-            queued_requests: self.admission.queued_requests(),
+            queued_requests: self.admission.queued_requests() + held_messages,
             active_requests,
         }
     }
 
     pub fn release_request(&mut self, request: RequestId, current_kv: u64) -> Option<u16> {
+        // A held message is still a pending request: hand held messages over
+        // so cancellation can find it (they reach admission one step early).
+        if let Some(engine) = self.async_engine.as_mut() {
+            for msg in engine.take_all_messages() {
+                self.admission
+                    .accept_message(&mut self.kv_store, msg, &self.context);
+            }
+        }
         if self.admission.cancel_pending(request) {
             return None;
         }

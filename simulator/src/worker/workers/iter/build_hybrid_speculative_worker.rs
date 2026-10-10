@@ -141,9 +141,10 @@ pub(crate) fn build_hybrid_speculative_worker<M: SpeculativeUnifiedModel>(
         Some(quantum) => admission.with_chunk_end_quantum(quantum),
         None => admission,
     };
-    // vLLM's async scheduling has a lifecycle half (the trailing verify row
-    // and the QUEUED stamp) and a cadence half (the output lag); both or
-    // neither.
+    // vLLM's async scheduling has a lifecycle half (decisions from the state
+    // at the previous launch, the trailing verify row, the QUEUED stamp) and a
+    // cadence half (between-step message pickup, the first-input step, output
+    // processing); both or neither.
     let admission = if config.async_scheduling {
         admission.with_async_scheduling()
     } else {
@@ -156,7 +157,7 @@ pub(crate) fn build_hybrid_speculative_worker<M: SpeculativeUnifiedModel>(
         SpeculativeIterExecution::new(model, essentials.cost, draft_tokens),
     );
     if config.async_scheduling {
-        worker.with_async_scheduling()
+        worker.with_async_scheduling(config.async_output_processing)
     } else {
         worker
     }

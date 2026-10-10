@@ -107,9 +107,10 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
         ),
         drafting_slots,
     );
-    // vLLM's async scheduling has a lifecycle half (the trailing verify row
-    // and the QUEUED stamp) and a cadence half (the output lag); both or
-    // neither.
+    // vLLM's async scheduling has a lifecycle half (decisions from the state
+    // at the previous launch, the trailing verify row, the QUEUED stamp) and a
+    // cadence half (between-step message pickup, the first-input step, output
+    // processing); both or neither.
     let admission = if config.async_scheduling {
         admission.with_async_scheduling()
     } else {
@@ -122,7 +123,7 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
         SpeculativeIterExecution::new(model, essentials.cost, draft_tokens),
     );
     if config.async_scheduling {
-        worker.with_async_scheduling()
+        worker.with_async_scheduling(config.async_output_processing)
     } else {
         worker
     }
@@ -395,13 +396,19 @@ mod tests {
         assert!(model.most_decodes.load(Ordering::Relaxed) > 2);
     }
 
-    /// vLLM async-scheduling rules. Every iteration costs 1 ms and the tests
-    /// tick at 1 ms, so while the engine stays busy iteration `i` (1-based) is
-    /// formed at tick `i - 1` and completes at tick `i`.
+    /// vLLM async-scheduling rules. Every iteration costs exactly 1 ms and the
+    /// tests tick every 0.25 ms, so iteration ends land on ticks. An arrival
+    /// is enqueued before the tick at its time; a closed-loop replacement is
+    /// enqueued after the tick that emitted its predecessor's completion, at
+    /// that time, as L6 does.
     mod async_scheduling {
         use std::sync::Mutex;
 
         use super::*;
+        use crate::common::UnifiedStage;
+
+        const TICK_MS: f64 = 0.25;
+        const TICKS: u64 = 400;
 
         /// One iteration as the model saw it.
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -451,20 +458,32 @@ mod tests {
             }
         }
 
-        /// One request: output length, uniform acceptance, and, for a
-        /// closed-loop replacement, the request whose completion releases it.
+        /// One request: prompt and output length, uniform acceptance, its
+        /// arrival, and, for a closed-loop replacement, the request whose
+        /// completion releases it.
         #[derive(Clone, Copy)]
         struct Spec {
+            prompt_tokens: u32,
             output_tokens: u32,
             accept_rate: f32,
+            arrival_ms: f64,
             replaces: Option<u32>,
         }
 
         fn spec(output_tokens: u32, accept_rate: f32) -> Spec {
             Spec {
+                prompt_tokens: PROMPT_TOKENS,
                 output_tokens,
                 accept_rate,
+                arrival_ms: 0.0,
                 replaces: None,
+            }
+        }
+
+        fn arriving(arrival_ms: f64, output_tokens: u32, accept_rate: f32) -> Spec {
+            Spec {
+                arrival_ms,
+                ..spec(output_tokens, accept_rate)
             }
         }
 
@@ -475,38 +494,36 @@ mod tests {
             }
         }
 
+        #[derive(Clone, Copy)]
+        struct Engine {
+            async_scheduling: bool,
+            output_processing_ms: f64,
+            /// KV capacity in tokens (`None`: plenty).
+            kv_tokens: Option<u64>,
+        }
+
+        const SYNC: Engine = Engine {
+            async_scheduling: false,
+            output_processing_ms: 0.0,
+            kv_tokens: None,
+        };
+        const ASYNC: Engine = Engine {
+            async_scheduling: true,
+            ..SYNC
+        };
+
         struct Run {
             iterations: Vec<Iteration>,
-            /// Tick whose `tick` call emitted each request's `RequestComplete`.
-            completed_at: Vec<usize>,
-            /// Active (KV-resident) requests the worker reported after each
-            /// tick.
-            active_after_tick: Vec<u32>,
-            /// Tick of the `tick` call that formed each iteration (1-based
-            /// iteration `i` at index `i - 1`).
-            formed_at: Vec<usize>,
+            /// Time (ms) at which each iteration was formed and launched.
+            launched_ms: Vec<f64>,
+            /// Time (ms) of the tick that emitted each `RequestComplete`.
+            completed_ms: Vec<f64>,
+            /// KV-resident requests the worker reported after each tick.
+            active_after: Vec<(f64, u32)>,
             requests: SharedRequests,
         }
 
         impl Run {
-            /// Iteration (1-based) in which `request`'s prefill ran.
-            fn prefilled_at(&self, request: u32) -> usize {
-                let admitted = self.requests.borrow()[RequestId(request)]
-                    .telemetry
-                    .speculative
-                    .is_some();
-                assert!(admitted, "request {request} never ran");
-                // Every prompt in these scenarios fits one chunk, so the k-th
-                // prefill-bearing iteration admitted the k-th prompt group.
-                self.iterations
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, iteration)| iteration.prefill_tokens > 0)
-                    .map(|(index, _)| index + 1)
-                    .last()
-                    .unwrap()
-            }
-
             /// Client-visible output token times (ms).
             fn output_times(&self, request: u32) -> Vec<f64> {
                 self.requests.borrow()[RequestId(request)]
@@ -525,32 +542,67 @@ mod tests {
                     .as_ms()
             }
 
-            fn queued_time(&self, request: u32) -> Option<Time> {
+            fn queued_ms(&self, request: u32) -> Option<f64> {
                 self.requests.borrow()[RequestId(request)]
                     .telemetry
                     .queued_time
+                    .map(Time::as_ms)
+            }
+
+            /// Server TTFT as `request_slo` writes it.
+            fn server_ttft_ms(&self, request: u32) -> f64 {
+                let arrival = self.requests.borrow()[RequestId(request)]
+                    .request
+                    .core
+                    .arrival_time
+                    .as_ms();
+                self.first_output_ms(request) - self.queued_ms(request).unwrap_or(arrival)
+            }
+
+            /// The first-scheduled stamp (stage 1, `Prefill`).
+            fn first_scheduled_ms(&self, request: u32) -> f64 {
+                self.requests.borrow()[RequestId(request)]
+                    .lifecycle
+                    .stage_log
+                    .iter()
+                    .find(|stage| stage.code == UnifiedStage::Prefill as u16)
+                    .expect("the request was scheduled")
+                    .time
+                    .as_ms()
+            }
+
+            fn active_after(&self, ms: f64) -> u32 {
+                self.active_after
+                    .iter()
+                    .find(|(time, _)| *time == ms)
+                    .expect("a tick at that time")
+                    .1
             }
         }
 
-        fn run(async_scheduling: bool, specs: &[Spec]) -> Run {
+        fn run(engine: Engine, specs: &[Spec]) -> Run {
             let rows: Vec<_> = specs
                 .iter()
                 .enumerate()
-                .map(|(id, spec)| (id as u32, PROMPT_TOKENS, spec.output_tokens))
+                .map(|(id, spec)| (id as u32, spec.prompt_tokens, spec.output_tokens))
                 .collect();
             let requests = shared_with(&rows);
             for (id, spec) in specs.iter().enumerate() {
-                requests.borrow_mut()[RequestId(id as u32)]
-                    .request
-                    .definition
-                    .decoding = DecodingStrategy::Speculative {
+                let mut store = requests.borrow_mut();
+                let record = &mut store[RequestId(id as u32)];
+                record.request.definition.decoding = DecodingStrategy::Speculative {
                     accept_rate: AcceptanceProfile::Uniform(spec.accept_rate),
                 };
+                record.request.core.arrival_time = Time::from_ms(spec.arrival_ms);
             }
             let model = Arc::new(RecordingModel::default());
             let mut config = config(KvAdmissionConfig::FullFootprint);
-            config.async_scheduling = async_scheduling;
+            config.async_scheduling = engine.async_scheduling;
+            config.async_output_processing = Time::from_ms(engine.output_processing_ms);
             config.log_output_token_times = true;
+            if let Some(kv_tokens) = engine.kv_tokens {
+                config.attn_kv_bytes = kv_tokens * 1024;
+            }
             let mut worker = build_speculative_worker(
                 WorkerId(0),
                 "test",
@@ -562,32 +614,33 @@ mod tests {
                 "test-gpu",
                 test_cluster(),
             );
-            for (id, spec) in specs.iter().enumerate() {
-                if spec.replaces.is_none() {
-                    worker.enqueue(WorkerMsgCommon::Request(RequestId(id as u32)));
-                }
-            }
-            let mut completed_at = vec![0; specs.len()];
-            let mut active_after_tick = Vec::new();
-            let mut formed_at = Vec::new();
+            let mut enqueued = vec![false; specs.len()];
+            let mut completed_ms = vec![f64::NAN; specs.len()];
+            let mut launched_ms = Vec::new();
+            let mut active_after = Vec::new();
             let mut events = Vec::new();
-            for tick in 0..100u64 {
-                worker.tick(Time::from_ms(tick as f64), &mut events);
-                active_after_tick.push(worker.status().active_requests);
-                let formed = model.iterations.lock().unwrap().len();
-                formed_at.resize(formed, tick as usize);
+            for tick in 0..TICKS {
+                let now_ms = tick as f64 * TICK_MS;
+                // Arrivals due by now, in trace order.
+                for (id, spec) in specs.iter().enumerate() {
+                    if spec.replaces.is_none() && !enqueued[id] && spec.arrival_ms <= now_ms {
+                        enqueued[id] = true;
+                        worker.enqueue(WorkerMsgCommon::Request(RequestId(id as u32)));
+                    }
+                }
+                worker.tick(Time::from_ms(now_ms), &mut events);
+                active_after.push((now_ms, worker.status().active_requests));
+                let launched = model.iterations.lock().unwrap().len();
+                launched_ms.resize(launched, now_ms);
                 for event in events.drain(..) {
                     let WorkerEventCommon::RequestComplete { req, .. } = event;
-                    completed_at[req.0 as usize] = tick as usize;
-                    // L6 delivers the replacement after this tick, while the
-                    // iteration the tick just formed (if any) runs; it
-                    // arrives at the completion instant.
+                    completed_ms[req.0 as usize] = now_ms;
                     for (id, spec) in specs.iter().enumerate() {
                         if spec.replaces == Some(req.0) {
                             requests.borrow_mut()[RequestId(id as u32)]
                                 .request
                                 .core
-                                .arrival_time = Time::from_ms(tick as f64);
+                                .arrival_time = Time::from_ms(now_ms);
                             worker.enqueue(WorkerMsgCommon::Request(RequestId(id as u32)));
                         }
                     }
@@ -605,95 +658,124 @@ mod tests {
             let iterations = model.iterations.lock().unwrap().clone();
             Run {
                 iterations,
-                completed_at,
-                active_after_tick,
-                formed_at,
+                launched_ms,
+                completed_ms,
+                active_after,
                 requests,
             }
         }
 
         #[test]
-        fn a_step_output_is_visible_at_the_end_of_the_next_step() {
-            // Request 0 keeps the engine busy. Request 1 prefills in
-            // iteration 1 and rejects every draft, retiring one token in each
-            // of iterations 2..4. vLLM processes each step's output only after
-            // it launched the next step.
+        fn a_step_output_is_visible_after_output_processing() {
+            // Request 0 keeps the engine busy. Request 1, queued at the end of
+            // step 1, prefills in step 3 and retires one token in each of
+            // steps 4..6 (every draft rejected). Step k's output is visible at
+            // the end of k plus the processing delay, not at the end of k+1.
             let specs = [spec(64, 0.0), spec(4, 0.0)];
-            let on = run(true, &specs);
-            let off = run(false, &specs);
+            let processed = run(
+                Engine {
+                    output_processing_ms: 0.5,
+                    ..ASYNC
+                },
+                &specs,
+            );
+            assert_eq!(processed.output_times(1), [3.5, 4.5, 5.5, 6.5]);
+            assert_eq!(processed.completed_ms[1], 6.5, "the completion too");
+            assert_eq!(processed.server_ttft_ms(1), 3.5 - 1.0);
+            let at_step_end = run(ASYNC, &specs);
+            assert_eq!(at_step_end.output_times(1), [3.0, 4.0, 5.0, 6.0]);
+            assert_eq!(at_step_end.completed_ms[1], 6.0);
+            // Processing is visibility only: the schedule and KV are unchanged.
+            assert_eq!(processed.iterations, at_step_end.iterations);
+            assert_eq!(processed.launched_ms, at_step_end.launched_ms);
+            assert_eq!(processed.active_after, at_step_end.active_after);
+            // Synchronous: both prefill in step 1.
+            let off = run(SYNC, &specs);
             assert_eq!(off.output_times(1), [1.0, 2.0, 3.0, 4.0]);
-            assert_eq!(off.completed_at[1], 4);
-            assert_eq!(on.output_times(1), [2.0, 3.0, 4.0, 5.0]);
-            assert_eq!(on.first_output_ms(1), 2.0, "TTFT moves by one step");
-            assert_eq!(on.completed_at[1], 5, "so does the completion");
-            // The lag is visibility only: the schedule and KV are unchanged.
-            assert_eq!(on.iterations, off.iterations);
-            assert_eq!(on.active_after_tick, off.active_after_tick);
+            assert_eq!(off.completed_ms[1], 4.0);
         }
 
         #[test]
-        fn an_idle_engine_shows_a_step_output_at_its_own_end() {
-            // One request, every draft rejected: iterations 1..4. Iteration
-            // 4's output has no next step to wait for.
-            let on = run(true, &[spec(4, 0.0)]);
-            let off = run(false, &[spec(4, 0.0)]);
-            assert_eq!(off.output_times(0), [1.0, 2.0, 3.0, 4.0]);
-            assert_eq!(on.output_times(0), [2.0, 3.0, 4.0, 4.0]);
-            assert_eq!(on.completed_at, [4]);
-            assert_eq!(on.completed_at, off.completed_at);
-            assert_eq!(on.iterations, off.iterations);
+        fn a_request_queued_during_step_k_first_runs_in_k_plus_2() {
+            // Request 1 arrives at 1.5 ms, while step 2 runs. Step 3 was formed
+            // when step 2 launched, so request 1 is queued at the end of 2, is
+            // scheduled by the decision made at 3's launch, and runs in 4.
+            let specs = [spec(64, 0.0), arriving(1.5, 4, 0.0)];
+            let on = run(ASYNC, &specs);
+            assert_eq!(on.iterations[2], iteration(1, 0), "step 3 without it");
+            assert_eq!(on.iterations[3], iteration(1, PROMPT_TOKENS));
+            assert_eq!(on.launched_ms[3], 3.0);
+            assert_eq!(on.queued_ms(1), Some(2.0));
+            // First scheduled when the decision was made: no queue wait.
+            assert_eq!(on.first_scheduled_ms(1), 2.0);
+            assert_eq!(on.first_output_ms(1), 4.0);
+            assert_eq!(on.server_ttft_ms(1), 2.0);
+            // Synchronous: picked up on arrival, runs in step 3.
+            let off = run(SYNC, &specs);
+            assert_eq!(off.iterations[2], iteration(1, PROMPT_TOKENS));
+            assert_eq!(off.queued_ms(1), None);
+            assert_eq!(off.first_scheduled_ms(1), 2.0);
+            assert_eq!(off.first_output_ms(1), 3.0);
         }
 
         #[test]
-        fn a_closed_loop_replacement_enters_at_n_plus_3_through_the_lag() {
-            // Request 0 keeps the engine busy; request 1 finishes at N = 2 by
-            // accepting drafts; request 2 replaces it.
-            let specs = [spec(64, 0.0), spec(4, 1.0), replacing(1, 2, 0.0)];
-            let on = run(true, &specs);
-            // N+1 runs the trailing row, so N's completion becomes visible at
-            // its end, and the replacement arrives while N+2 runs.
-            assert_eq!(on.iterations[2], iteration(2, 0), "N+1 trailing row");
-            assert_eq!(on.completed_at[1], 2 + 1);
-            assert_eq!(on.iterations[3], iteration(1, 0), "N+2 without it");
-            assert_eq!(on.prefilled_at(2), 2 + 3);
-            // The engine picks it up when N+2 ends and schedules it in that
-            // same decision: no admission hold.
-            let queued = on.queued_time(2).unwrap();
-            assert_eq!(queued, Time::from_ms(4.0));
-            assert_eq!(on.formed_at[on.prefilled_at(2) - 1], 4);
-            let off = run(false, &specs);
-            assert_eq!(off.completed_at[1], 2);
-            assert_eq!(off.prefilled_at(2), 2 + 2);
-            assert_eq!(off.queued_time(2), None);
+        fn an_idle_engine_runs_its_first_input_alone_and_the_burst_from_step_3() {
+            // Four requests at the same instant. The idle engine launches the
+            // first in trace order at once and forms step 2 from that state;
+            // the rest are queued when step 1 ends and run in step 3.
+            let specs = [spec(8, 0.0); 4];
+            let on = run(ASYNC, &specs);
+            assert_eq!(
+                on.iterations[..3],
+                [
+                    iteration(0, PROMPT_TOKENS),
+                    iteration(1, 0),
+                    iteration(1, 3 * PROMPT_TOKENS)
+                ]
+            );
+            assert_eq!(on.queued_ms(0), None, "queued at its arrival");
+            assert_eq!(on.first_output_ms(0), 1.0);
+            for request in 1..4 {
+                assert_eq!(on.queued_ms(request), Some(1.0), "request {request}");
+                assert_eq!(on.first_scheduled_ms(request), 1.0);
+                assert_eq!(on.first_output_ms(request), 3.0);
+            }
+            let off = run(SYNC, &specs);
+            assert_eq!(off.iterations[0], iteration(0, 4 * PROMPT_TOKENS));
         }
 
         #[test]
-        fn a_closed_loop_replacement_enters_at_n_plus_2_into_an_otherwise_idle_engine() {
-            // Request 0 alone finishes at N = 2 by accepting drafts. Its
-            // trailing row runs at N+1, whose end shows the completion; the
-            // engine then idles, so the replacement is queued on arrival and
-            // runs next.
-            let on = run(true, &[spec(4, 1.0), replacing(0, 2, 0.0)]);
-            assert_eq!(on.iterations[2], iteration(1, 0));
-            assert_eq!(on.completed_at[0], 3);
-            assert_eq!(on.prefilled_at(1), 2 + 2);
-            assert_eq!(on.queued_time(1), None, "queued at its arrival");
-            // With no trailing row the engine idles after N already, shows the
-            // completion at once, and the replacement starts as without the
-            // option.
-            let on = run(true, &[spec(2, 1.0), replacing(0, 2, 0.0)]);
-            let off = run(false, &[spec(2, 1.0), replacing(0, 2, 0.0)]);
-            assert_eq!(on.iterations, off.iterations);
-            assert_eq!(on.completed_at, off.completed_at);
-            assert_eq!(on.prefilled_at(1), off.prefilled_at(1));
+        fn the_idle_engine_rule_applies_again_later_in_the_run() {
+            // Request 0 finishes at step 2 (sure to finish, no trailing row)
+            // and the engine idles. Two requests arrive together at 4 ms: the
+            // first runs alone at once, the second is queued when that step
+            // ends and runs two steps later.
+            let specs = [spec(2, 1.0), arriving(4.0, 8, 0.0), arriving(4.0, 8, 0.0)];
+            let on = run(ASYNC, &specs);
+            assert_eq!(
+                on.iterations[..5],
+                [
+                    iteration(0, PROMPT_TOKENS),
+                    iteration(1, 0),
+                    iteration(0, PROMPT_TOKENS),
+                    iteration(1, 0),
+                    iteration(1, PROMPT_TOKENS)
+                ]
+            );
+            assert_eq!(on.launched_ms[2..5], [4.0, 5.0, 6.0]);
+            assert_eq!(on.queued_ms(1), None);
+            assert_eq!(on.first_scheduled_ms(1), 4.0);
+            assert_eq!(on.queued_ms(2), Some(5.0));
+            assert_eq!(on.first_scheduled_ms(2), 5.0);
+            assert_eq!(on.first_output_ms(2), 7.0);
         }
 
         #[test]
         fn a_request_finished_by_accepted_drafts_runs_exactly_one_trailing_row() {
             // Prefill emits 1 of 4; round 2 starts with 3 left and accepts them
-            // all, so only the drafts finished it. The async scheduler had
-            // already issued a third row.
-            let on = run(true, &[spec(4, 1.0)]);
+            // all, so only the drafts finished it. Step 3 was formed when step
+            // 2 launched, before that output: it carries a wasted row.
+            let on = run(ASYNC, &[spec(4, 1.0)]);
             assert_eq!(
                 on.iterations,
                 [
@@ -702,18 +784,19 @@ mod tests {
                     iteration(1, 0)
                 ]
             );
-            let off = run(false, &[spec(4, 1.0)]);
+            let off = run(SYNC, &[spec(4, 1.0)]);
             assert_eq!(
                 off.iterations,
                 [iteration(0, PROMPT_TOKENS), iteration(1, 0)]
             );
-            // The trailing row is the step after N, so it carries N's output.
-            assert_eq!(on.completed_at, [3]);
-            assert_eq!(on.output_times(0), [2.0, 3.0, 3.0, 3.0]);
-            assert_eq!(off.completed_at, [2]);
+            // The output is visible at the end of the step that computed it.
+            assert_eq!(on.completed_ms, [2.0]);
+            assert_eq!(on.output_times(0), [1.0, 2.0, 2.0, 2.0]);
+            assert_eq!(off.completed_ms, [2.0]);
             // KV stays resident through the trailing row, then is released.
-            assert_eq!(on.active_after_tick[2..4], [1, 0]);
-            assert_eq!(off.active_after_tick[2], 0);
+            assert_eq!(on.active_after(2.0), 1);
+            assert_eq!(on.active_after(3.0), 0);
+            assert_eq!(off.active_after(2.0), 0);
             // The trailing row emits nothing and is not a verify round.
             let requests = on.requests.borrow();
             let observation = requests[RequestId(0)]
@@ -732,70 +815,86 @@ mod tests {
             // is sure to finish. Four tokens rejecting every draft: the final
             // round also starts with 1 left.
             for (output_tokens, accept_rate, rounds) in [(2, 1.0, 1), (4, 0.0, 3)] {
-                let on = run(true, &[spec(output_tokens, accept_rate)]);
-                let off = run(false, &[spec(output_tokens, accept_rate)]);
+                let on = run(ASYNC, &[spec(output_tokens, accept_rate)]);
+                let off = run(SYNC, &[spec(output_tokens, accept_rate)]);
                 assert_eq!(on.iterations, off.iterations);
                 assert_eq!(on.iterations.len(), 1 + rounds);
-                assert_eq!(on.completed_at, off.completed_at);
-                assert_eq!(on.active_after_tick[1 + rounds], 0);
+                assert_eq!(on.completed_ms, off.completed_ms);
+                assert_eq!(on.active_after((1 + rounds) as f64), 0);
             }
         }
 
         #[test]
-        fn queued_is_the_next_step_boundary_and_a_kv_wait_stays_in_server_ttft() {
-            // KV holds one 8 + 8 token request at a time. Request 1 arrives at
-            // 0.5 ms, while iteration 1 prefills request 0.
-            let requests = shared_with(&[(0, PROMPT_TOKENS, 8), (1, PROMPT_TOKENS, 8)]);
-            for id in 0..2 {
-                let mut store = requests.borrow_mut();
-                store[RequestId(id)].request.definition.decoding = DecodingStrategy::Speculative {
-                    accept_rate: AcceptanceProfile::Uniform(0.0),
-                };
-            }
-            requests.borrow_mut()[RequestId(1)]
-                .request
-                .core
-                .arrival_time = Time::from_ms(0.5);
-            let model = Arc::new(RecordingModel::default());
-            let mut config = config(KvAdmissionConfig::FullFootprint);
-            config.async_scheduling = true;
-            config.attn_kv_bytes = 24 * 1024;
-            let mut worker = build_speculative_worker(
-                WorkerId(0),
-                "test",
-                model.clone(),
-                requests.clone(),
-                config,
-                None,
-                PoolId(0),
-                "test-gpu",
-                test_cluster(),
-            );
-            worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
-            let mut events = Vec::new();
-            worker.tick(Time::ZERO, &mut events);
-            worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
-            for tick in 1..40u64 {
-                worker.tick(Time::from_ms(tick as f64), &mut events);
-            }
-            // Request 0 decodes in iterations 2..8 and frees its KV at the
-            // end of 8; request 1 prefills in 9, its first token shows at the
-            // end of 10.
-            let iterations = model.iterations.lock().unwrap().clone();
-            assert_eq!(iterations[8], iteration(0, PROMPT_TOKENS));
-            let store = requests.borrow();
-            let record = &store[RequestId(1)];
-            assert_eq!(record.telemetry.queued_time, Some(Time::from_ms(1.0)));
-            assert_eq!(
-                record.telemetry.first_output_time,
-                Some(Time::from_ms(10.0))
-            );
-            // Server TTFT (10 - 1 ms) keeps the KV wait from 1 ms to the
-            // first schedule at 8 ms; client TTFT also keeps the half step
-            // before pickup.
-            assert!(record.lifecycle.completed);
-            // A request that arrived at an idle engine is queued on arrival.
-            assert_eq!(store[RequestId(0)].telemetry.queued_time, None);
+        fn a_closed_loop_replacement_enters_at_n_plus_3() {
+            // Request 0 keeps the engine busy; request 1 prefills in step 3
+            // and finishes at N = 4 by accepting drafts; request 2 replaces it.
+            let specs = [spec(64, 0.0), spec(4, 1.0), replacing(1, 2, 0.0)];
+            let on = run(ASYNC, &specs);
+            assert_eq!(on.iterations[2], iteration(1, PROMPT_TOKENS));
+            assert_eq!(on.completed_ms[1], 4.0, "visible at the end of N");
+            // The replacement arrives while N+1 runs (with the trailing row),
+            // is queued at its end, and runs in N+3.
+            assert_eq!(on.iterations[4], iteration(2, 0), "N+1 trailing row");
+            assert_eq!(on.iterations[5], iteration(1, 0), "N+2 without it");
+            assert_eq!(on.iterations[6], iteration(1, PROMPT_TOKENS), "N+3");
+            assert_eq!(on.queued_ms(2), Some(5.0));
+            assert_eq!(on.first_scheduled_ms(2), 5.0);
+            assert_eq!(on.first_output_ms(2), 7.0);
+        }
+
+        #[test]
+        fn a_closed_loop_replacement_enters_at_n_plus_2_into_an_otherwise_idle_engine() {
+            // Request 0 alone finishes at N = 2 by accepting drafts. The
+            // replacement arrives while N+1 runs the trailing row; the
+            // decision formed at N+1's launch is empty, so the engine waits for
+            // N+1, picks it up and runs it next.
+            let on = run(ASYNC, &[spec(4, 1.0), replacing(0, 2, 0.0)]);
+            assert_eq!(on.iterations[2], iteration(1, 0));
+            assert_eq!(on.iterations[3], iteration(0, PROMPT_TOKENS));
+            assert_eq!(on.launched_ms[3], 3.0);
+            assert_eq!(on.queued_ms(1), Some(3.0));
+            assert_eq!(on.first_scheduled_ms(1), 3.0);
+            // With no trailing row the engine idles after N already and picks
+            // the replacement up on arrival, as without the option.
+            let on = run(ASYNC, &[spec(2, 1.0), replacing(0, 2, 0.0)]);
+            let off = run(SYNC, &[spec(2, 1.0), replacing(0, 2, 0.0)]);
+            assert_eq!(on.iterations, off.iterations);
+            assert_eq!(on.launched_ms, off.launched_ms);
+            assert_eq!(on.completed_ms, off.completed_ms);
+            assert_eq!(on.queued_ms(1), None);
+        }
+
+        #[test]
+        fn a_kv_wait_stays_in_server_ttft_and_freed_kv_serves_the_step_after_next() {
+            // Request 0 (8 + 64) keeps the engine busy. Requests 1 and 2 (64 +
+            // 4 each) are queued at the end of step 1; KV holds request 0 and
+            // one of them, so request 1 runs in step 3 and request 2 waits.
+            // Request 1 finishes at 6, but the decision for 7 was made at 6's
+            // launch, with its KV still held: request 2 is scheduled by the
+            // decision at 7's launch and runs in 8.
+            const LONG_PROMPT: u32 = 64;
+            let waiting = Spec {
+                prompt_tokens: LONG_PROMPT,
+                ..spec(4, 0.0)
+            };
+            let specs = [spec(64, 0.0), waiting, waiting];
+            let kv_tokens = Some(144);
+            let on = run(Engine { kv_tokens, ..ASYNC }, &specs);
+            assert_eq!(on.iterations[2], iteration(1, LONG_PROMPT));
+            assert_eq!(on.completed_ms[1], 6.0);
+            assert_eq!(on.iterations[6], iteration(1, 0), "freed KV not yet seen");
+            assert_eq!(on.iterations[7], iteration(1, LONG_PROMPT));
+            assert_eq!(on.queued_ms(2), Some(1.0));
+            assert_eq!(on.first_scheduled_ms(2), 6.0, "a 5 ms KV wait");
+            assert_eq!(on.first_output_ms(2), 8.0);
+            assert_eq!(on.server_ttft_ms(2), 7.0, "the KV wait counts");
+            // Synchronous: requests 0 and 1 start together, and request 2 runs
+            // as soon as request 1's KV is freed.
+            let off = run(Engine { kv_tokens, ..SYNC }, &specs);
+            assert_eq!(off.iterations[0], iteration(0, PROMPT_TOKENS + LONG_PROMPT));
+            assert_eq!(off.completed_ms[1], 4.0);
+            assert_eq!(off.iterations[4], iteration(1, LONG_PROMPT));
+            assert_eq!(off.first_scheduled_ms(2), 4.0);
         }
 
         #[test]
@@ -804,7 +903,7 @@ mod tests {
             // request 1 finishes at 2 and frees its row at once; its
             // replacement joins iteration 4 and decodes once.
             let specs = [spec(8, 0.0), spec(4, 1.0), replacing(1, 2, 0.0)];
-            let off = run(false, &specs);
+            let off = run(SYNC, &specs);
             assert_eq!(
                 off.iterations,
                 [
@@ -818,14 +917,18 @@ mod tests {
                     iteration(1, 0),
                 ]
             );
-            assert_eq!(off.completed_at, [8, 2, 5]);
-            // Tokens are visible when their iteration ends, and the queued
-            // time is the arrival.
+            assert_eq!(off.launched_ms, [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+            assert_eq!(off.completed_ms, [8.0, 2.0, 5.0]);
+            // Tokens are visible when their iteration ends, the queued time is
+            // the arrival, and first scheduled is the decision at the end of
+            // the previous iteration.
             assert_eq!(off.output_times(1), [1.0, 2.0, 2.0, 2.0]);
             assert_eq!(off.output_times(2), [4.0, 5.0]);
-            assert!((0..3).all(|request| off.queued_time(request).is_none()));
+            assert!((0..3).all(|request| off.queued_ms(request).is_none()));
+            assert_eq!(off.first_scheduled_ms(2), 3.0);
             let default_config = WorkerConfig::default();
             assert!(!default_config.async_scheduling);
+            assert_eq!(default_config.async_output_processing, Time::ZERO);
         }
     }
 
