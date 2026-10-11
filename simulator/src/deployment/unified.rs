@@ -300,6 +300,7 @@ impl Deployment for UnifiedDeployment {
                 expert_popularity_file,
                 token_corpus_file,
                 cudagraph_capture_sizes,
+                sparse_mla_backend,
                 ..
             } => {
                 ensure_speculative(&g.worker, *draft_tokens)?;
@@ -313,6 +314,7 @@ impl Deployment for UnifiedDeployment {
                     token_corpus_file.as_deref(),
                     cudagraph_capture_sizes,
                     *draft_tokens,
+                    *sparse_mla_backend,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,

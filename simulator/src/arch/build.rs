@@ -16,7 +16,9 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
+use crate::arch::config::{
+    AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind, SparseMlaBackend,
+};
 use crate::arch::contract::SpeculativeUnifiedModel;
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
@@ -1288,6 +1290,7 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe_speculative_model(
     token_corpus_file: Option<&str>,
     cudagraph_capture_sizes: &[u32],
     draft_tokens: u32,
+    sparse_mla_backend: SparseMlaBackend,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1329,6 +1332,7 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe_speculative_model(
         gpu_name: gpu.to_string(),
         cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
         draft_tokens,
+        sparse_mla_backend,
     };
     let configs =
         glm53_flash_vllm_fp8_kda_dsa_moe_speculative::build_configs(&model_cfg, &parallel, &demand)
@@ -1970,6 +1974,7 @@ pub fn build_speculative_iter_model(
             expert_popularity_file,
             token_corpus_file,
             cudagraph_capture_sizes,
+            sparse_mla_backend,
         } => Ok((
             Box::new(glm53_flash_vllm_fp8_kda_dsa_moe_speculative_model(
                 model,
@@ -1981,6 +1986,7 @@ pub fn build_speculative_iter_model(
                 token_corpus_file.as_deref(),
                 cudagraph_capture_sizes,
                 *draft_tokens,
+                *sparse_mla_backend,
                 gpu,
                 name,
                 bridge,

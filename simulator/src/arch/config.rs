@@ -31,6 +31,7 @@ use serde::Deserialize;
 use schema_derive::{ParamStruct, ProviderSchema};
 
 use super::glm52_model_cfg::Glm52MtpMode;
+pub use crate::worklet::SparseMlaBackend;
 
 /// Model identity + layer controls. Flattened into every arch tag (§4), so it
 /// carries no `deny_unknown_fields` (the flattened struct must let the arch's
@@ -95,6 +96,10 @@ const SYNTHETIC_ROUTING_KINDS: [&str; 2] = ["uniform", "random"];
 /// GLM-5.2 proposer modes exposed by the iter selector. This mirrors
 /// [`Glm52MtpMode`]'s serde representation.
 const GLM52_MTP_MODES: [&str; 3] = ["off", "full_index", "index_share"];
+
+/// vLLM sparse-MLA backends of the H200 GLM-5.3-Flash speculative selector.
+/// This mirrors [`SparseMlaBackend`]'s serde representation.
+const SPARSE_MLA_BACKENDS: [&str; 2] = ["flash_attn_mla_sparse", "flashinfer_mla_sparse_sm90"];
 
 const fn default_glm52_parallel_size() -> u16 {
     8
@@ -619,6 +624,13 @@ pub enum IterArchSel {
         /// vLLM's captured CUDA-graph sizes (padding as in the B200 arch).
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
+        /// vLLM's sparse-MLA attention backend for the MQA rows.
+        /// `flash_attn_mla_sparse` (FA3) is the production recipe;
+        /// `flashinfer_mla_sparse_sm90` is what vLLM selects first when nvcc
+        /// is on PATH (`has_flashinfer()`), costed on NVIDIA H200 only.
+        #[serde(default)]
+        #[param(string, default = "flash_attn_mla_sparse", choices = SPARSE_MLA_BACKENDS, cache_key)]
+        sparse_mla_backend: SparseMlaBackend,
     },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by

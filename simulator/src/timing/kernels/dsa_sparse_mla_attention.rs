@@ -28,11 +28,24 @@
 //! (measured on H200 at 1/256/2176 valid slots: 3 launches through Q 992, 2 from
 //! Q 993). Its pooled grid carries 992 and 993 as adjacent query points, so the
 //! linear cache never interpolates across that drop.
+//!
+//! With nvcc on PATH vLLM picks `FLASHINFER_MLA_SPARSE_SM90` instead
+//! (`vllm_flashinfer_sparse_sm90_bf16`): FlashInfer's planned
+//! `BatchMLAPagedAttentionWrapper` run, one `BatchMLAPageAttentionHopperKernel`
+//! launch over the same rows. Its planner (`MLAPlan`, scheduler.cuh) gives each
+//! of the H200's 132 SMs one cluster and caps a work item at
+//! `f(ceil(total planned keys / 132))`, rounded up to 256 keys. Once a call
+//! has more than 132 rows that cap is at least a whole row, so rows of equal
+//! length are placed whole, `ceil(Q / 132)` per cluster: the time is a staircase
+//! in Q (measured on H200 at 4096 cache tokens: 63.5 us at Q 132, 119.1 us at
+//! 133, 121.5 us at 264, 176.8 us at 265). The grid therefore samples Q at full
+//! waves above 132 and `cache_coords` rounds a query up to its wave, so the
+//! linear cache interpolates in waves and never across a step.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
-use crate::timing::sweep::{Axis, SweepGrid};
+use crate::timing::sweep::{Axis, Coords, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
 const UNIFORM_QUERY_AXIS: [u32; 27] = [
@@ -94,6 +107,50 @@ const FA3_POOLED_QUERY_AXIS: [u32; 23] = [
 const FA3_POOLED_CACHE_AXIS: [u32; 18] = [
     1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 1536, 4096, 16384, 65536, 262144, 1048576,
 ];
+
+/// The H200 FlashInfer backend (vLLM `FLASHINFER_MLA_SPARSE_SM90`).
+pub const FLASHINFER_SM90_SPARSE_BACKEND: &str = "vllm_flashinfer_sparse_sm90_bf16";
+/// FlashInfer SM90 pooled query axis: dense below one wave, where the planner
+/// splits rows into rounded key chunks and the time is not monotone in Q
+/// (128 rows take longer than 132 at 2051 keys), then whole waves of 132 rows
+/// (`flashinfer_sm90_wave_rows`), log-spaced past 8 waves. It stops at 124
+/// waves: `MLAPlan` holds at most 16384 work items, at least one per row, and
+/// overruns its arrays past that (production plans at most 8192 rows).
+const FLASHINFER_SM90_POOLED_QUERY_AXIS: [u32; 25] = [
+    1, 2, 4, 6, 8, 16, 24, 32, 48, 64, 96, 112, 128, 132, 264, 396, 528, 792, 1056, 1584, 2112,
+    4224, 8316, 12408, 16368,
+];
+/// FlashInfer SM90 pooled context points; the grid adds the cap. The kernel
+/// walks keys in 64-token tiles and a partial last tile costs more than a
+/// full one: on H200 at 264 rows, 256 keys take 25.6 us, 258..288 keys a
+/// plateau near 36.7 us, then the time falls linearly to 29.1 us at 320. A
+/// real row's remainder is arbitrary, so below the cap the points sit at
+/// 64k + 40, where the time is near its mean over remainders (35.6 vs 35.0
+/// us at k = 4; 77.1 vs 76.3 us at k = 16), not on the fast full-tile teeth.
+/// Past the cap only the gather footprint grows.
+const FLASHINFER_SM90_POOLED_CACHE_AXIS: [u32; 18] = [
+    1, 2, 4, 8, 16, 40, 104, 168, 296, 552, 808, 1064, 1576, 2024, 4096, 16384, 65536, 1048576,
+];
+
+/// SMs of the GPUs whose FlashInfer SM90 planner rounds is known: `MLAPlan`
+/// runs one cluster per SM below 64 packed query rows per request, which a
+/// one-query row of at most 64 heads always is.
+pub fn flashinfer_sm90_clusters(gpu_name: &str) -> Option<u32> {
+    match gpu_name {
+        "NVIDIA H200" => Some(132),
+        _ => None,
+    }
+}
+
+/// The query rows the FlashInfer SM90 planner costs a call of `num_queries`
+/// equal rows at: past one wave, whole waves of `clusters` rows.
+fn flashinfer_sm90_wave_rows(num_queries: u32, clusters: u32) -> u32 {
+    if num_queries <= clusters {
+        num_queries
+    } else {
+        num_queries.div_ceil(clusters) * clusters
+    }
+}
 
 /// Which valid-slot-count shape a config sweeps.
 ///
@@ -204,6 +261,9 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
         if config.backends.contains(&FA3_SPARSE_BACKEND) {
             return fa3_sweep_grid(config);
         }
+        if config.backends.contains(&FLASHINFER_SM90_SPARSE_BACKEND) {
+            return flashinfer_sm90_sweep_grid(config);
+        }
         let (query_axis, cache_axis): (Vec<u32>, Vec<u32>) = match config.valid_counts_pattern {
             ValidCountsPattern::UniformFull => {
                 (UNIFORM_QUERY_AXIS.to_vec(), UNIFORM_CACHE_AXIS.to_vec())
@@ -237,6 +297,30 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
         // `num_queries`; `num_cache_tokens` sets the gather footprint the
         // indices point into, not how many of them are read.
         CacheKind::Cache2DLinear(Extrapolation::Weighted)
+    }
+
+    fn cache_coords(config: &Self::Config, input: &Self::Input) -> Coords {
+        if config.backends == [FLASHINFER_SM90_SPARSE_BACKEND] {
+            let clusters = flashinfer_sm90_clusters(&config.gpu_name)
+                .expect("validate_config admits only GPUs with a known SM count");
+            return Coords::new([
+                f64::from(flashinfer_sm90_wave_rows(input.num_queries, clusters)),
+                f64::from(input.num_cache_tokens),
+            ]);
+        }
+        input.coords()
+    }
+
+    fn validate_config(config: &Self::Config) -> anyhow::Result<()> {
+        if config.backends.contains(&FLASHINFER_SM90_SPARSE_BACKEND) {
+            anyhow::ensure!(
+                flashinfer_sm90_clusters(&config.gpu_name).is_some(),
+                "{FLASHINFER_SM90_SPARSE_BACKEND} rounds queries to the planner's waves, \
+                 whose SM count is known only for NVIDIA H200, got {}",
+                config.gpu_name
+            );
+        }
+        Ok(())
     }
 
     fn infeasible_mask(config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
@@ -528,6 +612,36 @@ fn fa3_sweep_grid(config: &DsaSparseMlaAttentionKernelConfig) -> SweepGrid {
     ])
 }
 
+/// The FlashInfer SM90 grid: its own wave-aligned query axis, so it sweeps
+/// alone, and only the pooled pattern its H200 worklet uses.
+fn flashinfer_sm90_sweep_grid(config: &DsaSparseMlaAttentionKernelConfig) -> SweepGrid {
+    assert!(
+        config.backends == [FLASHINFER_SM90_SPARSE_BACKEND],
+        "{FLASHINFER_SM90_SPARSE_BACKEND} has its own grid and cannot share a config with {:?}",
+        config.backends
+    );
+    let ValidCountsPattern::PooledUniformFull { .. } = config.valid_counts_pattern else {
+        panic!(
+            "{FLASHINFER_SM90_SPARSE_BACKEND} sweeps only PooledUniformFull, got {:?}",
+            config.valid_counts_pattern
+        );
+    };
+    // No `index_topk` point: 2048 keys are whole tiles, faster than the
+    // partial-tile rows on either side of it.
+    let mut cache_axis = FLASHINFER_SM90_POOLED_CACHE_AXIS.to_vec();
+    cache_axis.push(
+        config
+            .valid_counts_pattern
+            .valid_count_cap(config.selected_k),
+    );
+    cache_axis.sort_unstable();
+    cache_axis.dedup();
+    SweepGrid::new(vec![
+        Axis::values(FLASHINFER_SM90_POOLED_QUERY_AXIS.iter().copied()),
+        Axis::values(cache_axis),
+    ])
+}
+
 /// Pooled context axis: the fixed points plus `index_topk` (last unsaturated
 /// power-of-two anchor) and the saturating cap, so the linear cache never
 /// interpolates across the point where the count stops growing.
@@ -552,8 +666,8 @@ mod tests {
         canonical_valid_counts, speculative_cache_axis, speculative_query_axis,
         DsaSparseMlaAttentionKernelConfig, DsaSparseMlaAttentionKernelInput,
         DsaSparseMlaAttentionSpec, CAUSAL_CACHE_AXIS, CAUSAL_QUERY_AXIS, FA3_COMBINE_MAX_QUERIES,
-        FA3_SPARSE_BACKEND, SPECULATIVE_CACHE_AXIS, SPECULATIVE_QUERY_AXIS, UNIFORM_CACHE_AXIS,
-        UNIFORM_QUERY_AXIS,
+        FA3_SPARSE_BACKEND, FLASHINFER_SM90_SPARSE_BACKEND, SPECULATIVE_CACHE_AXIS,
+        SPECULATIVE_QUERY_AXIS, UNIFORM_CACHE_AXIS, UNIFORM_QUERY_AXIS,
     };
     use crate::timing::bridge::{ArgsPayload, DType};
     use crate::timing::cache::{CacheKind, Extrapolation};
@@ -955,6 +1069,98 @@ mod tests {
         let mut cfg = fa3_config();
         cfg.backends = vec![FA3_SPARSE_BACKEND, TRTLLM_BACKEND];
         DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
+    }
+
+    /// GLM-5.3-Flash TP4 on H200 under `FLASHINFER_MLA_SPARSE_SM90`.
+    fn flashinfer_sm90_config() -> DsaSparseMlaAttentionKernelConfig {
+        DsaSparseMlaAttentionKernelConfig {
+            backends: vec![FLASHINFER_SM90_SPARSE_BACKEND],
+            ..fa3_config()
+        }
+    }
+
+    /// Catches a FlashInfer grid that would let the linear cache interpolate
+    /// across a planner wave step (a query point off a multiple of 132 above
+    /// one wave), sample contexts on the fast full-tile teeth, drop the dense
+    /// sub-wave points, or pass 500 coordinates.
+    #[test]
+    fn flashinfer_sm90_grid_samples_whole_waves_within_the_ceiling() {
+        let cfg = flashinfer_sm90_config();
+        let grid = DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
+        let queries = &grid.axes()[0];
+        assert!(queries
+            .iter()
+            .filter(|&&q| q > 132.0)
+            .all(|&q| q as u32 % 132 == 0));
+        assert_contiguous(queries, &[112, 128, 132, 264, 396]);
+        // Partial-tile contexts (64k + 40) below the cap, then the cap itself.
+        assert_contiguous(&grid.axes()[1], &[40, 104, 168, 296]);
+        assert_contiguous(&grid.axes()[1], &[1576, 2024, 2051, 4096]);
+        // The planner's 16384-work capacity bounds the grid.
+        assert_eq!(queries.last(), Some(&16368.0));
+        assert_eq!(grid.axes()[1].last(), Some(&1_048_576.0));
+        let mask = DsaSparseMlaAttentionSpec::infeasible_mask(&cfg, &grid);
+        assert_mask_split(&mask, 25 * 19, 0);
+    }
+
+    /// Catches a projection that would price 133 rows like 132 (a whole wave
+    /// short), round inside the first wave, or round the context axis.
+    #[test]
+    fn flashinfer_sm90_cache_coords_round_queries_up_to_the_wave() {
+        let cfg = flashinfer_sm90_config();
+        let coords = |num_queries, num_cache_tokens| {
+            let input = DsaSparseMlaAttentionKernelInput {
+                num_queries,
+                num_cache_tokens,
+            };
+            DsaSparseMlaAttentionSpec::cache_coords(&cfg, &input).to_vec()
+        };
+        assert_eq!(coords(100, 3000), vec![100.0, 3000.0]);
+        assert_eq!(coords(132, 3000), vec![132.0, 3000.0]);
+        assert_eq!(coords(133, 3000), vec![264.0, 3000.0]);
+        assert_eq!(coords(384, 777), vec![396.0, 777.0]);
+        assert_eq!(coords(7892, 1037), vec![7920.0, 1037.0]);
+        // FA3 keeps its physical axes.
+        let input = DsaSparseMlaAttentionKernelInput {
+            num_queries: 133,
+            num_cache_tokens: 3000,
+        };
+        assert_eq!(
+            DsaSparseMlaAttentionSpec::cache_coords(&fa3_config(), &input).to_vec(),
+            vec![133.0, 3000.0]
+        );
+    }
+
+    /// Catches a FlashInfer payload that drifts from FA3's (the two backends
+    /// share the kind's args: only `backend` differs) or a GPU whose planner
+    /// waves are unknown being accepted.
+    #[test]
+    fn flashinfer_sm90_payloads_match_fa3_and_need_a_known_sm_count() {
+        let cfg = flashinfer_sm90_config();
+        let grid = DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
+        let payloads =
+            DsaSparseMlaAttentionSpec::enumerate(&cfg, &grid, FLASHINFER_SM90_SPARSE_BACKEND);
+        assert_eq!(payloads.len(), 25 * 19);
+        let mut fields =
+            serde_json::to_value(payload_for(&payloads, &grid, 264, 65536).fields()).unwrap();
+        assert_eq!(fields["valid_counts"], "g:(2048,2049,2050,2051)x66");
+        assert_eq!(fields["backend"], FLASHINFER_SM90_SPARSE_BACKEND);
+        fields["backend"] = Value::from(FA3_SPARSE_BACKEND);
+        let fa3 = fa3_config();
+        let fa3_grid = DsaSparseMlaAttentionSpec::sweep_grid(&fa3);
+        let fa3_payloads =
+            DsaSparseMlaAttentionSpec::enumerate(&fa3, &fa3_grid, FA3_SPARSE_BACKEND);
+        let mut expected =
+            serde_json::to_value(payload_for(&fa3_payloads, &fa3_grid, 256, 65536).fields())
+                .unwrap();
+        expected["num_queries"] = Value::from(264);
+        expected["valid_counts"] = Value::from("g:(2048,2049,2050,2051)x66");
+        assert_eq!(fields, expected);
+        assert!(DsaSparseMlaAttentionSpec::validate_config(&cfg).is_ok());
+        let mut h100 = cfg.clone();
+        h100.gpu_name = "NVIDIA H100".into();
+        assert!(DsaSparseMlaAttentionSpec::validate_config(&h100).is_err());
+        assert!(DsaSparseMlaAttentionSpec::validate_config(&fa3).is_ok());
     }
 
     #[test]

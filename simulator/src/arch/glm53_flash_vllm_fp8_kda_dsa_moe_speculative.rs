@@ -17,7 +17,9 @@
 //!   chunked core;
 //! - DSA: the kpool indexer over `K+1` rows per request (flattened to
 //!   single-token rows on SM90, where DeepGEMM has no `next_n = 6`),
-//!   dense-MHA prefill or sparse MQA through `FLASH_ATTN_MLA_SPARSE`, BF16 latent cache;
+//!   dense-MHA prefill or sparse MQA through `FLASH_ATTN_MLA_SPARSE` (or,
+//!   with `sparse_mla_backend: flashinfer_mla_sparse_sm90`, vLLM's
+//!   `FLASHINFER_MLA_SPARSE_SM90`), BF16 latent cache;
 //! - every TP all-reduce is FlashInfer's up to its sm90 fusion workspace and
 //!   a plain all-reduce above it (vLLM's FLASHINFER > CUSTOM > SYMM_MEM >
 //!   PYNCCL dispatch; custom and symm_mem have no L1 backend yet).
@@ -55,6 +57,7 @@ use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::kernels::all_reduce_fusion::fused_all_reduce_refusal;
+use crate::timing::kernels::dsa_sparse_mla_attention::flashinfer_sm90_clusters;
 use crate::timing::kernels::{
     AllReduceFusionKernel, AllReduceFusionKernelConfig, AllReduceFusionKernelInput,
     AllReduceFusionSpec, AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput,
@@ -62,7 +65,7 @@ use crate::timing::kernels::{
     MhcFusedPostPreRmsNormKernel, MhcPreRmsNormKernel, MhcRmsNormKernelConfig,
     MhcRmsNormKernelInput, ResidualRmsNormKernel, ResidualRmsNormKernelConfig,
     ResidualRmsNormKernelInput, RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput,
-    SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput, FA3_SPARSE_BACKEND,
+    SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
 };
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Dim, Evaluator, FlatCostNode,
@@ -79,7 +82,7 @@ use crate::worklet::{
     Glm53TritonMoeRouterLocalWorkletConfig, Glm53TritonMoeRouterLocalWorkletInput,
     Glm53TritonMoeRouterLocalWorkletResolved, Glm53TritonMoeTpLocalWorklet,
     Glm53TritonMoeTpLocalWorkletConfig, Glm53TritonMoeTpLocalWorkletInput,
-    Glm53TritonMoeTpLocalWorkletResolved,
+    Glm53TritonMoeTpLocalWorkletResolved, SparseMlaBackend,
 };
 
 pub const ARCH_KIND: &str = "glm53_flash_vllm_fp8_kda_dsa_moe_speculative";
@@ -148,8 +151,6 @@ const TOPK_BACKENDS: &[&str] = &["vllm_auto"];
 const MQA_LOGITS_PREFILL_BACKENDS: &[&str] = &["deepgemm_fp8"];
 const TOPK_PREFILL_BACKENDS: &[&str] = &["vllm_cuda"];
 const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
-/// vLLM `FLASH_ATTN_MLA_SPARSE` on H200 (BF16 cache, rope-free latent).
-const SPARSE_ATTENTION_BACKENDS: &[&str] = &[FA3_SPARSE_BACKEND];
 /// vLLM's `FlashAttnPrefillBackend` FA3 varlen calls of dense-MHA prefill.
 const DENSE_PREFILL_ATTENTION_BACKENDS: &[&str] = &["vllm_fa3"];
 const FUSED_MOE_BACKENDS: &[&str] = &["vllm_triton"];
@@ -167,6 +168,9 @@ pub struct Glm53FlashSpecParallel {
     /// vLLM's captured CUDA-graph sizes; empty runs eager (no padding).
     pub cudagraph_capture_sizes: Vec<u32>,
     pub draft_tokens: u32,
+    /// vLLM's sparse-MLA backend for the MQA rows: `FLASH_ATTN_MLA_SPARSE`
+    /// (the production recipe without nvcc on PATH) unless set.
+    pub sparse_mla_backend: SparseMlaBackend,
 }
 
 /// The routing demand of each MoE forward kind: the body and the MTP step 0
@@ -233,6 +237,14 @@ pub fn build_configs(
         }
         Ok(value / tp)
     };
+    if parallel.sparse_mla_backend == SparseMlaBackend::FlashinferMlaSparseSm90
+        && flashinfer_sm90_clusters(&parallel.gpu_name).is_none()
+    {
+        return Err(fit_failed(format!(
+            "flashinfer_mla_sparse_sm90 is costed only on NVIDIA H200 (its planner waves), got {}",
+            parallel.gpu_name
+        )));
+    }
     if model.index_topk + model.index_kpool - 1 > SELECTED_K {
         return Err(fit_failed(
             "pooled indexer window exceeds the 2176-wide page table",
@@ -319,7 +331,7 @@ pub fn build_configs(
             mqa_logits_prefill_backends: MQA_LOGITS_PREFILL_BACKENDS.to_vec(),
             topk_prefill_backends: TOPK_PREFILL_BACKENDS.to_vec(),
             mla_cache_append_backends: MLA_APPEND_BACKENDS.to_vec(),
-            sparse_attention_backends: SPARSE_ATTENTION_BACKENDS.to_vec(),
+            sparse_mla_backend: parallel.sparse_mla_backend,
             dense_prefill_attention_backends: DENSE_PREFILL_ATTENTION_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
         },
@@ -1530,6 +1542,7 @@ mod tests {
                 gpu_name: "NVIDIA H200".into(),
                 cudagraph_capture_sizes: vec![1, 2, 4, 6, 8, 12, 16, 24, 32, 512],
                 draft_tokens: 5,
+                sparse_mla_backend: SparseMlaBackend::default(),
             },
             &Glm53FlashSpecDemand {
                 body: uniform.clone(),

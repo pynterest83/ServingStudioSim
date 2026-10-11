@@ -40,6 +40,15 @@
 //! `PooledUniformFull` encoding with the same total of valid slots (see
 //! `sparse_attention_input`).
 //!
+//! `SparseMlaBackend::FlashinferMlaSparseSm90` prices the same call as vLLM's
+//! `FLASHINFER_MLA_SPARSE_SM90` (`flashinfer_mla_sparse_sm90.py`, chosen first
+//! when nvcc is on PATH): the backend `vllm_flashinfer_sparse_sm90_bf16` of the
+//! same kind and rows, one `BatchMLAPageAttentionHopperKernel`. Its per-call
+//! preparation is `_pack_topk_indices`, which packs each row's valid prefix of
+//! the remapped slots into the planned CSR page table, in place of FA3's query
+//! zero fill. The once-per-forward plan and `_clamp_work_kv_end` launch are not
+//! priced.
+//!
 //! The BF16 latent is appended with `concat_and_cache_mla<bf16, bf16>`; there is
 //! no query FP8 quant and no query concat (both FP8-cache artifacts on B200).
 //!
@@ -87,7 +96,7 @@ use crate::timing::kernels::{
     GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput, MlaCacheAppendKernel,
     MlaCacheAppendKernelConfig, MlaCacheAppendKernelInput, QKvRmsNormKernel,
     QKvRmsNormKernelConfig, QKvRmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
-    SingleGemmKernelInput, ValidCountsPattern,
+    SingleGemmKernelInput, ValidCountsPattern, FA3_SPARSE_BACKEND, FLASHINFER_SM90_SPARSE_BACKEND,
 };
 use crate::timing::{
     AttnPrefillLog, BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge,
@@ -117,6 +126,41 @@ const DECODE_CAUSAL_FILL_LAUNCHES: u32 = 5;
 /// FA3's q/k width on vLLM's rope-free path: `q` is zeros of this width and
 /// `k` the first this-many latent columns (`_FA3_QV_HEAD_DIM`).
 const FA3_QK_HEAD_DIM: u32 = 64;
+
+/// vLLM's sparse-MLA attention backend for the MQA rows. `vllm/platforms/cuda.py`
+/// tries `FLASHINFER_MLA_SPARSE_SM90` first for head_size 512 when
+/// `has_flashinfer()` (nvcc on PATH), else `FLASH_ATTN_MLA_SPARSE`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SparseMlaBackend {
+    /// `FLASH_ATTN_MLA_SPARSE`: an FA3 varlen call over the top-k block table,
+    /// after a zero fill of FA3's 64-wide rope-free query.
+    #[default]
+    FlashAttnMlaSparse,
+    /// `FLASHINFER_MLA_SPARSE_SM90`: FlashInfer's planned MLA run over the
+    /// top-k slots as a page-size-1 CSR page table, after packing each row's
+    /// valid prefix into it.
+    FlashinferMlaSparseSm90,
+}
+
+impl SparseMlaBackend {
+    /// The `dsa_sparse_mla_attention` L1 backend that prices the call.
+    pub fn l1_backend(self) -> &'static str {
+        match self {
+            Self::FlashAttnMlaSparse => FA3_SPARSE_BACKEND,
+            Self::FlashinferMlaSparseSm90 => FLASHINFER_SM90_SPARSE_BACKEND,
+        }
+    }
+
+    /// The slot of the backend's per-call launch ahead of the attention.
+    fn prep_slot(self) -> &'static str {
+        match self {
+            Self::FlashAttnMlaSparse => "sparse_mla.q_rope_zero_fill",
+            Self::FlashinferMlaSparseSm90 => "sparse_mla.pack_indices",
+        }
+    }
+}
+
 /// The synthetic index pattern the pooled sparse-attention rows were measured
 /// with (as the B200 pooled decode).
 const SPARSE_INDEX_DISTRIBUTION: &str = "unique_scattered_pages";
@@ -153,7 +197,7 @@ pub struct Glm53DsaSpecAttnLocalWorkletConfig {
     pub mqa_logits_prefill_backends: Vec<&'static str>,
     pub topk_prefill_backends: Vec<&'static str>,
     pub mla_cache_append_backends: Vec<&'static str>,
-    pub sparse_attention_backends: Vec<&'static str>,
+    pub sparse_mla_backend: SparseMlaBackend,
     /// Dense-MHA prefill FA3 calls (`flashinfer_attn_prefill` / `_rect`).
     pub dense_prefill_attention_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
@@ -193,7 +237,8 @@ pub struct Glm53DsaSpecAttnLocalWorkletResolved {
     pub merge_attn_states: ElementwiseKernelConfig,
     pub q_absorb: BatchedGemmKernelConfig,
     pub index_remap: ElementwiseKernelConfig,
-    pub q_rope_zero_fill: ElementwiseKernelConfig,
+    /// FA3's query zero fill or FlashInfer's index pack (`SparseMlaBackend`).
+    pub sparse_prep: ElementwiseKernelConfig,
     pub sparse_attention: DsaSparseMlaAttentionKernelConfig,
     pub v_up: BatchedGemmKernelConfig,
     pub o_proj: SingleGemmKernelConfig,
@@ -251,7 +296,7 @@ pub struct Glm53DsaSpecAttnLocalWorklet {
     pub merge_attn_states: Op<ElementwiseKernel>,
     pub q_absorb: Op<BatchedGemmKernel>,
     pub index_remap: Op<ElementwiseKernel>,
-    pub q_rope_zero_fill: Op<ElementwiseKernel>,
+    pub sparse_prep: Op<ElementwiseKernel>,
     pub sparse_attention: Op<DsaSparseMlaAttentionKernel>,
     pub v_up: Op<BatchedGemmKernel>,
     pub o_proj: Op<SingleGemmKernel>,
@@ -452,10 +497,20 @@ impl Glm53DsaSpecAttnLocalWorklet {
             ),
             // Placeholder: one int32 index row in, one global-slot row out.
             index_remap: ew(4 * cfg.selected_k, 4 * cfg.selected_k),
-            // `q_nope.new_zeros(Q, H, 64)`: written once per MQA row, nothing read.
-            q_rope_zero_fill: ew(0, heads * FA3_QK_HEAD_DIM * bf16.size_bytes()),
+            sparse_prep: match cfg.sparse_mla_backend {
+                // `q_nope.new_zeros(Q, H, 64)`: written once per MQA row, nothing read.
+                SparseMlaBackend::FlashAttnMlaSparse => {
+                    ew(0, heads * FA3_QK_HEAD_DIM * bf16.size_bytes())
+                }
+                // Placeholder: `_pack_topk_indices` reads a row's valid prefix of
+                // the int32 slot row and writes it to the page table, at most
+                // `selected_k` slots each way.
+                SparseMlaBackend::FlashinferMlaSparseSm90 => {
+                    ew(4 * cfg.selected_k, 4 * cfg.selected_k)
+                }
+            },
             sparse_attention: DsaSparseMlaAttentionKernelConfig {
-                backends: cfg.sparse_attention_backends.clone(),
+                backends: vec![cfg.sparse_mla_backend.l1_backend()],
                 gpu_name: cfg.gpu_name.clone(),
                 num_heads: cfg.num_heads.clone(),
                 num_kv_heads: Dim::param("num_kv_heads", 1),
@@ -582,7 +637,7 @@ impl Glm53DsaSpecAttnLocalWorklet {
             merge_attn_states: ew("dense_prefill.merge_attn_states", r.merge_attn_states)?,
             q_absorb: atomic(n, "q_absorb", r.q_absorb, BatchedGemmKernel::build, bridge)?,
             index_remap: ew("sparse_mla.index_remap", r.index_remap)?,
-            q_rope_zero_fill: ew("sparse_mla.q_rope_zero_fill", r.q_rope_zero_fill)?,
+            sparse_prep: ew(r.raw_cfg.sparse_mla_backend.prep_slot(), r.sparse_prep)?,
             sparse_attention: atomic(
                 n,
                 "sparse_mla.attention",
@@ -648,7 +703,7 @@ impl Glm53DsaSpecAttnLocalWorklet {
                 self.merge_attn_states.compile(builder),
                 self.q_absorb.compile(builder),
                 self.index_remap.compile(builder),
-                self.q_rope_zero_fill.compile(builder),
+                self.sparse_prep.compile(builder),
                 self.sparse_attention.compile(builder),
                 self.v_up.compile(builder),
                 self.o_proj.compile(builder),
@@ -831,7 +886,7 @@ impl Glm53DsaSpecAttnLocalWorklet {
             ev,
         );
         push_or_zero(&self.index_remap, tokens(mqa), mqa == 0, ev);
-        push_or_zero(&self.q_rope_zero_fill, tokens(mqa), mqa == 0, ev);
+        push_or_zero(&self.sparse_prep, tokens(mqa), mqa == 0, ev);
         push_or_zero(
             &self.sparse_attention,
             DsaSparseMlaAttentionKernelInput {
@@ -1089,7 +1144,7 @@ mod tests {
             mqa_logits_prefill_backends: vec!["deepgemm_fp8"],
             topk_prefill_backends: vec!["vllm_cuda"],
             mla_cache_append_backends: vec!["vllm_cuda"],
-            sparse_attention_backends: vec![crate::timing::kernels::FA3_SPARSE_BACKEND],
+            sparse_mla_backend: SparseMlaBackend::default(),
             dense_prefill_attention_backends: vec!["vllm_fa3"],
             elementwise_backends: vec!["triton"],
         }
@@ -1221,8 +1276,39 @@ mod tests {
                 index_kpool: 4
             }
         );
-        assert_eq!(r.q_rope_zero_fill.input_bytes_per_token.get(), 0);
-        assert_eq!(r.q_rope_zero_fill.output_bytes_per_token.get(), 16 * 64 * 2);
+        assert_eq!(r.sparse_prep.input_bytes_per_token.get(), 0);
+        assert_eq!(r.sparse_prep.output_bytes_per_token.get(), 16 * 64 * 2);
+    }
+
+    /// Catches the FlashInfer option pricing the call on another L1 identity
+    /// than FA3's (only the backend may differ) or keeping FA3's zero fill in
+    /// place of the per-call index pack.
+    #[test]
+    fn flashinfer_option_swaps_the_l1_backend_and_the_prep_launch() {
+        let fa3 = Glm53DsaSpecAttnLocalWorklet::resolve_config(&cfg());
+        let fi =
+            Glm53DsaSpecAttnLocalWorklet::resolve_config(&Glm53DsaSpecAttnLocalWorkletConfig {
+                sparse_mla_backend: SparseMlaBackend::FlashinferMlaSparseSm90,
+                ..cfg()
+            });
+        assert_eq!(
+            fi.sparse_attention.backends,
+            vec!["vllm_flashinfer_sparse_sm90_bf16"]
+        );
+        let mut same = fi.sparse_attention.clone();
+        same.backends = fa3.sparse_attention.backends.clone();
+        assert_eq!(same, fa3.sparse_attention);
+        assert_eq!(fi.sparse_prep.input_bytes_per_token.get(), 4 * 2176);
+        assert_eq!(fi.sparse_prep.output_bytes_per_token.get(), 4 * 2176);
+        assert_eq!(fi.sparse_prep, fi.index_remap);
+        assert_eq!(
+            SparseMlaBackend::FlashinferMlaSparseSm90.prep_slot(),
+            "sparse_mla.pack_indices"
+        );
+        assert_eq!(
+            SparseMlaBackend::default().prep_slot(),
+            "sparse_mla.q_rope_zero_fill"
+        );
     }
 
     /// Catches a sparse call priced at the wrong total of valid slots: verify

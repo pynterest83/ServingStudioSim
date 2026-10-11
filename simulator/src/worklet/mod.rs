@@ -176,7 +176,7 @@ pub use glm53_dsa_attn_local::{
 };
 pub use glm53_dsa_spec_attn_local::{
     Glm53DsaSpecAttnLocalWorklet, Glm53DsaSpecAttnLocalWorkletConfig,
-    Glm53DsaSpecAttnLocalWorkletInput, Glm53DsaSpecAttnLocalWorkletResolved,
+    Glm53DsaSpecAttnLocalWorkletInput, Glm53DsaSpecAttnLocalWorkletResolved, SparseMlaBackend,
 };
 pub use glm53_fp8_mlp_local::{
     Glm53Fp8MlpLocalWorklet, Glm53Fp8MlpLocalWorkletConfig, Glm53Fp8MlpLocalWorkletInput,
