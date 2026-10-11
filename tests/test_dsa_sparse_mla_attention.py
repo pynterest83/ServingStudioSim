@@ -97,6 +97,7 @@ def test_registration_support_family_environment_and_facades() -> None:
         "flashinfer_trtllm_fp8",
         "vllm_flashmla_bf16",
         "vllm_fa3_sparse_bf16",
+        "vllm_flashinfer_sparse_sm90_bf16",
     ]
     for spec in (torch_spec, flashmla_spec):
         assert spec.kernel_kind == spec.table_name == KIND

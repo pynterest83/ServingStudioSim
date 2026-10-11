@@ -69,7 +69,9 @@ DOC = KernelDoc(
         "counts only fmhaSm100, and vllm_flashmla_bf16 only "
         "sparse_attn_fwd_kernel. vllm_fa3_sparse_bf16 counts every launch of "
         "one FA3 call: prepare_varlen_num_blocks, FlashAttnFwdSm90 and, when FA3 "
-        "splits the keys, FlashAttnFwdCombine. Setup and output checks run before timing."
+        "splits the keys, FlashAttnFwdCombine. vllm_flashinfer_sparse_sm90_bf16 counts "
+        "only BatchMLAPageAttentionHopperKernel, the one launch of FlashInfer's planned "
+        "MLA run. Setup and output checks run before timing."
     ),
     caveats=(
         "Selected positions and tensor values are constructed, not taken from "
@@ -85,6 +87,13 @@ DOC = KernelDoc(
         " outputs, even for backends that return only the attention output.",
         "vllm_fa3_sparse_bf16 excludes vLLM's per-call zero fill of the 64-wide "
         "query that FA3's rope-free path takes in place of a RoPE query.",
+        "vllm_flashinfer_sparse_sm90_bf16 accepts only rope_dim = 0 with the "
+        "token_major_mqa_bf16_latent layout and GLM-5.3-Flash's pooled counts "
+        "(at most index_topk + index_kpool - 1 = 2051 per row). It measures a fresh "
+        "plan from the per-row host bounds plus vLLM's 32-token slack, trimmed on device "
+        "to the exact counts; production reuses a plan while the bounds stay inside "
+        "the slack. The plan, its kv_end clamp and the per-call index pack are "
+        "separate launches outside the timed run.",
     ),
     reference="profiling.runners.attention.dsa_sparse_mla_attention_reference",
 )
@@ -199,6 +208,43 @@ register(
             url=(
                 "https://github.com/vllm-project/vllm/blob/main/"
                 "vllm/v1/attention/backends/mla/flashattn_mla_sparse.py"
+            ),
+        ),
+    )
+)
+
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_flashinfer_sparse_sm90_bf16",
+        # vLLM FlashInferMLASparseSM90Backend.supports_compute_capability: major
+        # == 9; FlashInfer JIT-builds its BatchMLAPagedAttention FA3 (Hopper
+        # wgmma/TMA) module for sm_90a. The backend also admits FP8 caches; only
+        # the BF16 cache H200 GLM-5.3-Flash serves is profiled here.
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            kv=frozenset({DType.BF16}),
+            sm_targets=frozenset({"sm_90a"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.dsa_sparse_mla_flashinfer_sm90",
+            function_name="profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_bf16",
+        ),
+        table_name=KIND,
+        args_schema=DsaSparseMlaAttentionArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's FLASHINFER_MLA_SPARSE_SM90: FlashInfer's planned "
+                "BatchMLAPagedAttentionWrapper (FA3) run over rope-free BF16 latent rows, "
+                "with the selected rows packed as a page-size-1 CSR page table, on H200."
+            ),
+            url=(
+                "https://github.com/vllm-project/vllm/blob/main/"
+                "vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py"
             ),
         ),
     )
