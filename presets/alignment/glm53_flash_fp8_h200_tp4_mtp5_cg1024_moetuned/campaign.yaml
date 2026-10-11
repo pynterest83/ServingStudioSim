@@ -1,0 +1,882 @@
+schema_version: 1
+pack: glm53_flash_fp8_h200_tp4_mtp5_cg1024_moetuned
+description: >-
+  Step-2 baseline after Tock 2 (retained 2026-10-11): glm53_flash_fp8_h200_tp4_mtp5_cg1024 plus vLLM's Triton
+  fused-MoE config tuned for E=288,N=512,NVIDIA_H200,fp8_w8a8,block_shape=[128,128] (moe_configs/, sha256 212d200c...).
+  Measured over 5 interleaved passes: case 10 +3.1%, case 05 +7.7% output tok/s/GPU (logs/20261010_3_glm53_h200_tock2).
+  Profile passes MUST export VLLM_TUNED_CONFIG_FOLDER=<this pack>/moe_configs; the simulator MUST use the profile DB
+  whose vllm_fused_moe rows were measured with that config (VIBESIM_PROFILE_DB, see recorded_on). cg1024 pack below:
+  Step-2 baseline after Tock 1 (retained 2026-10-10): identical to glm53_flash_fp8_h200_tp4_mtp5 except
+  --max-cudagraph-capture-size 1024 (measured case 10 +34.0% output tok/s/GPU over 3 interleaved passes,
+  logs/20261010_1_glm53_h200_tock1) and the KV pools that setting leaves. Base pack below:
+  GLM-5.3-Flash FP8 on H200 in the production deployment (vLLM v0.31.0 fork, TP4/DP1 without
+  expert parallelism, BF16 KV cache, MTP with 5 speculative tokens; https://recipes.vllm.ai/zai-org/GLM-5.3-Flash
+  adapted to Hopper). Cases 01-13 reuse the B200 TP4/EP4 matrix's shapes, repeats and concurrency so the two
+  GPUs stay comparable. Cases 14/15 are left out until their pinned KV pools are re-derived for the BF16 KV
+  footprint. The measured side (profile passes) is the production engine; the simulated side is the H200
+  speculative arch (Triton fused MoE without EP, FLASH_ATTN_MLA_SPARSE FA3, FlashKDA, MTP 5) with the
+  host-time worker model. Measurements taken before the 2026-10-08 node tuning (see recorded_on.host_conditions)
+  are not comparable with measurements taken after it.
+recorded_on:
+  host: h200
+  gpu: NVIDIA H200
+  # Shared read-only copy (team10-obs PVC); weights and config identical to the B200 pack's 03eb5366.
+  checkpoint_snapshots: {glm53_flash: GLM-5.3-Flash@eb9eb208eb0d988989d07a6a12d0fdeb5f52574a}
+  nsys_version: 2025.5.2
+  device_roles: {primary: '4,5,6,7'}
+  # Measurement contract since 2026-10-08 (node hgx45 CPU tuning by the admins; lost on node reboot).
+  # Baselines measured before it (logs/20261007_0_glm53_flash_h200_campaign, untuned: default governor,
+  # C-states on) are not comparable with baselines measured under it. Before every GPU pass: no other process
+  # on GPUs 4-7 and the CPU governor below, else stop. During it: clocks.sm, power.draw, temperature.gpu and
+  # clocks_event_reasons are sampled. A HW slowdown, thermal (HW or SW) or HW power-brake event makes the pass
+  # unclean and it is re-measured. SW power cap at the 700 W limit is part of the default boost policy: its share of
+  # loaded samples and the median SM clock while capped are recorded in each pass's provenance, not rejected.
+  host_conditions:
+    since: '2026-10-08'
+    # Never locked, from the first measurement on (corrected 2026-10-09: the 1980 MHz read earlier was the
+    # boost clock under load; ~345 MHz idle is normal). profile.db rows and all baselines share this policy.
+    gpu_clock_policy: default boost, unlocked
+    cpu_governor: performance          # CPUs 48-95 and 144-191 (NUMA 2-3, the GPU 4-7 side)
+    cpu_cstates_disabled: [C1E, C6]
+    smt_contention: about 40% remaining (admin micro-benchmark; launch time 1.5-3.3x faster than before)
+    # Server environment for the re-measurement (exported by the workspace .env; the vLLM server inherits it):
+    # VLLM_DEEP_GEMM_WARMUP=full (default "relax" is a heuristic; the untuned case-03 workload pass had two
+    # ~2.7 s mid-replay stalls with no Triton JIT warning), and persistent VLLM_CACHE_ROOT / TRITON_CACHE_DIR /
+    # TORCHINDUCTOR_CACHE_DIR outside any worktree so JIT/compile work is reused across runs.
+    server_env: {VLLM_DEEP_GEMM_WARMUP: full, VLLM_TUNED_CONFIG_FOLDER: <pack>/moe_configs}
+    # The pack schema cannot carry server env without a python_runtime package list, so the run script exports
+    # VLLM_TUNED_CONFIG_FOLDER (never the workspace .env: the cg1024 baseline must keep the default config). Check the
+    # server log says "Using configuration from .../moe_configs/E=288,N=512,..." and never "Using default MoE config".
+    # Simulator side: VIBESIM_PROFILE_DB=logs/20261010_3_glm53_h200_tock2/profile_cg1024_moetuned.db (634 tuned
+    # vllm_fused_moe rows, _db_metadata key `variant` names the config and its sha256; the shared profile.db keeps the
+    # default-config rows of the production pack).
+variants:
+  tp4_dp1_mtp5:
+    deployment: unified
+    gpu: NVIDIA H200
+    replicas: 1
+    checkpoint: glm53_flash
+    engine: vllm
+    backend: vllm_tokens
+    run_name_prefix: glm53_flash_h200_tp4_mtp5_cg1024_moetuned
+    server:
+      tp_size: 4
+      dp_size: 1
+      # vLLM v0.31's own default on a >=70 GiB, <160 GiB GPU (OpenAI server): the production chunk budget.
+      chunk_size: 8192
+      # Tock 1 trial (2026-10-10): the ONLY change from glm53_flash_fp8_h200_tp4_mtp5 -> --max-cudagraph-capture-size 1024.
+      max_cudagraph_capture_size: 1024
+      enable_server_load_tracking: true
+      # Production runs 1 (v0.31 default at DP1). 4 keeps HTTP ingress serialization (~0.75 ms/request on
+      # GLM-5.3-Flash TP4) out of the engine's arrival pattern, which the simulator does not model.
+      api_server_count: 4
+      # No --enable-expert-parallel (production runs the 288 experts on every rank with the Triton FP8 MoE).
+      # `auto` keeps the checkpoint dtype: Hopper has no sparse-MLA backend for an FP8 KV cache.
+      # Multimodal input off (production serves it but the matrix is text-only): the vllm_tokens backend
+      # starts vLLM with --tokens-only, and v0.31 refuses to build Glm5NextMultiModalProcessor without a
+      # tokenizer. Same flag as the B200 pack; check the attention/MoE backends still match production.
+      extra_args: [--kv-cache-dtype, auto, --speculative-config, '{"method":"mtp","num_speculative_tokens":5}',
+        --limit-mm-per-prompt, '{"image":0,"video":0}']
+    # The H200 production arch: TP4 without EP, Triton FP8 fused MoE, FLASH_ATTN_MLA_SPARSE (FA3) with a
+    # BF16 cache, FlashKDA prefill, MTP-5 drafter. Routing: this pack's own case-03 capture (43 layers incl.
+    # MTP). Path relative to this pack (repo logs/, local evidence) until it is hosted by repository and revision (the user uploads it).
+    arch:
+      type: glm53_flash_vllm_fp8_kda_dsa_moe_speculative
+      model_config: model/config/glm53_flash.json
+      fp8: true
+      tp_size: 4
+      draft_tokens: 5
+      routing: corpus
+      token_corpus_file: ../../../logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32/profile_corpus/token_corpus/manifest.json
+      # vLLM's capture sizes at --max-cudagraph-capture-size 1024 (server log of the Tock 1 trial; MTP 5 adds 6 and 12).
+      cudagraph_capture_sizes: [1, 2, 4, 6, 8, 12, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120,
+        128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304,
+        320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512,
+        528, 544, 560, 576, 592, 608, 624, 640, 656, 672, 688, 704, 720, 736, 752, 768, 784, 800, 816, 832, 848, 864, 880, 896, 912, 928, 944, 960, 976, 992, 1008, 1024]
+    # Speculative worker on the hybrid KV store (recurrent state pinned per request). No gpu_time_multiplier:
+    # the host-time model replaces it, cycle = max(kernel + host_fixed, host_floor[graph mode]).
+    # Host values fitted ONLY on the tuned-host (2026-10-08) WORKLOAD passes of cases 03/04/05/10 (4199 engine
+    # steps; kernel time + graph mode from timing-predict of the workload iterations; logs/20261008_5_glm53_flash_
+    # h200_tuned/host_fit/workload_pooled.json): fixed 1.02 ms, eager-with-prefill 153.7 ms (binds 438), eager
+    # decode-only 125.1 ms (binds 816); full-graph and piecewise floors never bind (kernel + fixed is always
+    # above them) and are set to 0. Cycle |error| p50 2.1% / p90 7.3%, total +0.7%. The nsys passes are not used:
+    # nsys tracing inflates the eager host floor (~155-165 ms vs ~111-123 ms).
+    worker: {type: speculative, max_batch_tokens: 8192, batch_policy: mix, draft_tokens: 5, acceptance_seed: 73,
+      host_fixed_ms: 1.02, host_floor_full_graph_ms: 0.0, host_floor_piecewise_ms: 0.0,
+      host_floor_eager_prefill_ms: 153.65, host_floor_eager_decode_ms: 125.13,
+      # vLLM-reproduction rule (a framework constraint, not a target design): the hybrid prompt's last
+      # cacheable prefill chunk stops one block early under the MTP drafter (use_eagle_block_drop).
+      eagle_block_drop: true,
+      # vLLM framework limitation reproduced for the baseline, not an optimization target: async scheduling's
+      # one-step-ahead batch formation (trailing verify row, first-input startup step, k+2 pickup).
+      async_scheduling: true,
+      # Median first-token offset after the computing step's end, 12 initial-burst waves of the 03/05 workload passes.
+      async_output_processing_ms: 0.4}
+    profile_passes:
+    - {kind: workload_metrics, name: profile_workload, trace: workload, warmup: true}
+    - {kind: nsys, name: profile_nsys, trace: kernel, warmup: true}
+    # Measured routing demand of every accepted token, body and MTP layer (openai backend, the one that
+    # returns routes). No EP, so no expert-load stream is taken.
+    - {kind: token_corpus, name: profile_corpus, trace: workload}
+    input_builder: {type: speculative_engine_text, draft_tokens: 5, measured_phase: forward, group_assignment: per_dp_rank}
+    label_rules: label_rules/manifest.json
+cases:
+- index: 1
+  name: micro_throughput_c256
+  variant: tp4_dp1_mtp5
+  purpose: Maximum request batching and scheduler pressure.
+  coverage:
+  - batching
+  - scheduler_pressure
+  max_model_len: 8192
+  max_concurrency: 256
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.92
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/01_micro_throughput_c256.csv
+    shapes:
+    - - 16
+      - 16
+    - - 32
+      - 32
+    - - 64
+      - 64
+    - - 128
+      - 64
+    repeats: 256
+  attn_gpu_memory_gb:
+    value: 40.09
+    status: provisional
+    derived_from: 'per-GPU `Available KV cache memory: 37.34 GiB` in the H200 production recipe run (vLLM v0.31.0,
+      TP4, BF16 KV, MTP 5, gpu_memory_utilization 0.92, max_model_len 1048576); replace with this case''s own workload-pass
+      value'
+    evidence: reports/glm53-flash/evidence/vllm-0.31-recipe-h200.log (workspace root)
+  speculative_acceptance:
+    value: [0.7384, 0.5747, 0.5745, 0.5937, 0.6686]
+    status: provisional
+    derived_from: case 03 (balanced_anchor_c32) measured chain; replace with this case's own workload-pass
+      spec_decode_metrics.json (measured chains range 2.5-4.5 accepted tokens per verify across cases)
+    evidence: logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32/profile_workload/spec_decode_metrics.json
+  provenance:
+    derived_from_pack: glm53_flash_fp8_b200_tp4_ep4 case 01 (same shapes, repeats and concurrency)
+- index: 2
+  name: graph_boundaries_c128
+  variant: tp4_dp1_mtp5
+  purpose: CUDA graph and small-batch kernel boundaries.
+  coverage:
+  - cuda_graph_boundaries
+  - small_batch
+  max_model_len: 8192
+  max_concurrency: 128
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.92
+  capture_seconds: 15.0
+  device_role: primary
+  analyze_iterations:
+  - 0
+  - 239
+  workload_trace:
+    file: traces/02_graph_boundaries_c128.csv
+    shapes:
+    - - 1
+      - 32
+    - - 15
+      - 32
+    - - 16
+      - 32
+    - - 31
+      - 32
+    - - 32
+      - 32
+    - - 63
+      - 64
+    - - 64
+      - 64
+    - - 127
+      - 64
+    - - 128
+      - 64
+    - - 255
+      - 64
+    - - 256
+      - 64
+    repeats: 48
+  attn_gpu_memory_gb:
+    value: 40.09
+    status: provisional
+    derived_from: 'per-GPU `Available KV cache memory: 37.34 GiB` in the H200 production recipe run (vLLM v0.31.0,
+      TP4, BF16 KV, MTP 5, gpu_memory_utilization 0.92, max_model_len 1048576); replace with this case''s own workload-pass
+      value'
+    evidence: reports/glm53-flash/evidence/vllm-0.31-recipe-h200.log (workspace root)
+  speculative_acceptance:
+    value: [0.7384, 0.5747, 0.5745, 0.5937, 0.6686]
+    status: provisional
+    derived_from: case 03 (balanced_anchor_c32) measured chain; replace with this case's own workload-pass
+      spec_decode_metrics.json (measured chains range 2.5-4.5 accepted tokens per verify across cases)
+    evidence: logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32/profile_workload/spec_decode_metrics.json
+  provenance:
+    derived_from_pack: glm53_flash_fp8_b200_tp4_ep4 case 02 (same shapes, repeats and concurrency)
+- index: 3
+  name: balanced_anchor_c32
+  variant: tp4_dp1_mtp5
+  purpose: Comparable extension of the existing c32 anchor.
+  coverage:
+  - balanced_anchor
+  max_model_len: 8192
+  max_concurrency: 32
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.92
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/03_balanced_anchor_c32.csv
+    shapes:
+    - - 256
+      - 128
+    - - 256
+      - 256
+    - - 1024
+      - 128
+    - - 1024
+      - 256
+    - - 2048
+      - 128
+    - - 2048
+      - 256
+    - - 4096
+      - 128
+    - - 4096
+      - 256
+    repeats: 16
+  attn_gpu_memory_gb:
+    value: 45.133
+    status: measured
+    # Tock 1 trial passes (cg1024): GPU KV cache size 842,137 tokens = 3084 blocks vs 3144 at capture 512
+    # (-60 blocks x 13.94 MiB = -0.817 GiB from the base pack's 45.95). Graph memory profiling 4.62 vs 2.56 GiB.
+    derived_from: 'per-GPU `Available KV cache memory: 42.79 GiB` (GPU KV cache size 858,521 tokens) in this
+      case''s workload pass at max_model_len 8192, gpu_memory_utilization 0.92'
+    evidence: logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32/profile_workload
+  speculative_acceptance:
+    value: [0.7347, 0.5721, 0.5548, 0.6026, 0.6571]
+    status: measured
+    derived_from: consecutive accepted-token count ratios from this case's clean Prometheus replay delta
+      (tuned host, mean acceptance length 2.621, 9400 drafts)
+    evidence: logs/20261008_5_glm53_flash_h200_tuned/03_balanced_anchor_c32/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_per_request:
+    value: acceptance/03_balanced_anchor_c32.json
+    status: measured
+    derived_from: per-request conditional acceptance of draft positions 1-5 (128 requests, 9400
+      verify rounds; acceptance/extract_per_request.py; each trace request draws a chain of its own shape by a fixed hash of its id). Measured on the synthetic enwik9 prompts of this
+      matrix (tokens-only replay); production traffic may have a different per-request distribution.
+    evidence: logs/20261008_5_glm53_flash_h200_tuned/03_balanced_anchor_c32/profile_workload/vllm/glm53_flash_h200_tp4_mtp5_03_balanced_anchor_c32_workload_metrics.jsonl
+  provenance:
+    derived_from_pack: glm53_flash_fp8_b200_tp4_ep4 case 03 (same shapes, repeats and concurrency)
+- index: 4
+  name: prefill_spectrum_c32
+  variant: tp4_dp1_mtp5
+  purpose: Prefill scaling and the 2048-token chunk boundary.
+  coverage:
+  - prefill_scaling
+  - chunk_boundary
+  max_model_len: 8192
+  max_concurrency: 32
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.92
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/04_prefill_spectrum_c32.csv
+    shapes:
+    - - 128
+      - 64
+    - - 512
+      - 64
+    - - 1984
+      - 64
+    - - 2048
+      - 64
+    - - 2112
+      - 64
+    - - 4096
+      - 64
+    - - 6144
+      - 64
+    - - 7168
+      - 64
+    repeats: 16
+  attn_gpu_memory_gb:
+    value: 45.95
+    status: measured
+    derived_from: 'per-GPU `Available KV cache memory: 42.79 GiB` (GPU KV cache size 858,521 tokens) in this
+      case''s workload pass at max_model_len 8192, gpu_memory_utilization 0.92'
+    evidence: logs/20261007_0_glm53_flash_h200_campaign/04_prefill_spectrum_c32/profile_workload
+  speculative_acceptance:
+    value: [0.7324, 0.5467, 0.5080, 0.5180, 0.6058]
+    status: measured
+    derived_from: consecutive accepted-token count ratios from this case's clean Prometheus replay delta
+      (tuned host, mean acceptance length 2.505, 3274 drafts)
+    evidence: logs/20261008_5_glm53_flash_h200_tuned/04_prefill_spectrum_c32/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_per_request:
+    value: acceptance/04_prefill_spectrum_c32.json
+    status: measured
+    derived_from: per-request conditional acceptance of draft positions 1-5 (128 requests, 3274
+      verify rounds; acceptance/extract_per_request.py; each trace request draws a chain of its own shape by a fixed hash of its id). Measured on the synthetic enwik9 prompts of this
+      matrix (tokens-only replay); production traffic may have a different per-request distribution.
+    evidence: logs/20261008_5_glm53_flash_h200_tuned/04_prefill_spectrum_c32/profile_workload/vllm/glm53_flash_h200_tp4_mtp5_04_prefill_spectrum_c32_workload_metrics.jsonl
+  provenance:
+    derived_from_pack: glm53_flash_fp8_b200_tp4_ep4 case 04 (same shapes, repeats and concurrency)
+- index: 5
+  name: decode_spectrum_c64
+  variant: tp4_dp1_mtp5
+  purpose: Decode residence, KV growth, and batch contraction.
+  coverage:
+  - decode_residence
+  - kv_growth
+  max_model_len: 8192
+  max_concurrency: 64
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.92
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/05_decode_spectrum_c64.csv
+    shapes:
+    - - 128
+      - 16
+    - - 128
+      - 128
+    - - 128
+      - 512
+    - - 128
+      - 1024
+    - - 128
+      - 2048
+    - - 128
+      - 4096
+    - - 512
+      - 2048
+    - - 1024
+      - 4096
+    repeats: 16
+  attn_gpu_memory_gb:
+    value: 45.133
+    status: measured
+    # Tock 1 trial passes (cg1024): GPU KV cache size 842,137 tokens = 3084 blocks vs 3144 at capture 512
+    # (-60 blocks x 13.94 MiB = -0.817 GiB from the base pack's 45.95). Graph memory profiling 4.62 vs 2.56 GiB.
+    derived_from: 'per-GPU `Available KV cache memory: 42.79 GiB` (GPU KV cache size 858,521 tokens) in this
+      case''s workload pass at max_model_len 8192, gpu_memory_utilization 0.92'
+    evidence: logs/20261007_0_glm53_flash_h200_campaign/05_decode_spectrum_c64/profile_workload
+  speculative_acceptance:
+    value: [0.8993, 0.8543, 0.8727, 0.8802, 0.9060]
+    status: measured
+    derived_from: consecutive accepted-token count ratios from this case's clean Prometheus replay delta
+      (tuned host, mean acceptance length 4.463, 50107 drafts)
+    evidence: logs/20261008_5_glm53_flash_h200_tuned/05_decode_spectrum_c64/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_per_request:
+    value: acceptance/05_decode_spectrum_c64.json
+    status: measured
+    derived_from: per-request conditional acceptance of draft positions 1-5 (128 requests, 50107
+      verify rounds; acceptance/extract_per_request.py; each trace request draws a chain of its own shape by a fixed hash of its id). Measured on the synthetic enwik9 prompts of this
+      matrix (tokens-only replay); production traffic may have a different per-request distribution.
+    evidence: logs/20261008_5_glm53_flash_h200_tuned/05_decode_spectrum_c64/profile_workload/vllm/glm53_flash_h200_tp4_mtp5_05_decode_spectrum_c64_workload_metrics.jsonl
+  provenance:
+    derived_from_pack: glm53_flash_fp8_b200_tp4_ep4 case 05 (same shapes, repeats and concurrency)
+- index: 6
+  name: long_long_c8
+  variant: tp4_dp1_mtp5
+  purpose: Long-prefill plus long-decode interaction near context capacity.
+  coverage:
+  - long_prefill
+  - long_decode
+  max_model_len: 8192
+  max_concurrency: 8
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.92
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/06_long_long_c8.csv
+    shapes:
+    - - 2048
+      - 4096
+    - - 3072
+      - 3072
+    - - 4096
+      - 3968
+    - - 5120
+      - 2944
+    - - 6144
+      - 1920
+    repeats: 7
+  attn_gpu_memory_gb:
+    value: 40.09
+    status: provisional
+    derived_from: 'per-GPU `Available KV cache memory: 37.34 GiB` in the H200 production recipe run (vLLM v0.31.0,
+      TP4, BF16 KV, MTP 5, gpu_memory_utilization 0.92, max_model_len 1048576); replace with this case''s own workload-pass
+      value'
+    evidence: reports/glm53-flash/evidence/vllm-0.31-recipe-h200.log (workspace root)
+  speculative_acceptance:
+    value: [0.7384, 0.5747, 0.5745, 0.5937, 0.6686]
+    status: provisional
+    derived_from: case 03 (balanced_anchor_c32) measured chain; replace with this case's own workload-pass
+      spec_decode_metrics.json (measured chains range 2.5-4.5 accepted tokens per verify across cases)
+    evidence: logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32/profile_workload/spec_decode_metrics.json
+  provenance:
+    derived_from_pack: glm53_flash_fp8_b200_tp4_ep4 case 06 (same shapes, repeats and concurrency)
+- index: 7
+  name: quadrant_interference_c48
+  variant: tp4_dp1_mtp5
+  purpose: All four IO quadrants sharing continuous batches.
+  coverage:
+  - io_quadrants
+  - continuous_batching
+  max_model_len: 8192
+  max_concurrency: 48
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.92
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/07_quadrant_interference_c48.csv
+    shapes:
+    - - 128
+      - 128
+    - - 128
+      - 4096
+    - - 4096
+      - 128
+    - - 3072
+      - 3072
+    repeats: 24
+  attn_gpu_memory_gb:
+    value: 40.09
+    status: provisional
+    derived_from: 'per-GPU `Available KV cache memory: 37.34 GiB` in the H200 production recipe run (vLLM v0.31.0,
+      TP4, BF16 KV, MTP 5, gpu_memory_utilization 0.92, max_model_len 1048576); replace with this case''s own workload-pass
+      value'
+    evidence: reports/glm53-flash/evidence/vllm-0.31-recipe-h200.log (workspace root)
+  speculative_acceptance:
+    value: [0.7384, 0.5747, 0.5745, 0.5937, 0.6686]
+    status: provisional
+    derived_from: case 03 (balanced_anchor_c32) measured chain; replace with this case's own workload-pass
+      spec_decode_metrics.json (measured chains range 2.5-4.5 accepted tokens per verify across cases)
+    evidence: logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32/profile_workload/spec_decode_metrics.json
+  provenance:
+    derived_from_pack: glm53_flash_fp8_b200_tp4_ep4 case 07 (same shapes, repeats and concurrency)
+- index: 8
+  name: completion_churn_c96
+  variant: tp4_dp1_mtp5
+  purpose: Rapid completions, shrinking batches, and request replacement.
+  coverage:
+  - completion_churn
+  - admission
+  max_model_len: 8192
+  max_concurrency: 96
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.92
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/08_completion_churn_c96.csv
+    shapes:
+    - - 512
+      - 1
+    - - 512
+      - 16
+    - - 512
+      - 64
+    - - 512
+      - 256
+    - - 512
+      - 1024
+    - - 512
+      - 4096
+    repeats: 32
+  attn_gpu_memory_gb:
+    value: 40.09
+    status: provisional
+    derived_from: 'per-GPU `Available KV cache memory: 37.34 GiB` in the H200 production recipe run (vLLM v0.31.0,
+      TP4, BF16 KV, MTP 5, gpu_memory_utilization 0.92, max_model_len 1048576); replace with this case''s own workload-pass
+      value'
+    evidence: reports/glm53-flash/evidence/vllm-0.31-recipe-h200.log (workspace root)
+  speculative_acceptance:
+    value: [0.7384, 0.5747, 0.5745, 0.5937, 0.6686]
+    status: provisional
+    derived_from: case 03 (balanced_anchor_c32) measured chain; replace with this case's own workload-pass
+      spec_decode_metrics.json (measured chains range 2.5-4.5 accepted tokens per verify across cases)
+    evidence: logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32/profile_workload/spec_decode_metrics.json
+  provenance:
+    derived_from_pack: glm53_flash_fp8_b200_tp4_ep4 case 08 (same shapes, repeats and concurrency)
+- index: 9
+  name: rate_knee
+  variant: tp4_dp1_mtp5
+  purpose: Maximum sustainable open-loop request rate.
+  coverage:
+  - arrival_rate_knee
+  max_model_len: 8192
+  max_concurrency: null
+  profile_arrival_mode: trace-timed
+  simulation_arrival_mode: trace_timed
+  gpu_memory_utilization: 0.92
+  capture_seconds: 20.0
+  device_role: primary
+  workload_trace:
+    file: traces/09_rate_knee.csv
+    shapes:
+    - - 128
+      - 128
+    - - 128
+      - 4096
+    - - 4096
+      - 128
+    - - 3072
+      - 3072
+    - - 512
+      - 256
+    - - 2048
+      - 1024
+    - - 6144
+      - 512
+    - - 1024
+      - 4096
+    repeats: 64
+  rate:
+    value: 2.7
+    status: provisional
+    derived_from: B200 knee carried over unchanged; recalibrate as 0.8 x the H200 case-10 saturated request rate
+    evidence: logs/20260925_4_glm53_flash_campaign/10_full_saturation_rate/analysis_e2e.api1 (B200)
+  attn_gpu_memory_gb:
+    value: 40.09
+    status: provisional
+    derived_from: 'per-GPU `Available KV cache memory: 37.34 GiB` in the H200 production recipe run (vLLM v0.31.0,
+      TP4, BF16 KV, MTP 5, gpu_memory_utilization 0.92, max_model_len 1048576); replace with this case''s own workload-pass
+      value'
+    evidence: reports/glm53-flash/evidence/vllm-0.31-recipe-h200.log (workspace root)
+  speculative_acceptance:
+    value: [0.7384, 0.5747, 0.5745, 0.5937, 0.6686]
+    status: provisional
+    derived_from: case 03 (balanced_anchor_c32) measured chain; replace with this case's own workload-pass
+      spec_decode_metrics.json (measured chains range 2.5-4.5 accepted tokens per verify across cases)
+    evidence: logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32/profile_workload/spec_decode_metrics.json
+  provenance:
+    derived_from_pack: glm53_flash_fp8_b200_tp4_ep4 case 09 (same shapes, repeats and concurrency)
+- index: 10
+  name: full_saturation_rate
+  variant: tp4_dp1_mtp5
+  purpose: Peak-throughput open-loop load beyond the sustainable knee.
+  coverage:
+  - saturation
+  - peak_throughput
+  max_model_len: 8192
+  max_concurrency: 256
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.92
+  capture_seconds: 20.0
+  device_role: primary
+  workload_trace:
+    file: traces/10_full_saturation_rate.csv
+    shapes:
+    - - 128
+      - 128
+    - - 128
+      - 4096
+    - - 4096
+      - 128
+    - - 3072
+      - 3072
+    - - 512
+      - 256
+    - - 2048
+      - 1024
+    - - 6144
+      - 512
+    - - 1024
+      - 4096
+    repeats: 64
+  attn_gpu_memory_gb:
+    value: 45.133
+    status: measured
+    # Tock 1 trial passes (cg1024): GPU KV cache size 842,137 tokens = 3084 blocks vs 3144 at capture 512
+    # (-60 blocks x 13.94 MiB = -0.817 GiB from the base pack's 45.95). Graph memory profiling 4.62 vs 2.56 GiB.
+    derived_from: 'per-GPU `Available KV cache memory: 42.79 GiB` (GPU KV cache size 858,521 tokens) in this
+      case''s workload pass at max_model_len 8192, gpu_memory_utilization 0.92'
+    evidence: logs/20261007_0_glm53_flash_h200_campaign/10_full_saturation_rate/profile_workload
+  speculative_acceptance:
+    value: [0.8749, 0.8178, 0.8452, 0.8792, 0.8984]
+    status: measured
+    derived_from: consecutive accepted-token count ratios from this case's clean Prometheus replay delta
+      (tuned host, mean acceptance length 4.204, 202737 drafts)
+    evidence: logs/20261008_5_glm53_flash_h200_tuned/10_full_saturation_rate/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_per_request:
+    value: acceptance/10_full_saturation_rate.json
+    status: measured
+    derived_from: per-request conditional acceptance of draft positions 1-5 (512 requests, 202737
+      verify rounds; acceptance/extract_per_request.py; each trace request draws a chain of its own shape by a fixed hash of its id). Measured on the synthetic enwik9 prompts of this
+      matrix (tokens-only replay); production traffic may have a different per-request distribution.
+    evidence: logs/20261008_5_glm53_flash_h200_tuned/10_full_saturation_rate/profile_workload/vllm/glm53_flash_h200_tp4_mtp5_10_full_saturation_rate_workload_metrics.jsonl
+  provenance:
+    derived_from_pack: glm53_flash_fp8_b200_tp4_ep4 case 10 (same shapes, repeats and concurrency)
+- index: 11
+  name: long_prefill_ladder_c1
+  variant: tp4_dp1_mtp5
+  purpose: '16K-491K prompts: long-prefill ladder at concurrency 1.'
+  coverage:
+  - long_prefill
+  - bounded_kernel_trace
+  max_model_len: 524288
+  max_concurrency: 1
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.92
+  capture_seconds: 120.0
+  device_role: primary
+  workload_trace:
+    file: traces/11_long_prefill_ladder_c1.csv
+    shapes:
+    - - 16384
+      - 16
+    - - 32768
+      - 64
+    - - 65536
+      - 16
+    - - 98304
+      - 64
+    - - 131072
+      - 16
+    - - 196608
+      - 64
+    - - 262144
+      - 16
+    - - 393216
+      - 64
+    - - 458752
+      - 16
+    - - 491520
+      - 64
+    repeats: 2
+  kernel_trace:
+    file: traces/11_long_prefill_ladder_c1.nsys.csv
+    shapes:
+    - - 16384
+      - 16
+    - - 32768
+      - 64
+    - - 65536
+      - 16
+    - - 98304
+      - 64
+    - - 131072
+      - 16
+    - - 196608
+      - 64
+    - - 262144
+      - 16
+    repeats: 1
+    id_suffix: nsys
+  attn_gpu_memory_gb:
+    value: 40.09
+    status: provisional
+    derived_from: 'per-GPU `Available KV cache memory: 37.34 GiB` in the H200 production recipe run (vLLM v0.31.0,
+      TP4, BF16 KV, MTP 5, gpu_memory_utilization 0.92, max_model_len 1048576); replace with this case''s own workload-pass
+      value'
+    evidence: reports/glm53-flash/evidence/vllm-0.31-recipe-h200.log (workspace root)
+  speculative_acceptance:
+    value: [0.7384, 0.5747, 0.5745, 0.5937, 0.6686]
+    status: provisional
+    derived_from: case 03 (balanced_anchor_c32) measured chain; replace with this case's own workload-pass
+      spec_decode_metrics.json (measured chains range 2.5-4.5 accepted tokens per verify across cases)
+    evidence: logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32/profile_workload/spec_decode_metrics.json
+  provenance:
+    derived_from_pack: glm53_flash_fp8_b200_tp4_ep4 case 11 (same shapes, repeats and concurrency)
+- index: 12
+  name: ultra_context_decode_c1
+  variant: tp4_dp1_mtp5
+  purpose: 'Long context plus long output: ultra-context decode at concurrency 1.'
+  coverage:
+  - ultra_context
+  - long_decode
+  max_model_len: 524288
+  max_concurrency: 1
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.92
+  capture_seconds: 120.0
+  device_role: primary
+  workload_trace:
+    file: traces/12_ultra_context_decode_c1.csv
+    shapes:
+    - - 458752
+      - 256
+    - - 458752
+      - 1024
+    - - 458752
+      - 4096
+    - - 262144
+      - 256
+    - - 262144
+      - 1024
+    - - 262144
+      - 4096
+    - - 131072
+      - 256
+    - - 131072
+      - 1024
+    - - 131072
+      - 4096
+    - - 32768
+      - 256
+    - - 32768
+      - 1024
+    - - 32768
+      - 4096
+    - - 8192
+      - 256
+    - - 8192
+      - 1024
+    - - 8192
+      - 4096
+    repeats: 1
+  kernel_trace:
+    file: traces/12_ultra_context_decode_c1.nsys.csv
+    shapes:
+    - - 458752
+      - 64
+    - - 8192
+      - 256
+    - - 12288
+      - 64
+    repeats: 1
+    id_suffix: nsys
+  attn_gpu_memory_gb:
+    value: 43.24
+    status: measured
+    derived_from: 'per-GPU `Available KV cache memory: 40.27 GiB` (GPU KV cache size 3,245,540 tokens) in this
+      case''s workload pass at max_model_len 524288, gpu_memory_utilization 0.92'
+    evidence: logs/20261007_0_glm53_flash_h200_campaign/12_ultra_context_decode_c1/profile_workload
+  speculative_acceptance:
+    value: [0.8794, 0.8219, 0.8397, 0.8856, 0.8749]
+    status: measured
+    derived_from: consecutive accepted-token count ratios from this case's clean Prometheus replay delta
+      (tuned host, mean acceptance length 4.217, 6378 drafts)
+    evidence: logs/20261008_5_glm53_flash_h200_tuned/12_ultra_context_decode_c1/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_per_request:
+    value: acceptance/12_ultra_context_decode_c1.json
+    status: measured
+    derived_from: per-request conditional acceptance of draft positions 1-5 (15 requests, 6378
+      verify rounds; acceptance/extract_per_request.py; each trace request draws a chain of its own shape by a fixed hash of its id). Measured on the synthetic enwik9 prompts of this
+      matrix (tokens-only replay); production traffic may have a different per-request distribution.
+    evidence: logs/20261008_5_glm53_flash_h200_tuned/12_ultra_context_decode_c1/profile_workload/vllm/glm53_flash_h200_tp4_mtp5_12_ultra_context_decode_c1_workload_metrics.jsonl
+  provenance:
+    derived_from_pack: glm53_flash_fp8_b200_tp4_ep4 case 12 (same shapes, repeats and concurrency)
+- index: 13
+  name: generation_length_matrix_c8
+  variant: tp4_dp1_mtp5
+  purpose: Mixed prompt and output lengths across a generation-length matrix.
+  coverage:
+  - generation_length_matrix
+  max_model_len: 131072
+  max_concurrency: 8
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.92
+  capture_seconds: 60.0
+  device_role: primary
+  workload_trace:
+    file: traces/13_generation_length_matrix_c8.csv
+    shapes:
+    - - 128
+      - 4096
+    - - 128
+      - 8192
+    - - 128
+      - 16384
+    - - 128
+      - 32768
+    - - 512
+      - 4096
+    - - 512
+      - 8192
+    - - 512
+      - 16384
+    - - 512
+      - 32768
+    - - 2048
+      - 4096
+    - - 2048
+      - 8192
+    - - 2048
+      - 16384
+    - - 2048
+      - 32768
+    - - 8192
+      - 4096
+    - - 8192
+      - 8192
+    - - 8192
+      - 16384
+    - - 8192
+      - 32768
+    - - 16384
+      - 4096
+    - - 16384
+      - 8192
+    - - 16384
+      - 16384
+    - - 16384
+      - 32768
+    - - 32768
+      - 4096
+    - - 32768
+      - 8192
+    - - 32768
+      - 16384
+    - - 32768
+      - 32768
+    repeats: 1
+  kernel_trace:
+    file: traces/13_generation_length_matrix_c8.nsys.csv
+    shapes:
+    - - 128
+      - 256
+    - - 512
+      - 256
+    - - 2048
+      - 256
+    - - 8192
+      - 256
+    - - 16384
+      - 256
+    - - 32768
+      - 256
+    - - 4096
+      - 256
+    - - 24576
+      - 256
+    repeats: 1
+    id_suffix: nsys
+  attn_gpu_memory_gb:
+    value: 40.09
+    status: provisional
+    derived_from: 'per-GPU `Available KV cache memory: 37.34 GiB` in the H200 production recipe run (vLLM v0.31.0,
+      TP4, BF16 KV, MTP 5, gpu_memory_utilization 0.92, max_model_len 1048576); replace with this case''s own workload-pass
+      value'
+    evidence: reports/glm53-flash/evidence/vllm-0.31-recipe-h200.log (workspace root)
+  speculative_acceptance:
+    value: [0.7384, 0.5747, 0.5745, 0.5937, 0.6686]
+    status: provisional
+    derived_from: case 03 (balanced_anchor_c32) measured chain; replace with this case's own workload-pass
+      spec_decode_metrics.json (measured chains range 2.5-4.5 accepted tokens per verify across cases)
+    evidence: logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32/profile_workload/spec_decode_metrics.json
+  provenance:
+    derived_from_pack: glm53_flash_fp8_b200_tp4_ep4 case 13 (same shapes, repeats and concurrency)
