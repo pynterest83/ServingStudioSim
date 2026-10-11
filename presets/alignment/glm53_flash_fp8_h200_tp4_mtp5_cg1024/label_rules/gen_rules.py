@@ -16,6 +16,10 @@ import json
 import sys
 
 SRC = "logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32"
+# FLASHINFER_MLA_SPARSE_SM90 capture of case 10 (vLLM picks it first when nvcc is on PATH;
+# the arch's sparse_mla_backend: flashinfer_mla_sparse_sm90). Its kernels never co-occur
+# with FA3's in one capture.
+FI_SRC = "logs/20261010_1_glm53_h200_tock1/runs/Tn/10_full_saturation_rate"
 MTP = "unified.mtp."
 rules = []
 ROLE = {}
@@ -195,13 +199,21 @@ for s, role in [
         ("dense_prefill.kv_b_proj", "dense-MHA prefill kv_b up projection"),
         ("q_absorb", "MLA W_UK query absorb bmm"),
         ("sparse_mla.index_remap", "sparse MLA request-to-global index remap"),
-        ("sparse_mla.q_rope_zero_fill", "zero fill of FA3's 64-wide rope-free query"),
         ("v_up", "MLA W_UV value up bmm"),
         ("o_proj", "DSA output projection")]:
     op(D + s, role, [D + s])
 op(D + "dense_prefill.attention", "dense-MHA prefill FlashAttention-3 varlen call (prepare + mainloop)",
    [D + "dense_prefill.attention"])
-op(D + "sparse_mla", "FLASH_ATTN_MLA_SPARSE: one FA3 call per layer (prepare_varlen, mainloop, combine)",
+# The sparse-MLA backend's per-call launch ahead of the attention has a backend-specific
+# slot, and the cost manifest carries only the selected backend's. Each operation lists
+# both so the one rule set resolves against either manifest (a rule body is resolved
+# whether or not it fires); the kernel names pick the operation.
+PREP_SLOTS = [D + "sparse_mla.q_rope_zero_fill", D + "sparse_mla.pack_indices"]
+op(D + "sparse_mla.q_rope_zero_fill", "zero fill of FA3's 64-wide rope-free query", PREP_SLOTS)
+op(D + "sparse_mla.pack_indices", "FLASHINFER_MLA_SPARSE_SM90 pack of each row's valid top-k "
+   "slots into the planned CSR page table (_pack_topk_indices)", PREP_SLOTS)
+op(D + "sparse_mla", "one sparse-MLA call per layer: FLASH_ATTN_MLA_SPARSE's FA3 call (prepare_varlen, "
+   "mainloop, combine) or FLASHINFER_MLA_SPARSE_SM90's BatchMLAPageAttentionHopperKernel",
    [D + "sparse_mla.attention"])
 op(D + "glue", "DSA index/mask plumbing around the indexer (fills, copies, aranges, compares), "
    "with the prefill-only plumbing", [D + "glue", D + "indexer_glue", D + "prefill_glue"])
@@ -254,6 +266,10 @@ def dsa_chain(P):
     M(q + "sparse_mla", "prepare_varlen_num_blocks", after=q + "sparse_mla.q_rope_zero_fill")
     M(q + "sparse_mla", "FlashAttnFwdSm90", after=q + "sparse_mla")
     M(q + "sparse_mla", "FlashAttnFwdCombine", after=q + "sparse_mla")
+    M(q + "sparse_mla.pack_indices", "_pack_topk_indices", after=q + "sparse_mla.index_remap",
+      source_experiment=FI_SRC)
+    M(q + "sparse_mla", "BatchMLAPageAttentionHopperKernel", after=q + "sparse_mla.pack_indices",
+      source_experiment=FI_SRC)
     # a prefill-only forward has no MQA rows: o_proj follows the dense call
     M(q + "o_proj", "_TNN", after=q + "dense_prefill.attention")
     M(q + "o_proj", "_TNT", after=q + "dense_prefill.attention")
@@ -403,6 +419,9 @@ M("mtp.argmax", "ArgMaxOps")
 for n in ("_compute_slot_mappings_kernel", "_token_request_mapping_kernel", "sm90_paged_mqa_logits_metadata",
           "_update_draft_inputs_kernel", "_prepare_decode_inputs_kernel", "_prepare_prefill_inputs_kernel"):
     M("mtp.step_glue", n)
+# FLASHINFER_MLA_SPARSE_SM90's per-plan kv_end clamp, part of the draft metadata rebuild; the
+# forward plan's copy runs in preprocess and stays unmapped there.
+M("mtp.step_glue", "_clamp_work_kv_end", source_experiment=FI_SRC)
 STEP_GLUE_NAMES = GLUE_NAMES + (IDX, GATHER, "vectorized_gather_kernel<(int)16, int>", "DeviceScanInitKernel",
                                  "DeviceScanKernel", "compute_cuda_kernel", "_scatter_gather_elementwise_kernel",
                                  "indexSelectSmallIndex<int")

@@ -1212,7 +1212,8 @@
    "role": "zero fill of FA3's 64-wide rope-free query",
    "source_experiment": "logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32",
    "slot_suffixes": [
-    "dsa.sparse_mla.q_rope_zero_fill"
+    "dsa.sparse_mla.q_rope_zero_fill",
+    "dsa.sparse_mla.pack_indices"
    ],
    "excluded_slot_prefixes": [
     "unified.mtp."
@@ -1224,7 +1225,7 @@
    "operation": "dsa.sparse_mla",
    "name": "prepare_varlen_num_blocks",
    "type": "model",
-   "role": "FLASH_ATTN_MLA_SPARSE: one FA3 call per layer (prepare_varlen, mainloop, combine)",
+   "role": "one sparse-MLA call per layer: FLASH_ATTN_MLA_SPARSE's FA3 call (prepare_varlen, mainloop, combine) or FLASHINFER_MLA_SPARSE_SM90's BatchMLAPageAttentionHopperKernel",
    "source_experiment": "logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32",
    "slot_suffixes": [
     "dsa.sparse_mla.attention"
@@ -1239,7 +1240,7 @@
    "operation": "dsa.sparse_mla",
    "name": "FlashAttnFwdSm90",
    "type": "model",
-   "role": "FLASH_ATTN_MLA_SPARSE: one FA3 call per layer (prepare_varlen, mainloop, combine)",
+   "role": "one sparse-MLA call per layer: FLASH_ATTN_MLA_SPARSE's FA3 call (prepare_varlen, mainloop, combine) or FLASHINFER_MLA_SPARSE_SM90's BatchMLAPageAttentionHopperKernel",
    "source_experiment": "logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32",
    "slot_suffixes": [
     "dsa.sparse_mla.attention"
@@ -1254,7 +1255,7 @@
    "operation": "dsa.sparse_mla",
    "name": "FlashAttnFwdCombine",
    "type": "model",
-   "role": "FLASH_ATTN_MLA_SPARSE: one FA3 call per layer (prepare_varlen, mainloop, combine)",
+   "role": "one sparse-MLA call per layer: FLASH_ATTN_MLA_SPARSE's FA3 call (prepare_varlen, mainloop, combine) or FLASHINFER_MLA_SPARSE_SM90's BatchMLAPageAttentionHopperKernel",
    "source_experiment": "logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32",
    "slot_suffixes": [
     "dsa.sparse_mla.attention"
@@ -1263,6 +1264,37 @@
     "unified.mtp."
    ],
    "after": "dsa.sparse_mla",
+   "phase": "forward"
+  },
+  {
+   "operation": "dsa.sparse_mla.pack_indices",
+   "name": "_pack_topk_indices",
+   "type": "model",
+   "role": "FLASHINFER_MLA_SPARSE_SM90 pack of each row's valid top-k slots into the planned CSR page table (_pack_topk_indices)",
+   "source_experiment": "logs/20261010_1_glm53_h200_tock1/runs/Tn/10_full_saturation_rate",
+   "slot_suffixes": [
+    "dsa.sparse_mla.q_rope_zero_fill",
+    "dsa.sparse_mla.pack_indices"
+   ],
+   "excluded_slot_prefixes": [
+    "unified.mtp."
+   ],
+   "after": "dsa.sparse_mla.index_remap",
+   "phase": "forward"
+  },
+  {
+   "operation": "dsa.sparse_mla",
+   "name": "BatchMLAPageAttentionHopperKernel",
+   "type": "model",
+   "role": "one sparse-MLA call per layer: FLASH_ATTN_MLA_SPARSE's FA3 call (prepare_varlen, mainloop, combine) or FLASHINFER_MLA_SPARSE_SM90's BatchMLAPageAttentionHopperKernel",
+   "source_experiment": "logs/20261010_1_glm53_h200_tock1/runs/Tn/10_full_saturation_rate",
+   "slot_suffixes": [
+    "dsa.sparse_mla.attention"
+   ],
+   "excluded_slot_prefixes": [
+    "unified.mtp."
+   ],
+   "after": "dsa.sparse_mla.pack_indices",
    "phase": "forward"
   },
   {
@@ -2668,7 +2700,9 @@
    "source_experiment": "logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32",
    "slot_suffixes": [
     "mtp.step_0.dsa.sparse_mla.q_rope_zero_fill",
-    "mtp.recurrent.dsa.sparse_mla.q_rope_zero_fill"
+    "mtp.recurrent.dsa.sparse_mla.q_rope_zero_fill",
+    "mtp.step_0.dsa.sparse_mla.pack_indices",
+    "mtp.recurrent.dsa.sparse_mla.pack_indices"
    ],
    "after": "mtp.dsa.sparse_mla.index_remap",
    "phase": "draft"
@@ -2677,7 +2711,7 @@
    "operation": "mtp.dsa.sparse_mla",
    "name": "prepare_varlen_num_blocks",
    "type": "model",
-   "role": "MTP FLASH_ATTN_MLA_SPARSE: one FA3 call per layer (prepare_varlen, mainloop, combine)",
+   "role": "MTP one sparse-MLA call per layer: FLASH_ATTN_MLA_SPARSE's FA3 call (prepare_varlen, mainloop, combine) or FLASHINFER_MLA_SPARSE_SM90's BatchMLAPageAttentionHopperKernel",
    "source_experiment": "logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32",
    "slot_suffixes": [
     "mtp.step_0.dsa.sparse_mla.attention",
@@ -2690,7 +2724,7 @@
    "operation": "mtp.dsa.sparse_mla",
    "name": "FlashAttnFwdSm90",
    "type": "model",
-   "role": "MTP FLASH_ATTN_MLA_SPARSE: one FA3 call per layer (prepare_varlen, mainloop, combine)",
+   "role": "MTP one sparse-MLA call per layer: FLASH_ATTN_MLA_SPARSE's FA3 call (prepare_varlen, mainloop, combine) or FLASHINFER_MLA_SPARSE_SM90's BatchMLAPageAttentionHopperKernel",
    "source_experiment": "logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32",
    "slot_suffixes": [
     "mtp.step_0.dsa.sparse_mla.attention",
@@ -2703,13 +2737,41 @@
    "operation": "mtp.dsa.sparse_mla",
    "name": "FlashAttnFwdCombine",
    "type": "model",
-   "role": "MTP FLASH_ATTN_MLA_SPARSE: one FA3 call per layer (prepare_varlen, mainloop, combine)",
+   "role": "MTP one sparse-MLA call per layer: FLASH_ATTN_MLA_SPARSE's FA3 call (prepare_varlen, mainloop, combine) or FLASHINFER_MLA_SPARSE_SM90's BatchMLAPageAttentionHopperKernel",
    "source_experiment": "logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32",
    "slot_suffixes": [
     "mtp.step_0.dsa.sparse_mla.attention",
     "mtp.recurrent.dsa.sparse_mla.attention"
    ],
    "after": "mtp.dsa.sparse_mla",
+   "phase": "draft"
+  },
+  {
+   "operation": "mtp.dsa.sparse_mla.pack_indices",
+   "name": "_pack_topk_indices",
+   "type": "model",
+   "role": "MTP FLASHINFER_MLA_SPARSE_SM90 pack of each row's valid top-k slots into the planned CSR page table (_pack_topk_indices)",
+   "source_experiment": "logs/20261010_1_glm53_h200_tock1/runs/Tn/10_full_saturation_rate",
+   "slot_suffixes": [
+    "mtp.step_0.dsa.sparse_mla.q_rope_zero_fill",
+    "mtp.recurrent.dsa.sparse_mla.q_rope_zero_fill",
+    "mtp.step_0.dsa.sparse_mla.pack_indices",
+    "mtp.recurrent.dsa.sparse_mla.pack_indices"
+   ],
+   "after": "mtp.dsa.sparse_mla.index_remap",
+   "phase": "draft"
+  },
+  {
+   "operation": "mtp.dsa.sparse_mla",
+   "name": "BatchMLAPageAttentionHopperKernel",
+   "type": "model",
+   "role": "MTP one sparse-MLA call per layer: FLASH_ATTN_MLA_SPARSE's FA3 call (prepare_varlen, mainloop, combine) or FLASHINFER_MLA_SPARSE_SM90's BatchMLAPageAttentionHopperKernel",
+   "source_experiment": "logs/20261010_1_glm53_h200_tock1/runs/Tn/10_full_saturation_rate",
+   "slot_suffixes": [
+    "mtp.step_0.dsa.sparse_mla.attention",
+    "mtp.recurrent.dsa.sparse_mla.attention"
+   ],
+   "after": "mtp.dsa.sparse_mla.pack_indices",
    "phase": "draft"
   },
   {
@@ -3449,6 +3511,18 @@
    "type": "model",
    "role": "draft step input prep and attention-metadata rebuild (slot mappings, token/request maps, paged-MQA metadata, draft inputs)",
    "source_experiment": "logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32",
+   "slot_suffixes": [
+    "mtp.step_0.step_glue",
+    "mtp.recurrent.step_glue"
+   ],
+   "phase": "draft"
+  },
+  {
+   "operation": "mtp.step_glue",
+   "name": "_clamp_work_kv_end",
+   "type": "model",
+   "role": "draft step input prep and attention-metadata rebuild (slot mappings, token/request maps, paged-MQA metadata, draft inputs)",
+   "source_experiment": "logs/20261010_1_glm53_h200_tock1/runs/Tn/10_full_saturation_rate",
    "slot_suffixes": [
     "mtp.step_0.step_glue",
     "mtp.recurrent.step_glue"
