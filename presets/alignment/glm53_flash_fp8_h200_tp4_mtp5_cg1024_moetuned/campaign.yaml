@@ -47,9 +47,10 @@ recorded_on:
     # The pack schema cannot carry server env without a python_runtime package list, so the run script exports
     # VLLM_TUNED_CONFIG_FOLDER (never the workspace .env: the cg1024 baseline must keep the default config). Check the
     # server log says "Using configuration from .../moe_configs/E=288,N=512,..." and never "Using default MoE config".
-    # Simulator side: VIBESIM_PROFILE_DB=logs/20261010_3_glm53_h200_tock2/profile_cg1024_moetuned.db (634 tuned
-    # vllm_fused_moe rows, _db_metadata key `variant` names the config and its sha256; the shared profile.db keeps the
-    # default-config rows of the production pack).
+    # Simulator side: VIBESIM_PROFILE_DB=logs/20261011_0_glm53_h200_tick3/fi/profile_cg1024_moetuned_fi.db (copy of
+    # logs/20261010_3_glm53_h200_tock2/profile_cg1024_moetuned.db: 634 tuned vllm_fused_moe rows, _db_metadata key
+    # `variant` names the config and its sha256, + the K=4 rows + 475 FlashInfer SM90 sparse-MLA rows); the shared
+    # profile.db keeps the default-config FA3 rows of the production pack.
 variants:
   tp4_dp1_mtp5:
     deployment: unified
@@ -75,14 +76,18 @@ variants:
       # Multimodal input off (production serves it but the matrix is text-only): the vllm_tokens backend
       # starts vLLM with --tokens-only, and v0.31 refuses to build Glm5NextMultiModalProcessor without a
       # tokenizer. Same flag as the B200 pack; check the attention/MoE backends still match production.
+      # Sparse MLA pinned to FlashInfer SM90 (user decision 2026-10-11). vLLM only offers it when nvcc is on PATH
+      # (or a prebuilt FlashInfer is installed) and otherwise falls back to FA3 silently; the Tock 1/2 servers ran it
+      # because PATH had /usr/local/cuda/bin. Pinning makes the backend explicit; the production pack keeps FA3.
       extra_args: [--kv-cache-dtype, auto, --speculative-config, '{"method":"mtp","num_speculative_tokens":5}',
-        --limit-mm-per-prompt, '{"image":0,"video":0}']
-    # The H200 production arch: TP4 without EP, Triton FP8 fused MoE, FLASH_ATTN_MLA_SPARSE (FA3) with a
+        --limit-mm-per-prompt, '{"image":0,"video":0}', --attention-backend, FLASHINFER_MLA_SPARSE_SM90]
+    # The H200 production arch: TP4 without EP, Triton FP8 fused MoE, FLASHINFER_MLA_SPARSE_SM90 (pinned) with a
     # BF16 cache, FlashKDA prefill, MTP-5 drafter. Routing: this pack's own case-03 capture (43 layers incl.
     # MTP). Path relative to this pack (repo logs/, local evidence) until it is hosted by repository and revision (the user uploads it).
     arch:
       type: glm53_flash_vllm_fp8_kda_dsa_moe_speculative
       model_config: model/config/glm53_flash.json
+      sparse_mla_backend: flashinfer_mla_sparse_sm90
       fp8: true
       tp_size: 4
       draft_tokens: 5
