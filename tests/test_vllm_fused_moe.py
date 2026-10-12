@@ -76,3 +76,62 @@ def test_both_launches_look_up_the_layer_config_keyed_by_intermediate_size(
     assert all(call[1][2] == _INTERMEDIATE for call in calls)
     # The resolved config is the one the kernel is launched with.
     assert all(launch.positional[-1] is tuned for launch in launches)
+
+
+# ── the tuned-config backend ─────────────────────────────────────────────────
+
+
+def test_the_tuned_folder_holds_the_file_vllm_looks_up_with_the_recorded_bytes() -> None:
+    """Catches a tuned folder vLLM would silently ignore or read other bytes from.
+
+    ``get_moe_configs`` opens exactly ``E=<E>,N=<I>,device_name=<gpu>,dtype=fp8_w8a8,
+    block_shape=[128,128].json``; any other name falls back to the default
+    config and the backend's rows would measure the default kernel under a
+    tuned name. The sha256 ties the rows to the config the Tock measured.
+    """
+    import hashlib
+
+    from profiling.kernels import vllm_fused_moe as kernel
+
+    folder = kernel.TUNED_212D200C_CONFIG_DIR
+    expected_name = (
+        f"E={_EXPERTS},N={_INTERMEDIATE},device_name=NVIDIA_H200,dtype=fp8_w8a8,"
+        "block_shape=[128,128].json"
+    )
+    assert sorted(path.name for path in folder.glob("*.json")) == [expected_name]
+    digest = hashlib.sha256((folder / expected_name).read_bytes()).hexdigest()
+    assert digest == kernel.TUNED_212D200C_SHA256
+    assert (folder / "sha256.txt").read_text().split() == [digest, expected_name]
+
+
+def test_only_the_tuned_backend_points_vllm_at_the_tuned_folder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches the tuned config leaking into the default rows, or the tuned rows
+    being measured without it (the runner itself never sets the variable)."""
+    from profiling.db.registry import find_kernel_profiler_spec
+    from profiling.kernels import vllm_fused_moe as kernel
+
+    default = find_kernel_profiler_spec(kernel.KIND, "vllm_triton")
+    tuned = find_kernel_profiler_spec(kernel.KIND, kernel.TUNED_212D200C_BACKEND)
+    assert "VLLM_TUNED_CONFIG_FOLDER" not in dict(default.worker_env)
+    assert dict(tuned.worker_env)["VLLM_TUNED_CONFIG_FOLDER"] == kernel._worker_config_dir(
+        kernel.TUNED_212D200C_CONFIG_DIR
+    )
+    # Same launch, same table and cache identity: only the environment differs.
+    assert (tuned.runner_ref, tuned.table_name, tuned.args_schema) == (
+        default.runner_ref,
+        default.table_name,
+        default.args_schema,
+    )
+
+    # The folder is spelled as the worker sees it: the host path for a host
+    # worker, the image's /opt/vibesim mount otherwise.
+    monkeypatch.setenv("VIBESIM_VLLM_PROFILE_ENV", "host")
+    assert kernel._worker_config_dir(kernel.TUNED_212D200C_CONFIG_DIR) == str(
+        kernel.TUNED_212D200C_CONFIG_DIR
+    )
+    monkeypatch.setenv("VIBESIM_VLLM_PROFILE_ENV", "container")
+    assert kernel._worker_config_dir(kernel.TUNED_212D200C_CONFIG_DIR) == (
+        "/opt/vibesim/profiling/configs/vllm_fused_moe/tuned_212d200c"
+    )

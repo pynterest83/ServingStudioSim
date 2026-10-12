@@ -30,7 +30,9 @@ them, and two flags would admit two combinations that cannot occur.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from profiling.db.args import DType, KernelArgs
 from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
@@ -125,6 +127,37 @@ DOC = KernelDoc(
 )
 
 
+#: Backend of the rows measured under the tuned config below. The rows key on
+#: the same args as ``vllm_triton`` (the tile config is backend behavior, not an
+#: axis), so they need their own backend to sit beside the default rows under
+#: ``UNIQUE(gpu_name, backend, args_hash)`` instead of overwriting them.
+TUNED_212D200C_BACKEND: str = "vllm_triton_tuned_212d200c"
+#: Repo-tracked ``VLLM_TUNED_CONFIG_FOLDER`` of that backend: vLLM's
+#: ``benchmark_moe.py --tune`` output for E=288, N=512, NVIDIA_H200,
+#: fp8_w8a8, block_shape [128, 128] (GLM-5.3-Flash TP4 without EP), whose
+#: sha256 ``sha256.txt`` records (212d200cb5c6...).
+TUNED_212D200C_CONFIG_DIR: Path = (
+    Path(__file__).resolve().parents[1] / "configs" / "vllm_fused_moe" / "tuned_212d200c"
+)
+TUNED_212D200C_SHA256: str = "212d200cb5c6d734d0b977fc3fa5bb834defc98ba1c1455abfbf1132efc0011a"
+#: Where the container worker sees the same folder: ``profiling/`` is mounted
+#: (worktree source mode) or copied (image mode) under ``/opt/vibesim``.
+_CONTAINER_PROJECT_ROOT = "/opt/vibesim"
+
+
+def _worker_config_dir(config_dir: Path) -> str:
+    """The tuned folder as the vLLM worker process will see it.
+
+    ``get_moe_configs`` opens ``VLLM_TUNED_CONFIG_FOLDER`` in the worker, so a
+    host path only works for the host worker (``VIBESIM_VLLM_PROFILE_ENV=host``).
+    The image (the default) needs its own spelling of the same path.
+    """
+    if os.environ.get("VIBESIM_VLLM_PROFILE_ENV", "container") == "host":
+        return str(config_dir)
+    relative = config_dir.relative_to(Path(__file__).resolve().parents[2])
+    return f"{_CONTAINER_PROJECT_ROOT}/{relative.as_posix()}"
+
+
 register(
     KernelProfilerSpec(
         kernel_kind=KIND,
@@ -150,5 +183,39 @@ register(
             url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/fused_moe.py",
         ),
         subprocess_env="vllm_env",
+    )
+)
+
+
+# The same launch under a tuned config folder. vLLM's ``get_moe_configs`` reads
+# ``VLLM_TUNED_CONFIG_FOLDER`` before its shipped tables, so the runner is
+# unchanged: the worker environment alone switches the tile configs, exactly as
+# a server started with that variable does.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend=TUNED_212D200C_BACKEND,
+        supports=BackendSupport(
+            compute=frozenset({DType.FP8_E4M3}),
+            min_compute_capability=(8, 9),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.moe.vllm_fused_moe_triton",
+            function_name="profile_vllm_fused_moe_triton",
+        ),
+        table_name=KIND,
+        args_schema=VllmFusedMoeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        doc=BackendDoc(
+            summary=(
+                "vLLM invoke_fused_moe_triton_kernel with FP8 block scales under "
+                "VLLM_TUNED_CONFIG_FOLDER: the tuned H200 E=288, N=512 config "
+                "(sha256 212d200c...)."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/benchmarks/kernels/benchmark_moe.py",
+        ),
+        subprocess_env="vllm_env",
+        worker_env=(("VLLM_TUNED_CONFIG_FOLDER", _worker_config_dir(TUNED_212D200C_CONFIG_DIR)),),
     )
 )
