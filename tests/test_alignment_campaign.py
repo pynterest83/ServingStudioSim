@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import dataclasses
+import hashlib
 import io
 import json
 import re
@@ -28,6 +29,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+import yaml
 
 from alignment.labeling import load_rules, subsumptions
 from launcher.alignment_campaign import check as check_module
@@ -1428,3 +1430,205 @@ def test_per_request_acceptance_excludes_output_position_buckets(pack):
     }
     with pytest.raises(PackError, match="exclusive"):
         pack_module._case(raw, 0)
+
+
+# ── session-trace cases ──────────────────────────────────────────────────────
+
+_SESSION_ROWS = [
+    # request_id, session_id, round, arrival_ms, prefix_len, input_len, output_len, tool_wait
+    ("session_a_round_000000", "a", 0, "0.000000", 0, 3000, 40, "0.000000"),
+    ("session_b_round_000000", "b", 0, "800.000000", 0, 5000, 300, "0.000000"),
+    ("session_a_round_000001", "a", 1, "0.000000", 3040, 200, 12, "250.000000"),
+    ("session_c_round_000000", "c", 0, "2000.000000", 0, 1200, 2, "0.000000"),
+]
+
+
+def _write_session_pack(root: Path, *, rows=_SESSION_ROWS, case_overrides=None) -> Path:
+    """A one-case pack driven by a committed session trace, built from the
+    production GLM H200 pack's variant with synthetic routing (the pack's
+    corpus path is relative to its own directory)."""
+    source = PACK_ROOT / "glm53_flash_fp8_h200_tp4_mtp5"
+    campaign = pack_module._load_preset(source / "campaign.yaml")
+    variant_name, variant = next(iter(campaign["variants"].items()))
+    variant["arch"] = {
+        key: value for key, value in variant["arch"].items() if key != "token_corpus_file"
+    }
+    variant["arch"]["routing"] = "uniform"
+    root.mkdir(parents=True)
+    shutil.copytree(source / "label_rules", root / "label_rules")
+    shutil.copy(source / "acceptance.yaml", root / "acceptance.yaml")
+    (root / "traces").mkdir()
+    (root / "traces" / "invariants.json").write_text(
+        json.dumps({"schema_version": 1, "traces": {}}) + "\n"
+    )
+    (root / "session_traces").mkdir()
+    text = pack_module.SESSION_TRACE_HEADER + "\n" + "".join(
+        ",".join(str(item) for item in row) + "\n" for row in rows
+    )
+    (root / "session_traces" / "s.csv").write_text(text)
+    (root / "session_traces" / "s.manifest.json").write_text(
+        json.dumps({"schema": "session-execution-v2", "rounds": len(rows),
+                    "parameters": {"source_sha256": "0" * 64}})
+    )
+    case = {
+        "index": 20, "name": "agentic", "variant": variant_name, "purpose": "p", "coverage": [],
+        "max_model_len": 8192, "profile_arrival_mode": "trace-timed",
+        "simulation_arrival_mode": "trace_timed", "gpu_memory_utilization": 0.92,
+        "capture_seconds": 15.0, "device_role": "primary",
+        "session_trace": {
+            "file": "session_traces/s.csv", "manifest": "session_traces/s.manifest.json",
+            "sha256": hashlib.sha256(text.encode()).hexdigest(),
+        },
+        "text_corpus": {"host_key": "code", "sha256": "1" * 64},
+        "attn_gpu_memory_gb": {"value": 45.0, "status": "measured", "derived_from": "t",
+                               "evidence": "e"},
+        "rate": {"value": 2.0, "status": "provisional", "derived_from": "placeholder"},
+        "speculative_acceptance": {"value": [0.9, 0.8, 0.7, 0.6, 0.5], "status": "provisional",
+                                   "derived_from": "case 05"},
+        **(case_overrides or {}),
+    }
+    campaign["cases"] = [case]
+    (root / "campaign.yaml").write_text(yaml.safe_dump(campaign, sort_keys=False))
+    return root
+
+
+def test_session_trace_case_drives_both_sides_from_the_committed_trace(tmp_path):
+    """The defects this catches: the measured side replaying an independent
+    shape trace while the simulator replays sessions (or the reverse), the
+    simulator losing the speculative tag on a session trace, a rate that the
+    two sides rescale differently, and the replay corpus override being
+    ignored."""
+    session_pack = load_pack(_write_session_pack(tmp_path / "pack"))
+    case = session_pack.cases[0]
+    assert case.workload_trace is None and case.session_trace is not None
+    host = check_module.host_for(session_pack, None)
+    documents = case_documents(session_pack, case, host, tmp_path / "out", REPO_ROOT)
+    traces = case_traces(session_pack, case)
+
+    committed = (session_pack.root / "session_traces" / "s.csv").read_text()
+    assert traces["trace.csv"] == committed
+    replay = list(csv.DictReader(io.StringIO(traces["trace.csv"])))
+    simulation = list(csv.DictReader(io.StringIO(traces["trace_speculative.csv"])))
+    assert replay == [
+        {key: value for key, value in row.items() if key != "accept_rate"} for row in simulation
+    ]
+    for row in simulation:
+        assert json.loads(row["accept_rate"]) == pytest.approx(
+            render_module.acceptance_chain(case, int(row["output_len"]))
+        )
+
+    for profile_pass in session_pack.variant_of(case).profile_passes:
+        workload = documents[f"{profile_pass.name}.yaml"]["workload"]
+        assert workload["frontend"] == {"type": "session", "path": "./trace.csv"}
+        assert workload["text_file"] == "/nonexistent/corpus/code"
+        assert workload["rate"] == 2.0
+        assert workload["arrival_mode"] == "trace-timed"
+
+    sim = documents[f"{PHASE_CONFIG_STEMS[SIMULATION_PHASE]}.yaml"]["workload"]
+    assert sim["input_file_format"] == "text-generation-session-execution-v2"
+    assert sim["input_file_tags"] == ["speculative"]
+    assert sim["trace_files"][0].endswith("trace_speculative.csv")
+    # Three sessions start over 2 s: req-frontend measures 1 session/s and
+    # rescales it to 2/s; the simulator divides by request_rate.
+    assert render_module.session_arrival_rate(committed) == pytest.approx(1.0)
+    assert sim["request_rate"] == pytest.approx(2.0)
+
+    rendered = render_case(session_pack, case, host, tmp_path / "rendered", REPO_ROOT)
+    assert (rendered.directory / "trace.manifest.json").read_text() == (
+        session_pack.root / "session_traces" / "s.manifest.json"
+    ).read_text()
+
+
+def test_session_trace_pack_passes_the_check_with_the_real_loaders(tmp_path):
+    """`check` renders the session case and hands it to `load_profile_config`,
+    which parses the `session` frontend; no invariants entry is required for a
+    committed trace."""
+    session_pack = load_pack(_write_session_pack(tmp_path / "pack"))
+    findings = check_module.check_pack(
+        session_pack, metric_names=metric_names(_schemas(session_pack))
+    )
+    assert not [item for item in findings if item.level == "error"], findings
+    assert extract_module.expected_request_count(session_pack, session_pack.cases[0]) == 4
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda root: (root / "session_traces/s.csv").write_text(
+            (root / "session_traces/s.csv").read_text() + "x\n"), "hashes to"),
+        (lambda root: (root / "session_traces/s.manifest.json").unlink(), "missing"),
+        (lambda root: (root / "session_traces/s.manifest.json").write_text(
+            json.dumps({"schema": "session-rounds-v2"})), "schema must be"),
+        (lambda root: (root / "session_traces/s.manifest.json").write_text(
+            json.dumps({"schema": "session-execution-v2", "sha256": "f" * 64})),
+         "does not match"),
+        (lambda root: (root / "session_traces/s.manifest.json").write_text(
+            json.dumps({"schema": "session-execution-v2", "rounds": 9})), "manifest says 9"),
+    ],
+)
+def test_session_trace_check_refuses_bytes_the_pack_did_not_pin(tmp_path, mutate, message):
+    """A changed trace, a missing or foreign manifest, or a manifest that
+    disagrees with the bytes is an error, not a re-render of another workload."""
+    root = _write_session_pack(tmp_path / "pack")
+    mutate(root)
+    session_pack = load_pack(root)
+    findings = check_module.check_pack(session_pack)
+    errors = [str(item) for item in findings if item.level == "error"]
+    assert any(message in error for error in errors), errors
+
+
+def test_session_trace_check_applies_the_context_limit_to_prefix_plus_round(tmp_path):
+    """Only the second round of session `a` reaches the limit, and only once
+    its 3040-token declared prefix is counted: vLLM refuses that request."""
+    rows = [row if row[1] != "b" else (*row[:5], 1000, *row[6:]) for row in _SESSION_ROWS]
+    root = _write_session_pack(
+        tmp_path / "pack", rows=rows, case_overrides={"max_model_len": 3250}
+    )
+    findings = check_module.check_pack(load_pack(root))
+    assert any(
+        "session_a_round_000001" in item.message and "max_model_len" in item.message
+        for item in findings if item.level == "error"
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"workload_trace": {"file": "traces/x.csv", "shapes": [[16, 16]]}}, "exactly one"),
+        ({"kernel_trace": {"file": "traces/x.csv", "shapes": [[16, 16]]}}, "kernel_trace"),
+        ({"speculative_acceptance_per_request": {
+            "value": "acceptance/x.json", "status": "measured", "derived_from": "t"}},
+         "independent-request"),
+        ({"session_trace": {"file": "s.csv", "manifest": "m.json", "sha256": "abc"}},
+         "64 lowercase"),
+    ],
+)
+def test_session_trace_case_rejects_conflicting_declarations(tmp_path, overrides, message):
+    root = _write_session_pack(tmp_path / "pack", case_overrides=overrides)
+    with pytest.raises(PackError, match=message):
+        load_pack(root)
+
+
+def test_a_declared_text_corpus_is_verified_and_keyed_by_host(tmp_path):
+    """The corpus decides the prompt tokens; a host whose file has other bytes
+    must not silently measure another workload, and an unknown key must name
+    what the host declares."""
+    session_pack = load_pack(_write_session_pack(tmp_path / "pack"))
+    case = session_pack.cases[0]
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("not the declared corpus")
+    host = dataclasses.replace(
+        check_module.host_for(session_pack, None), text_corpora={"code": str(corpus)}
+    )
+    with pytest.raises(PackError, match="hashes to"):
+        render_case(session_pack, case, host, tmp_path / "out", REPO_ROOT)
+    pinned = dataclasses.replace(
+        case,
+        text_corpus=dataclasses.replace(
+            case.text_corpus,
+            sha256=hashlib.sha256(corpus.read_bytes()).hexdigest(),
+        ),
+    )
+    render_case(session_pack, pinned, host, tmp_path / "out", REPO_ROOT)
+    with pytest.raises(PackError, match="no text corpus named 'code'"):
+        dataclasses.replace(host, text_corpora={}).text_corpus_path("code")

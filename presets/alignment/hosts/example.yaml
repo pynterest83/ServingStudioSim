@@ -21,6 +21,10 @@ checkpoints:
 
 # Corpus the load generator draws synthetic prompt text from (enwik9).
 text_corpus: /path/to/corpus/enwik9
+# Optional further corpora a case selects by key (`cases[].text_corpus.host_key`,
+# with the corpus sha256 recorded in the pack and verified at render time).
+text_corpora:
+  code: /path/to/corpus/code.txt
 
 # Exact nsys path. The profiler version is part of the run's provenance, so this
 # is never resolved from PATH.

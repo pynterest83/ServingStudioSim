@@ -11,7 +11,8 @@ copy of; configs are built as dicts and dumped, so a malformed nesting is a
 | rendered field                       | source                                  |
 |--------------------------------------|-----------------------------------------|
 | `server.model_path` / `tokenizer`    | host `checkpoints[variant.checkpoint]`  |
-| `workload.text_file`                 | host `text_corpus`                      |
+| `workload.text_file`                 | host `text_corpus`, or the host's       |
+|                                      | `text_corpora[case.text_corpus.host_key]`|
 | `nsys.executable`                    | host `nsys_executable`                  |
 | `fork_python`                        | host `fork_python` (omitted when empty) |
 | `cuda_visible_devices`               | host `device_roles[case.device_role]`   |
@@ -26,6 +27,26 @@ copy of; configs are built as dicts and dumped, so a malformed nesting is a
 | `worker.prefill_gpu_time_multiplier` | variant, verbatim (a pack-declared      |
 |                                      | calibration, never the recommendation)  |
 | `workload.arrival_mode` / `rate`     | case                                    |
+| `workload.frontend`                  | `independent` over the shape trace, or  |
+|                                      | `session` over `case.session_trace`     |
+
+## Session-trace cases
+
+A case with `session_trace` replays a committed `session-execution-v2` CSV
+instead of a shape recipe. `trace.csv` is that file byte for byte, driven by
+req-frontend's session frontend on the measured side and read with
+`input_file_format: text-generation-session-execution-v2` by the simulator.
+A speculative case adds `trace_speculative.csv`: the same rows plus the
+`accept_rate` column of the `speculative` tag, which req-frontend's session
+loader accepts and the simulator turns into each round's decoding strategy,
+one chain per round from `acceptance_chain` (its `output_len`).
+
+`rate` keeps req-frontend's meaning, a target top-level arrival rate (sessions
+per second here). req-frontend rescales the trace by `trace_rate / rate`, the
+trace rate being (sessions - 1) / span of the session start times; the
+simulator divides arrival times by `request_rate`. The simulation therefore gets
+`request_rate = rate / trace_rate`, which equals `rate` for the 1 req/s shape
+traces.
 
 ## Two normalizations that are not cosmetic
 
@@ -56,16 +77,32 @@ from typing import Any, Callable
 
 import yaml
 
-from alignment.load_generator.config import IndependentFrontendConfig, routes_backend
+from alignment.load_generator.config import (
+    IndependentFrontendConfig,
+    SessionFrontendConfig,
+    routes_backend,
+)
 
 from ..corpus import ROUTING_FILES
-from .pack import Case, HostProfile, Pack, PackError, TraceSpec, Variant, load_per_request_chains
+from .pack import (
+    Case,
+    HostProfile,
+    Pack,
+    PackError,
+    TraceSpec,
+    Variant,
+    load_per_request_chains,
+    read_session_trace,
+)
 
 #: Trace file names inside a rendered case directory. Fixed rather than derived
 #: from the pack's file names so a run directory reads the same for every pack.
 WORKLOAD_TRACE_NAME = "trace.csv"
 SPECULATIVE_TRACE_NAME = "trace_speculative.csv"
 KERNEL_TRACE_NAME = "trace_nsys.csv"
+#: The session trace's `tracegen` manifest, copied beside `trace.csv` so a run
+#: directory carries the provenance of the bytes it replayed.
+SESSION_MANIFEST_NAME = "trace.manifest.json"
 
 #: The four phases that follow the variant's profile passes. `--phase` values are
 #: artifact directory names throughout; only these two analyze rows have a config
@@ -247,6 +284,54 @@ def trace_text(
     return buffer.getvalue()
 
 
+def session_rows(text: str) -> list[list[str]]:
+    """A session trace's rows as the strings in the file (header excluded)."""
+    return list(csv.reader(io.StringIO(text)))[1:]
+
+
+def session_arrival_rate(text: str) -> float:
+    """Sessions per second of a session trace, as req-frontend computes it:
+    (sessions - 1) over the span of each session's first-round arrival."""
+    first_arrival: dict[str, float] = {}
+    for row in session_rows(text):
+        first_arrival.setdefault(row[1], float(row[3]))
+    arrivals = list(first_arrival.values())
+    span_seconds = (max(arrivals, default=0.0) - min(arrivals, default=0.0)) / 1000.0
+    if len(arrivals) < 2 or span_seconds <= 0:
+        raise PackError(
+            "a trace-timed session trace needs at least two sessions with distinct start times"
+        )
+    return (len(arrivals) - 1) / span_seconds
+
+
+def session_trace_with_acceptance(case: Case, text: str) -> str:
+    """The session trace plus the `speculative` tag's `accept_rate` column,
+    one chain per round from its `output_len`. Every other field keeps the
+    file's own spelling."""
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    reader = csv.reader(io.StringIO(text))
+    header = next(reader)
+    writer.writerow([*header, "accept_rate"])
+    output_column = header.index("output_len")
+    for row in reader:
+        chain = acceptance_chain(case, int(row[output_column]))
+        writer.writerow([*row, json.dumps(chain, separators=(",", ":"))])
+    return buffer.getvalue()
+
+
+def _check_session_lengths(case: Case, text: str) -> None:
+    """The shape traces' context rule, applied to a session round's whole
+    prompt (declared prefix plus fresh input) and its output."""
+    for index, row in enumerate(session_rows(text)):
+        total = int(row[4]) + int(row[5]) + int(row[6])
+        if total >= case.max_model_len:
+            raise PackError(
+                f"{case.slug} session trace row {index} ({row[0]}) reaches max_model_len: "
+                f"{row[4]}+{row[5]}+{row[6]} >= {case.max_model_len}"
+            )
+
+
 # ── config bodies ────────────────────────────────────────────────────────────
 
 SPECULATIVE_CONFIG_FLAG = "--speculative-config"
@@ -345,10 +430,14 @@ def _workload_block(
     backend = variant.backend
     if profile_kind == "token_corpus":
         backend = routes_backend(backend)
+    frontend = (
+        IndependentFrontendConfig if case.session_trace is None else SessionFrontendConfig
+    )
+    corpus_key = None if case.text_corpus is None else case.text_corpus.host_key
     body: dict[str, Any] = {
-        "frontend": {"type": IndependentFrontendConfig.type, "path": f"./{trace_name}"},
+        "frontend": {"type": frontend.type, "path": f"./{trace_name}"},
         "backend": {"type": backend},
-        "text_file": host.text_corpus,
+        "text_file": host.text_corpus_path(corpus_key),
         "tokenizer": host.checkpoint_path(variant.tokenizer),
         "token_pool_limit": 1_000_000,
         "arrival_mode": case.profile_arrival_mode,
@@ -487,9 +576,13 @@ def simulation_document(
                 f"acceptance vector must have that many positions"
             )
     trace_name = SPECULATIVE_TRACE_NAME if speculative else WORKLOAD_TRACE_NAME
+    session_text = None
+    if case.session_trace is not None:
+        session_text, _ = read_session_trace(pack.root, case)
+    frontend = IndependentFrontendConfig if session_text is None else SessionFrontendConfig
     workload: dict[str, Any] = {
         "trace_files": [_preset_path(case_dir / trace_name, repo_root)],
-        "input_file_format": IndependentFrontendConfig.input_file_format,
+        "input_file_format": frontend.input_file_format,
         "arrival_mode": case.simulation_arrival_mode,
     }
     if speculative:
@@ -497,7 +590,13 @@ def simulation_document(
     if case.max_concurrency is not None:
         workload["max_concurrency"] = case.max_concurrency
     if case.rate is not None:
-        workload["request_rate"] = case.rate.value
+        # The client's `rate` is absolute; the simulator's rescales a rate-1
+        # trace (see "Session-trace cases" above).
+        workload["request_rate"] = (
+            case.rate.value
+            if session_text is None
+            else case.rate.value / session_arrival_rate(session_text)
+        )
     workload["run_to_end"] = True
 
     arch = dict(variant.arch)
@@ -617,6 +716,13 @@ def case_documents(
 
 def case_traces(pack: Pack, case: Case) -> dict[str, str]:
     """Trace file name → contents for one rendered case directory."""
+    if case.session_trace is not None:
+        text, _ = read_session_trace(pack.root, case)
+        _check_session_lengths(case, text)
+        traces = {WORKLOAD_TRACE_NAME: text}
+        if case.speculative_acceptance is not None:
+            traces[SPECULATIVE_TRACE_NAME] = session_trace_with_acceptance(case, text)
+        return traces
     traces = {WORKLOAD_TRACE_NAME: trace_text(case, case.workload_trace)}
     if case.speculative_acceptance is not None:
         if case.speculative_acceptance_per_request is not None:
@@ -639,6 +745,29 @@ def case_traces(pack: Pack, case: Case) -> dict[str, str]:
     return traces
 
 
+def _verify_text_corpus(case: Case, host: HostProfile) -> None:
+    """Refuse to render a case whose declared replay corpus has other bytes.
+
+    A corpus missing on the rendering machine is left to the profile phase,
+    whose runner refuses it before the engine starts: a simulation-only host
+    never needs the corpus at all.
+    """
+    if case.text_corpus is None:
+        return
+    path = Path(host.text_corpus_path(case.text_corpus.host_key))
+    if not path.is_file():
+        return
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 24), b""):
+            digest.update(block)
+    if digest.hexdigest() != case.text_corpus.sha256:
+        raise PackError(
+            f"cases[{case.slug}].text_corpus: {path} hashes to {digest.hexdigest()}, "
+            f"the pack records {case.text_corpus.sha256}"
+        )
+
+
 def render_case(
     pack: Pack, case: Case, host: HostProfile, out_root: Path, repo_root: Path
 ) -> RenderedCase:
@@ -646,11 +775,16 @@ def render_case(
     touches artifact directories, so re-rendering after a config fix does not
     discard an expensive capture."""
     case_dir = Path(out_root).resolve() / case.slug
+    _verify_text_corpus(case, host)
     case_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     for name, text in case_traces(pack, case).items():
         target = case_dir / name
         target.write_text(text, encoding="utf-8")
+        written.append(target)
+    if case.session_trace is not None:
+        target = case_dir / SESSION_MANIFEST_NAME
+        target.write_bytes((pack.root / case.session_trace.manifest).read_bytes())
         written.append(target)
     for name, document in case_documents(pack, case, host, case_dir, repo_root).items():
         target = case_dir / name

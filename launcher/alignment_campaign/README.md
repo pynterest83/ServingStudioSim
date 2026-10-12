@@ -172,6 +172,37 @@ arrival modes, `gpu_memory_utilization`, `capture_seconds`, `device_role`, its
 `workload_trace` (and `kernel_trace` where the NSYS capture is bounded
 separately), plus `purpose` and `coverage` so the matrix explains itself.
 
+A case replays either a shape recipe (`workload_trace`, plus an optional
+`kernel_trace`) or a committed canonical `session-execution-v2` trace made by
+req-frontend's `tracegen` (`session_trace`), never both:
+
+```yaml
+session_trace:
+  file: session_traces/<name>.csv            # pack-relative, committed
+  manifest: session_traces/<name>.manifest.json
+  sha256: <sha256 of the CSV itself>         # the manifest records only its source's
+```
+
+`check` requires the file and its manifest, a manifest `schema` of
+`session-execution-v2`, the recorded sha256 (and the manifest's own, when it
+records one), the canonical header, the manifest's round count, and every
+round's `prefix_len + input_len + output_len` below `max_model_len`. A committed
+trace is not regenerated, so `traces/invariants.json` does not record it.
+Rendering writes it byte for byte as `trace.csv` (driven by the `session`
+frontend) with its manifest as `trace.manifest.json`, and the simulation reads
+it as `text-generation-session-execution-v2`. A speculative case gets
+`trace_speculative.csv`, the same rows plus the `speculative` tag's
+`accept_rate`, one chain per round from `speculative_acceptance` (and its
+output-position buckets); per-request measured chains are keyed by independent
+shapes and are refused. Arrival keeps the case fields' meaning: `saturated`
+with `max_concurrency` (sessions), or `trace-timed` with `rate` as req-frontend's
+target sessions per second; the simulation's `request_rate` is `rate` divided
+by the trace's own session start rate, so both sides replay the same timeline.
+
+Optional `text_corpus: {host_key, sha256}` selects the replay corpus of the
+measured passes from the host profile's `text_corpora` map instead of its
+`text_corpus`; rendering on a host that has the file verifies its sha256.
+
 Optional per-case `chunk_size` sets both server `max_num_batched_tokens` and
 worker `max_batch_tokens`. CUDA graph capture size remains a separate variant
 setting. Optional calibrated `speculative_acceptance` supplies one conditional

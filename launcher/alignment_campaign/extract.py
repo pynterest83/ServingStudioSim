@@ -26,12 +26,22 @@ from .metrics import (
     is_case_directory,
     measure_case,
 )
-from .pack import Pack
+from .pack import Case, Pack, read_session_trace
 
 #: Golden and comparison key: `<variant>/<slug>@<metric>`. Without a pack there
 #: is no variant, so the engine uses this placeholder — a pack-less comparison is
 #: never recorded, so the key never reaches the store.
 UNSCOPED_VARIANT = "-"
+
+
+def expected_request_count(pack: Pack, case: Case) -> int:
+    """Requests the case's replay trace declares: shapes x repeats, or the
+    rounds of its committed session trace."""
+    if case.session_trace is not None:
+        text, _ = read_session_trace(pack.root, case)
+        return len(text.splitlines()) - 1
+    assert case.workload_trace is not None
+    return case.workload_trace.request_count
 
 
 @dataclass(frozen=True)
@@ -97,7 +107,7 @@ def extract(roots: list[Path], pack: Pack | None = None) -> Extraction:
             if case is None:
                 continue  # a directory the pack does not declare is not this matrix
             variant = case.variant
-            expected = case.workload_trace.request_count
+            expected = expected_request_count(pack, case)
         measurement = measure_case(directory, expected_requests=expected)
         cases[f"{variant}/{slug}"] = measurement
 

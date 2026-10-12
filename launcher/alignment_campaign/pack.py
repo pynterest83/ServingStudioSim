@@ -33,6 +33,7 @@ re-rendering on a different machine cannot silently reuse a stale KV budget.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -117,6 +118,45 @@ class TraceSpec:
         return len(self.shapes) * self.repeats
 
 
+#: The one canonical session format a case can replay, and its header. Both
+#: consumers (req-frontend's session frontend and the simulator) parse it with
+#: the same req-frontend loader, so the pack only has to pin the bytes.
+SESSION_TRACE_SCHEMA = "session-execution-v2"
+SESSION_TRACE_HEADER = (
+    "request_id,session_id,round_idx,arrival_time_ms,prefix_len,input_len,output_len,"
+    "tool_wait_after_ms"
+)
+
+
+@dataclass(frozen=True)
+class SessionTraceSpec:
+    """A canonical `session-execution-v2` trace committed into the pack.
+
+    Unlike a `TraceSpec` there is no recipe to regenerate it from: `tracegen`
+    resolved the session topology and the prefix/append split, so the CSV is
+    the data. `file` and `manifest` are pack-relative; the manifest is the one
+    `tracegen` wrote beside it. `sha256` is the canonical CSV's own hash,
+    recorded here because the manifest only records its *source* file's.
+    """
+
+    file: str
+    manifest: str
+    sha256: str
+
+
+@dataclass(frozen=True)
+class TextCorpusSpec:
+    """The replay text corpus a case's measured passes sample prompts from.
+
+    `host_key` names an entry of the host profile's `text_corpora` (a corpus is
+    a machine path and often hundreds of MB, so it never enters the pack), and
+    `sha256` pins its bytes. Absent, the host's `text_corpus` is used.
+    """
+
+    host_key: str
+    sha256: str
+
+
 @dataclass(frozen=True)
 class ProfilePass:
     """One measured pass. `name` is simultaneously the config stem, the artifact
@@ -183,7 +223,9 @@ class Case:
     #: analyzes when a stable numbered excerpt, rather than the full capture,
     #: is the intended evidence population. `None` keeps the whole capture.
     analyze_iterations: tuple[int, int] | None
-    workload_trace: TraceSpec
+    #: The shape recipe a case replays; `None` exactly when `session_trace`
+    #: drives the case instead.
+    workload_trace: TraceSpec | None
     kernel_trace: TraceSpec | None
     attn_gpu_memory_gb: Calibrated
     rate: Calibrated | None
@@ -206,6 +248,12 @@ class Case:
     #: request length, and the within-request correlation of draft positions
     #: survive. Exclusive with the output-position buckets.
     speculative_acceptance_per_request: Calibrated | None = None
+    #: A committed `session-execution-v2` trace driving both the measured passes
+    #: (req-frontend's session frontend) and the simulation. Exclusive with
+    #: `workload_trace` and `kernel_trace`.
+    session_trace: SessionTraceSpec | None = None
+    #: Replay corpus override for the measured passes.
+    text_corpus: TextCorpusSpec | None = None
 
     @property
     def slug(self) -> str:
@@ -228,10 +276,10 @@ class Case:
             found["speculative_acceptance_per_request"] = self.speculative_acceptance_per_request
         return found
 
-    def trace_for(self, role: str) -> TraceSpec:
+    def trace_for(self, role: str) -> TraceSpec | None:
         """The trace a pass with this role drives. A case with no bounded kernel
         trace profiles kernels from its full workload trace, which is what cases
-        01-10 do."""
+        01-10 do. `None` for a session-trace case."""
         if role == "kernel" and self.kernel_trace is not None:
             return self.kernel_trace
         return self.workload_trace
@@ -285,6 +333,20 @@ class HostProfile:
     device_roles: dict[str, str]
     port: int
     startup_timeout: float
+    #: Further replay corpora a case may select by key (`cases[].text_corpus`).
+    text_corpora: dict[str, str] = field(default_factory=dict)
+
+    def text_corpus_path(self, key: str | None) -> str:
+        """The host's default corpus, or the keyed one a case selects."""
+        if key is None:
+            return self.text_corpus
+        try:
+            return self.text_corpora[key]
+        except KeyError:
+            raise PackError(
+                f"host {self.name}: no text corpus named {key!r} "
+                f"(declared: {sorted(self.text_corpora)})"
+            ) from None
 
     def checkpoint_path(self, key: str) -> str:
         try:
@@ -413,6 +475,41 @@ def _trace_spec(raw: Any, where: str) -> TraceSpec:
     return TraceSpec(file=file_name, shapes=tuple(shapes), repeats=repeats, id_suffix=id_suffix)
 
 
+def _session_trace_spec(raw: Any, where: str) -> SessionTraceSpec:
+    if not isinstance(raw, dict):
+        raise PackError(f"{where}: must be a mapping")
+    body = dict(raw)
+    spec = SessionTraceSpec(
+        file=_typed(_require(body, "file", where), str, f"{where}.file"),
+        manifest=_typed(_require(body, "manifest", where), str, f"{where}.manifest"),
+        sha256=_typed(_require(body, "sha256", where), str, f"{where}.sha256"),
+    )
+    _reject_extra(body, where)
+    if not _is_sha256(spec.sha256):
+        raise PackError(f"{where}.sha256 must be 64 lowercase hex digits")
+    return spec
+
+
+def _text_corpus_spec(raw: Any, where: str) -> TextCorpusSpec:
+    if not isinstance(raw, dict):
+        raise PackError(f"{where}: must be a mapping")
+    body = dict(raw)
+    spec = TextCorpusSpec(
+        host_key=_typed(_require(body, "host_key", where), str, f"{where}.host_key"),
+        sha256=_typed(_require(body, "sha256", where), str, f"{where}.sha256"),
+    )
+    # Free-form provenance (where the corpus came from) is kept out of the type.
+    body.pop("provenance", None)
+    _reject_extra(body, where)
+    if not _is_sha256(spec.sha256):
+        raise PackError(f"{where}.sha256 must be 64 lowercase hex digits")
+    return spec
+
+
+def _is_sha256(value: str) -> bool:
+    return len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+
+
 def _variant(name: str, raw: Any) -> Variant:
     where = f"variants.{name}"
     if not isinstance(raw, dict):
@@ -500,6 +597,19 @@ def _case(raw: Any, index_hint: int) -> Case:
     per_request_raw = body.pop("speculative_acceptance_per_request", None)
     rate_raw = body.pop("rate", None)
     kernel_raw = body.pop("kernel_trace", None)
+    workload_raw = body.pop("workload_trace", None)
+    session_raw = body.pop("session_trace", None)
+    corpus_raw = body.pop("text_corpus", None)
+    if (workload_raw is None) == (session_raw is None):
+        raise PackError(
+            f"{where}: set exactly one of workload_trace (a shape recipe) and session_trace "
+            "(a committed session-execution-v2 trace)"
+        )
+    if session_raw is not None and kernel_raw is not None:
+        raise PackError(
+            f"{where}: kernel_trace bounds an independent shape trace; a session_trace case "
+            "profiles kernels from its session trace under capture_seconds"
+        )
     window_raw = body.pop("analyze_iterations", None)
     window: tuple[int, int] | None = None
     if window_raw is not None:
@@ -550,8 +660,10 @@ def _case(raw: Any, index_hint: int) -> Case:
         ),
         device_role=_typed(_require(body, "device_role", where), str, f"{where}.device_role"),
         analyze_iterations=window,
-        workload_trace=_trace_spec(
-            _require(body, "workload_trace", where), f"{where}.workload_trace"
+        workload_trace=(
+            None
+            if workload_raw is None
+            else _trace_spec(workload_raw, f"{where}.workload_trace")
         ),
         kernel_trace=(
             None if kernel_raw is None else _trace_spec(kernel_raw, f"{where}.kernel_trace")
@@ -570,6 +682,14 @@ def _case(raw: Any, index_hint: int) -> Case:
         ),
         speculative_acceptance_per_request=None if per_request_raw is None else _calibrated(
             per_request_raw, f"{where}.speculative_acceptance_per_request"
+        ),
+        session_trace=(
+            None
+            if session_raw is None
+            else _session_trace_spec(session_raw, f"{where}.session_trace")
+        ),
+        text_corpus=(
+            None if corpus_raw is None else _text_corpus_spec(corpus_raw, f"{where}.text_corpus")
         ),
     )
     _reject_extra(body, where)
@@ -602,6 +722,14 @@ def _case(raw: Any, index_hint: int) -> Case:
             raise PackError(
                 f"{where}: speculative_acceptance_per_request and "
                 "speculative_acceptance_by_output_position are exclusive"
+            )
+        if case.session_trace is not None:
+            # The measured chains are keyed by independent (input, output)
+            # shapes, which a session round's fresh suffix is not.
+            raise PackError(
+                f"{where}: speculative_acceptance_per_request draws from independent-request "
+                "shapes; a session_trace case uses speculative_acceptance (optionally by output "
+                "position)"
             )
         if not isinstance(case.speculative_acceptance_per_request.value, str):
             raise PackError(
@@ -664,6 +792,65 @@ def load_per_request_chains(
         (entry["input_len"], entry["output_len"], tuple(float(x) for x in entry["chain"]))
         for entry in chains
     )
+
+
+#: Manifest keys under which a `tracegen` manifest may record the sha256 of the
+#: canonical CSV itself (today it records only `parameters.source_sha256`, the
+#: hash of its input). Checked when present.
+_SESSION_MANIFEST_TRACE_SHA_KEYS = ("sha256", "trace_sha256", "output_sha256")
+
+
+def read_session_trace(root: Path, case: Case) -> tuple[str, dict[str, Any]]:
+    """The committed session trace text and its manifest, validated.
+
+    Raises `PackError` on a missing file or manifest, a manifest that is not a
+    `session-execution-v2` one, a sha256 that differs from the pack's record
+    (or from the manifest's, when the manifest records one), a non-canonical
+    header, or a round count that differs from the manifest's.
+    """
+    spec = case.session_trace
+    assert spec is not None
+    where = f"cases[{case.slug}].session_trace"
+    trace_path = Path(root) / spec.file
+    manifest_path = Path(root) / spec.manifest
+    if not trace_path.is_file():
+        raise PackError(f"{where}.file: missing {spec.file}")
+    if not manifest_path.is_file():
+        raise PackError(f"{where}.manifest: missing {spec.manifest}")
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except json.JSONDecodeError as exc:
+        raise PackError(f"{where}.manifest: {spec.manifest} is not JSON: {exc}") from exc
+    if not isinstance(manifest, dict) or manifest.get("schema") != SESSION_TRACE_SCHEMA:
+        raise PackError(
+            f"{where}.manifest: schema must be {SESSION_TRACE_SCHEMA!r}, got "
+            f"{manifest.get('schema') if isinstance(manifest, dict) else manifest!r}"
+        )
+    data = trace_path.read_bytes()
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != spec.sha256:
+        raise PackError(
+            f"{where}.sha256: {spec.file} hashes to {actual}, the pack records {spec.sha256}"
+        )
+    for key in _SESSION_MANIFEST_TRACE_SHA_KEYS:
+        recorded = manifest.get(key)
+        if isinstance(recorded, str) and recorded != actual:
+            raise PackError(
+                f"{where}.manifest: {key} {recorded} does not match {spec.file} ({actual})"
+            )
+    text = data.decode("utf-8")
+    lines = text.splitlines()
+    if not lines or lines[0] != SESSION_TRACE_HEADER:
+        raise PackError(
+            f"{where}.file: header must be {SESSION_TRACE_HEADER!r}, got "
+            f"{lines[0] if lines else ''!r}"
+        )
+    rounds = manifest.get("rounds")
+    if isinstance(rounds, int) and rounds != len(lines) - 1:
+        raise PackError(
+            f"{where}: {spec.file} holds {len(lines) - 1} rounds, its manifest says {rounds}"
+        )
+    return text, manifest
 
 
 def load_pack(root: Path) -> Pack:
@@ -739,6 +926,9 @@ def load_host(path: Path) -> HostProfile:
             _typed(_require(raw, "device_roles", where), dict, f"{where}.device_roles")
         ),
         port=_typed(raw.pop("port", 8000), int, f"{where}.port"),
+        text_corpora=dict(
+            _typed(raw.pop("text_corpora", {}) or {}, dict, f"{where}.text_corpora")
+        ),
         startup_timeout=float(
             _typed(raw.pop("startup_timeout", 900.0), (int, float), f"{where}.startup_timeout")
         ),

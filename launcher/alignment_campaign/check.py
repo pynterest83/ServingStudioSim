@@ -49,7 +49,7 @@ from ..alignment_config import (
     load_timing_predict_config,
 )
 from ..corpus import ROUTING_FILES
-from .pack import Case, Finding, HostProfile, Pack, PackError
+from .pack import Case, Finding, HostProfile, Pack, PackError, read_session_trace
 from .render import (
     ANALYSIS_E2E_PHASE,
     ANALYSIS_KERNEL_PHASE,
@@ -59,6 +59,7 @@ from .render import (
     SIMULATION_PHASE,
     TIMING_PREDICT_PHASE,
     WORKLOAD_TRACE_NAME,
+    _check_session_lengths,
     case_documents,
     case_traces,
     trace_text,
@@ -93,6 +94,11 @@ def host_for(pack: Pack, host: HostProfile | None) -> HostProfile:
     base = stub_host()
     checkpoints = dict(base.checkpoints)
     roles = dict(base.device_roles)
+    corpora = {
+        case.text_corpus.host_key: f"/nonexistent/corpus/{case.text_corpus.host_key}"
+        for case in pack.cases
+        if case.text_corpus is not None
+    }
     for variant in pack.variants.values():
         for key in (variant.checkpoint, variant.tokenizer, variant.draft_checkpoint):
             if key is None:
@@ -105,7 +111,7 @@ def host_for(pack: Pack, host: HostProfile | None) -> HostProfile:
             roles.setdefault(case.device_role, ",".join(str(index) for index in range(world_size)))
     from dataclasses import replace
 
-    return replace(base, checkpoints=checkpoints, device_roles=roles)
+    return replace(base, checkpoints=checkpoints, device_roles=roles, text_corpora=corpora)
 
 
 # ── trace invariants ─────────────────────────────────────────────────────────
@@ -269,6 +275,14 @@ def _check_traces(pack: Pack) -> list[Finding]:
         )
 
     for case in pack.cases:
+        if case.session_trace is not None:
+            # Committed bytes pinned by the pack's own sha256, not a recipe:
+            # nothing to regenerate and nothing for invariants.json to record.
+            try:
+                text, _ = read_session_trace(pack.root, case)
+                _check_session_lengths(case, text)
+            except PackError as exc:
+                findings.append(Finding("error", f"cases[{case.slug}].session_trace", str(exc)))
         for role, spec in (("workload_trace", case.workload_trace),
                            ("kernel_trace", case.kernel_trace)):
             if spec is None:
