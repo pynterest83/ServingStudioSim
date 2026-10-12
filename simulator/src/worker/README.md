@@ -48,7 +48,11 @@ Hybrid recurrent + attention archs (Qwen3.6 local, GLM-5.3-Flash) swap in
 `HybridGdnKv` under `barebone` (`Qwen36HybridWorker`), `chunked_prefill`
 (`HybridChunkedPrefillWorker`) and `speculative` (`HybridSpeculativeWorker`, the
 H200 GLM-5.3-Flash MTP arch, whose per-request state counts one page per draft
-position).
+position). A retained prefix snapshot is charged the arch's
+`recurrent_checkpoint_bytes`; with `eagle_block_drop` the speculative recipe
+switches the store to vLLM's EAGLE replay boundaries
+(`HybridGdnKv::with_eagle_replay_boundaries`, `CheckpointRetention` in
+`kv/shared/prefix_cache.rs`).
 
 Aliases such as `BareboneWorker<M>` and `DisaggAttnWorker<M>` name these concrete
 generic compositions. They are not wrapper runtimes.

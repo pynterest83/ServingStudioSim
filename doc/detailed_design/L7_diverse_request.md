@@ -190,7 +190,9 @@ speculative execution 仍只是被保真存储，在真实 consumer 与 capabili
 - stage/completion：`record.lifecycle.*`
 - TTFT/TPOT 日志：`record.telemetry.*`
 
-当前 text worker 已通过 L5 `PrefixKv` 实现 prefix-aware KV，chunked prefill 仍未实现。
+当前 text worker 已通过 L5 `PrefixKv` 实现 prefix-aware KV；`chunked_prefill` 与
+`speculative` worker（含 hybrid 的 `HybridChunkedPrefillWorker`、`HybridSpeculativeWorker`）
+同样消费 `PrefixKv`，chunked prefill 已经实现（`ChunkedPrefillKv`）。
 `TextGenerationDefinition.prompt_tokens` 只表示本次 fresh suffix；
 `SessionInput::Session.declared_prefix_tokens` 是 immutable requirement，不是 observed hit。
 `FullAttnKv` 在目标 attention partition 上解析：
@@ -201,7 +203,32 @@ prefill_tokens_to_compute = fresh prompt + declared prefix - resident
 post_prefill_context_tokens = fresh prompt + declared prefix
 ```
 
-`ResolvedPrefillContext` 只存于 `FullAttnKv`。Execution 从 `PrefixKv` 读取
+`HybridGdnKv`（recurrent + attention）把 resident 量化到 arch 的 checkpoint interval
+`Q`：默认规则下 completed request 的 resident context 中每个 `Q` 边界都可恢复，
+`resident = min(retained, floor(declared / Q) * Q)`，每个保留边界额外计一份
+`recurrent_checkpoint_bytes`（arch contract，默认等于整份 per-request state；
+GLM-5.3-Flash H200 speculative 为 3 个 page，即每个 KDA group 一个 state block，
+而 decoding request 常驻 19 个 page）。
+
+speculative recipe 在 `eagle_block_drop` 且 prefix caching 开启时改用 vLLM v0.31 的
+EAGLE replay 规则（`CheckpointRetention::EagleReplayBoundaries`，
+`kv_cache_coordinator.py` 的 `get_replay_boundaries` 与 `find_longest_cache_hit`）：
+
+```text
+P = 上一轮 prompt（fresh + declared，不含 output）
+retained = { max(floor((P-1)/Q)*Q - Q, 0), max(floor(P/Q)*Q - Q, 0) }   # resend / extension
+M = min(本轮 declared prefix, 本轮 prompt - 1)                         # 最后一个 token 必须计算
+candidate = max(floor(M/Q)*Q - Q, 0)                                   # attention 匹配后丢一个 block
+resident = retained 中不超过 candidate 的最大边界，否则 0
+```
+
+state 只写在 prompt 内，所以上一轮的 output 总是由下一轮重算；保留的 attention KV
+是较高边界之上的那个 block（`floor(P/Q)*Q`），每个非零边界计一份 checkpoint。
+已知限制（backlog）：每个 session 只保留最近一次 completed request 的条目，
+更早轮次留下、vLLM LRU pool 里可能仍存活的 checkpoint 不会被命中；也不模拟
+跨 session 的共享（radix / ref-counted page）。
+
+`ResolvedPrefillContext` 只存于 KV owner（`FullAttnKv` / `HybridGdnKv`）。Execution 从 `PrefixKv` 读取
 resident 与 `prefill_tokens_to_compute`；`TextGenerationProgress` 仍只保存真实 processed prefill
 work 与 emitted output tokens。cache disabled/evicted/placement miss 都会重算缺失 prefix，
 不会把 declaration 当成 guaranteed hit。admission 成功时会把实际 resident 数一次性复制到
@@ -229,6 +256,12 @@ request definition 重新推导。
 barebone、HP、PD prefill 与 AFD attention 都接通该 capability，并通过 worker selector
 暴露 `prefix_cache_mode`、`prefix_cache_policy` 与可选
 `prefix_cache_max_gpu_memory_gb`；launcher 从 Rust schema 自动生成对应 CLI/sweep 参数。
+`chunked_prefill` 与 `speculative` selector 不暴露这些 key，固定为 opportunistic + LRU、无上限。
+
+请求总长度（declared prefix + fresh prompt + output，speculative worker 再加
+`draft_tokens`）超过 pool 的 `max_model_len` 时，vLLM 以 HTTP 400 拒绝该 request；
+simulator 没有 per-request rejection 生命周期，因此 `deployment::check_trace` 在 run
+开始前拒绝整个 trace，并报告超长 request 数与前几个 request id（`TooLong`）。
 PD decode 消费 prefill 传来的 exact KV 数，但不另外维护 session prefix cache。默认类型参数
 仍指向 `TextGenerationDefinition`，且类型参数继续贯穿 `Flow`、`SharedRequests` 与 store；
 prefix support 没有把 current worker 扩成 request-family variant。
