@@ -194,7 +194,7 @@ impl Deployment for UnifiedDeployment {
             async_scheduling: async_scheduling(&g.worker),
             async_output_processing: async_output_processing(&g.worker)?,
             max_running_requests: max_running_requests(&g.worker),
-            checkpoint_release_at_prefill_end: checkpoint_release_at_prefill_end(&g.worker),
+            checkpoint_release: checkpoint_release(&g.worker),
             ..WorkerConfig::default()
         };
 
@@ -938,15 +938,15 @@ fn max_running_requests(worker: &IterWorkerSel) -> Option<u32> {
     }
 }
 
-/// The speculative selector's `recurrent_checkpoint_release: prefill-end`.
-fn checkpoint_release_at_prefill_end(worker: &IterWorkerSel) -> bool {
-    matches!(
-        worker,
+/// The speculative selector's `recurrent_checkpoint_release`.
+fn checkpoint_release(worker: &IterWorkerSel) -> RecurrentCheckpointRelease {
+    match worker {
         IterWorkerSel::Speculative {
-            recurrent_checkpoint_release: RecurrentCheckpointRelease::PrefillEnd,
+            recurrent_checkpoint_release,
             ..
-        }
-    )
+        } => *recurrent_checkpoint_release,
+        _ => RecurrentCheckpointRelease::Completion,
+    }
 }
 
 fn async_scheduling(worker: &IterWorkerSel) -> bool {

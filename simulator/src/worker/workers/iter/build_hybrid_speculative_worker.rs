@@ -27,7 +27,7 @@ use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{
     ChunkedPrefillAdmission, LoadBalance, PendingOrder, SpeculativeDecodeCompletion,
 };
-use crate::worker::config::KvAdmissionConfig;
+use crate::worker::config::{KvAdmissionConfig, RecurrentCheckpointRelease};
 use crate::worker::execution::SpeculativeIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::kv::{HybridGdnKv, PrefixCacheConfig};
@@ -159,13 +159,15 @@ pub(crate) fn build_hybrid_speculative_worker<M: SpeculativeUnifiedModel>(
     } else {
         kv_store
     };
-    let kv_store = if config.checkpoint_release_at_prefill_end {
+    let kv_store = if config.checkpoint_release.at_prefill_end() {
         assert!(
             eagle_replay_boundaries,
-            "recurrent_checkpoint_release: prefill-end is modeled only under eagle_block_drop \
-             with prefix caching"
+            "recurrent_checkpoint_release: prefill-end(-refresh) is modeled only under \
+             eagle_block_drop with prefix caching"
         );
-        kv_store.with_checkpoint_release_at_prefill_end()
+        kv_store.with_checkpoint_release_at_prefill_end(
+            config.checkpoint_release == RecurrentCheckpointRelease::PrefillEndRefresh,
+        )
     } else {
         kv_store
     };
@@ -237,7 +239,7 @@ mod tests {
     use crate::common::{AcceptanceProfile, DecodingStrategy, RequestId, SessionInput, Time};
     use crate::test_helpers::{lm, shared_with, test_cluster};
     use crate::timing::LeafMetrics;
-    use crate::worker::config::KvAdmissionConfig;
+    use crate::worker::config::{KvAdmissionConfig, RecurrentCheckpointRelease};
     use crate::worker::iter_worker::IterWorker;
     use crate::worker::kv::PrefixCachePolicy;
     use crate::worker::types::WorkerMsgCommon;
@@ -639,7 +641,7 @@ mod tests {
             attn_kv_bytes: 100_000 * KV_BYTES_PER_TOKEN,
             max_batch_tokens: Some(2048),
             kv_admission: KvAdmissionConfig::Incremental,
-            checkpoint_release_at_prefill_end: true,
+            checkpoint_release: RecurrentCheckpointRelease::PrefillEnd,
             speculative_draft_tokens: DRAFT_TOKENS,
             speculative_acceptance_seed: Some(7),
             eagle_block_drop: true,

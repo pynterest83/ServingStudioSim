@@ -415,3 +415,7 @@ evicts by segment (`CheckpointRelease::AtPrefillEnd` in
 state, a dead entry's context stays queued as an orphan until reached. Under
 load whose retained working set exceeds the pool this is what turns hits into
 an all-miss thrash (`logs/20261012_11_glm53_h200_thrash`).
+`prefill-end-refresh` is a what-if on top of it
+(`CheckpointRelease::AtPrefillEndRefreshedAtCompletion`): the states are freed
+at the prefill end the same way, but if still cached at completion they move to
+the completion position with the attention segment; evicted ones stay lost.

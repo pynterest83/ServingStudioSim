@@ -548,11 +548,10 @@ pub struct WorkerConfig {
     /// chunked-prefill and speculative selectors). `None` is unlimited. Only
     /// `ChunkedPrefillAdmission` reads it.
     pub max_running_requests: Option<u32>,
-    /// A hybrid arch's prompt snapshots enter the retained tier at the prefill
-    /// end rather than at completion (the speculative selector's
-    /// `recurrent_checkpoint_release: prefill-end`). Only the hybrid
+    /// When a hybrid arch's prompt snapshots enter the retained tier (the
+    /// speculative selector's `recurrent_checkpoint_release`). Only the hybrid
     /// speculative recipe reads it.
-    pub checkpoint_release_at_prefill_end: bool,
+    pub checkpoint_release: crate::worker::config::RecurrentCheckpointRelease,
 }
 
 impl Default for WorkerConfig {
@@ -579,7 +578,7 @@ impl Default for WorkerConfig {
             async_scheduling: false,
             async_output_processing: Time::ZERO,
             max_running_requests: None,
-            checkpoint_release_at_prefill_end: false,
+            checkpoint_release: crate::worker::config::RecurrentCheckpointRelease::Completion,
         }
     }
 }

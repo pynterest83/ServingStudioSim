@@ -183,6 +183,22 @@ pub(crate) enum CheckpointRelease {
     /// segment that only occupies capacity until it is reached. Only the LRU
     /// policy is defined in this mode.
     AtPrefillEnd,
+    /// What-if: freed at the prefill end exactly as [`Self::AtPrefillEnd`],
+    /// but snapshots still cached when the request completes move to the
+    /// completion position together with its context KV, as if the engine
+    /// re-freed (touched) them then. Snapshots evicted before completion stay
+    /// lost. Only the LRU policy is defined in this mode.
+    AtPrefillEndRefreshedAtCompletion,
+}
+
+impl CheckpointRelease {
+    /// Snapshots enter the tier at the prefill end, as a segment of their own.
+    pub(crate) fn at_prefill_end(self) -> bool {
+        matches!(
+            self,
+            Self::AtPrefillEnd | Self::AtPrefillEndRefreshedAtCompletion
+        )
+    }
 }
 
 /// The resumable positions of one entry under
@@ -619,7 +635,7 @@ impl PrefixCache {
         prompt_tokens: u64,
         physical_limit: u64,
     ) -> PrefixCacheInsertResult {
-        debug_assert_eq!(self.release, CheckpointRelease::AtPrefillEnd);
+        debug_assert!(self.release.at_prefill_end());
         let mut mutations = Vec::new();
         if let Some(mutation) =
             self.remove_with_receipt(session_id, PrefixCacheMutationKind::SameSessionReplacement)
@@ -682,14 +698,16 @@ impl PrefixCache {
     /// the entry can serve a hit. If the snapshots were evicted meanwhile, the
     /// context KV still enters the queue, as an orphan. Freed blocks never
     /// evict anything in the engine, so this only evicts when the hard tier
-    /// keeps the freed context for itself (`physical_limit`).
+    /// keeps the freed context for itself (`physical_limit`). Under
+    /// [`CheckpointRelease::AtPrefillEndRefreshedAtCompletion`] surviving
+    /// snapshots move to this completion position too.
     pub(crate) fn complete_context(
         &mut self,
         session_id: u32,
         prompt_tokens: u64,
         physical_limit: u64,
     ) -> PrefixCacheInsertResult {
-        debug_assert_eq!(self.release, CheckpointRelease::AtPrefillEnd);
+        debug_assert!(self.release.at_prefill_end());
         let mut mutations = Vec::new();
         let effective_capacity = self.max_retained_tokens.min(physical_limit);
         let live = self
@@ -751,6 +769,9 @@ impl PrefixCache {
             .expect("a live pending entry");
         entry.context_pending = false;
         entry.last_access_sequence = sequence;
+        if self.release == CheckpointRelease::AtPrefillEndRefreshedAtCompletion {
+            entry.checkpoint_sequence = sequence;
+        }
         self.used_tokens += tokens;
         mutations.push(PrefixCacheMutation {
             kind: PrefixCacheMutationKind::Retain,
@@ -778,7 +799,7 @@ impl PrefixCache {
             Victim::Entry(session_id) => {
                 let cache_used_before = self.used_tokens;
                 let entry = self.remove(session_id)?;
-                if self.release == CheckpointRelease::AtPrefillEnd && !entry.context_pending {
+                if self.release.at_prefill_end() && !entry.context_pending {
                     self.orphans
                         .insert(entry.last_access_sequence, entry.tokens);
                     self.orphan_tokens += entry.tokens;
@@ -804,7 +825,7 @@ impl PrefixCache {
     }
 
     fn victim(&self) -> Option<Victim> {
-        if self.release == CheckpointRelease::AtPrefillEnd {
+        if self.release.at_prefill_end() {
             // One LRU over segments: an entry's oldest is its snapshot segment.
             let entry = self
                 .entries
@@ -1304,5 +1325,51 @@ mod tests {
         assert_eq!(completed.retained_tokens, 0);
         assert_eq!(cache.peek(1, 39), 0);
         assert_eq!(cache.used_charge(), 32);
+    }
+
+    fn refreshed_cache(capacity: u64) -> PrefixCache {
+        PrefixCache::new(capacity, PrefixCachePolicy::Lru, 16, 10)
+            .with_checkpoint_retention(CheckpointRetention::EagleReplayBoundaries)
+            .with_checkpoint_release(CheckpointRelease::AtPrefillEndRefreshedAtCompletion)
+    }
+
+    #[test]
+    fn a_completion_refresh_moves_the_snapshots_behind_newer_segments() {
+        // The long-decode order of `a_long_decode_loses_its_snapshots_before_a_younger_entry`:
+        // refreshed at completion, session 1's snapshots are now the newest
+        // segment, so session 2 (completed earlier) goes first.
+        let mut cache = refreshed_cache(1_000);
+        cache.insert_checkpoints(1, 40, 1_000);
+        cache.insert_checkpoints(2, 40, 1_000);
+        cache.complete_context(2, 40, 1_000);
+        cache.complete_context(1, 40, 1_000);
+        assert_eq!(cache.used_charge(), 84);
+        cache.shrink_to(80);
+        assert_eq!(cache.peek(1, 39), 16, "the refreshed snapshots survive");
+        assert_eq!(cache.peek(2, 39), 0);
+        assert_eq!(
+            cache.used_charge(),
+            74,
+            "session 2's context stays queued as an orphan"
+        );
+        // Session 2's orphan (completion 2) precedes session 1 (completion 3).
+        cache.shrink_to(50);
+        assert_eq!(cache.peek(1, 39), 16);
+        assert_eq!(cache.used_charge(), 42);
+    }
+
+    #[test]
+    fn a_completion_refresh_does_not_resurrect_evicted_snapshots() {
+        let mut cache = refreshed_cache(1_000);
+        cache.insert_checkpoints(1, 40, 1_000);
+        cache.shrink_to(0);
+        let completed = cache.complete_context(1, 40, 1_000);
+        assert_eq!(completed.retained_tokens, 0);
+        assert_eq!(cache.peek(1, 39), 0);
+        assert_eq!(
+            cache.used_charge(),
+            32,
+            "only the context returns, as an orphan"
+        );
     }
 }

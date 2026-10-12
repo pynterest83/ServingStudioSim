@@ -57,9 +57,20 @@ pub enum RecurrentCheckpointRelease {
     Completion,
     /// When the prefill ends (vLLM's Mamba `align` mode).
     PrefillEnd,
+    /// What-if: when the prefill ends, as `PrefillEnd`, but states still
+    /// cached at completion are refreshed to the completion time together
+    /// with the context KV.
+    PrefillEndRefresh,
 }
 
-const CHECKPOINT_RELEASE_CHOICES: [&str; 2] = ["completion", "prefill-end"];
+impl RecurrentCheckpointRelease {
+    /// The states enter the retained tier at the prefill end.
+    pub fn at_prefill_end(self) -> bool {
+        matches!(self, Self::PrefillEnd | Self::PrefillEndRefresh)
+    }
+}
+
+const CHECKPOINT_RELEASE_CHOICES: [&str; 3] = ["completion", "prefill-end", "prefill-end-refresh"];
 
 /// Ordering used when the next physical decode allocation does not fit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -529,8 +540,11 @@ pub enum IterWorkerSel {
         /// finishes; `prefill-end` reproduces vLLM's Mamba `align` mode, which
         /// frees the replay-boundary states into the LRU block pool when the
         /// prefill ends and the attention blocks when the request finishes, so
-        /// a long decode ages its own successor's hit. Modeled only under
-        /// `eagle_block_drop` with prefix caching.
+        /// a long decode ages its own successor's hit. `prefill-end-refresh`
+        /// is a what-if: freed at the prefill end, but states still cached at
+        /// completion move to the completion time with the attention blocks.
+        /// The prefill-end modes are modeled only under `eagle_block_drop`
+        /// with prefix caching.
         #[serde(default)]
         #[param(string, default = "completion", choices = CHECKPOINT_RELEASE_CHOICES)]
         recurrent_checkpoint_release: RecurrentCheckpointRelease,
@@ -892,6 +906,21 @@ mod tests {
              recurrent_checkpoint_release: prefill-end\n",
         )
         .expect("parse the vLLM block-pool speculative YAML");
+        let refresh: IterWorkerSel = serde_yaml::from_str(
+            "type: speculative\n\
+             attn_gpu_memory_gb: 80.0\n\
+             max_batch_tokens: 8192\n\
+             draft_tokens: 5\n\
+             recurrent_checkpoint_release: prefill-end-refresh\n",
+        )
+        .expect("parse the refresh what-if");
+        assert!(matches!(
+            refresh,
+            IterWorkerSel::Speculative {
+                recurrent_checkpoint_release: RecurrentCheckpointRelease::PrefillEndRefresh,
+                ..
+            }
+        ));
         let IterWorkerSel::Speculative {
             kv_admission,
             max_running_requests,

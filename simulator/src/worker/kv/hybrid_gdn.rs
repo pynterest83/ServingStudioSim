@@ -652,7 +652,7 @@ impl ChunkedPrefillKv for HybridGdnKv {
             u64::from(context_tokens),
             remaining_output_tokens,
         );
-        if self.checkpoint_release == CheckpointRelease::AtPrefillEnd {
+        if self.checkpoint_release.at_prefill_end() {
             if let Some(session_id) = resolved_prefill.session_id() {
                 self.retain_checkpoints(
                     request,
@@ -816,20 +816,30 @@ impl HybridGdnKv {
     }
 
     /// Retain a prompt's snapshots when its prefill ends and its context KV
-    /// when it completes, as two LRU segments ([`CheckpointRelease::AtPrefillEnd`]).
+    /// when it completes, as two LRU segments ([`CheckpointRelease::AtPrefillEnd`]);
+    /// with `refresh_at_completion`, surviving snapshots move to the completion
+    /// position too ([`CheckpointRelease::AtPrefillEndRefreshedAtCompletion`]).
     /// Needs [`Self::with_eagle_replay_boundaries`] first: only the replay
     /// boundaries are freed into the pool at the prefill end.
-    pub(crate) fn with_checkpoint_release_at_prefill_end(mut self) -> Self {
+    pub(crate) fn with_checkpoint_release_at_prefill_end(
+        mut self,
+        refresh_at_completion: bool,
+    ) -> Self {
         assert!(
             self.eagle_replay_boundaries,
             "checkpoint release at the prefill end is modeled only under EAGLE replay boundaries"
         );
+        let release = if refresh_at_completion {
+            CheckpointRelease::AtPrefillEndRefreshedAtCompletion
+        } else {
+            CheckpointRelease::AtPrefillEnd
+        };
         self.prefix_caches = self
             .prefix_caches
             .into_iter()
-            .map(|cache| cache.with_checkpoint_release(CheckpointRelease::AtPrefillEnd))
+            .map(|cache| cache.with_checkpoint_release(release))
             .collect();
-        self.checkpoint_release = CheckpointRelease::AtPrefillEnd;
+        self.checkpoint_release = release;
         self
     }
 
@@ -964,7 +974,9 @@ impl HybridGdnKv {
                 physical_limit,
                 cache_return_metadata,
             ),
-            CheckpointRelease::AtPrefillEnd => self.prefix_caches[partition as usize]
+            CheckpointRelease::AtPrefillEnd
+            | CheckpointRelease::AtPrefillEndRefreshedAtCompletion => self.prefix_caches
+                [partition as usize]
                 .complete_context(session_id, tokens, physical_limit),
         };
         for mutation in insert_result.mutations {
@@ -1607,7 +1619,7 @@ mod tests {
 
     #[test]
     fn prefill_end_release_retains_the_snapshots_before_the_request_finishes() {
-        let mut kv_store = incremental_store(10_000).with_checkpoint_release_at_prefill_end();
+        let mut kv_store = incremental_store(10_000).with_checkpoint_release_at_prefill_end(false);
         incremental_round_to_decode(&mut kv_store, 0);
         assert_eq!(
             kv_store.prefix_caches[0].used_charge(),
