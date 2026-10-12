@@ -13,6 +13,10 @@
 //! can be smaller than the state a running request pins. Under
 //! `eagle_block_drop` the store also retains and resumes only vLLM's EAGLE
 //! replay boundaries of each prompt (`HybridGdnKv::with_eagle_replay_boundaries`).
+//! A `prefix_match_unit_tokens` finer than the checkpoint interval (vLLM's
+//! `--prefix-match-unit`) adds each prompt's partial-tail boundary at that unit,
+//! both as a retained resume point (`HybridGdnKv::with_prefix_match_unit`) and
+//! as a chunk stop (`ChunkedPrefillAdmission::with_prefix_match_unit`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -127,10 +131,25 @@ pub(crate) fn build_hybrid_speculative_worker<M: SpeculativeUnifiedModel>(
     // The same vLLM constraint the chunk split below reproduces also decides
     // which prompt boundaries a completed request leaves resumable.
     let eagle_replay_boundaries = chunk_end_quantum.is_some() && config.eagle_block_drop;
-    let kv_store = if eagle_replay_boundaries {
-        kv_store.with_eagle_replay_boundaries()
-    } else {
-        kv_store
+    // vLLM requires the unit to divide every group's block size and the
+    // indexer's 4-token key pool granularity.
+    let prefix_match_unit = config.prefix_match_unit_tokens.inspect(|&unit| {
+        assert!(
+            eagle_replay_boundaries,
+            "prefix_match_unit_tokens is modeled only under eagle_block_drop with prefix caching"
+        );
+        assert!(
+            unit > 0 && unit.is_multiple_of(4) && checkpoint_interval_tokens.is_multiple_of(unit),
+            "prefix_match_unit_tokens={unit} must be a multiple of 4 dividing the \
+             recurrent checkpoint interval {checkpoint_interval_tokens}"
+        );
+    });
+    let kv_store = match (eagle_replay_boundaries, prefix_match_unit) {
+        (true, Some(unit)) => kv_store
+            .with_eagle_replay_boundaries()
+            .with_prefix_match_unit(unit),
+        (true, None) => kv_store.with_eagle_replay_boundaries(),
+        (false, _) => kv_store,
     };
     let balance = if num_partitions == 1 {
         LoadBalance::Single
@@ -152,9 +171,15 @@ pub(crate) fn build_hybrid_speculative_worker<M: SpeculativeUnifiedModel>(
         drafting_slots,
     );
     let admission = match chunk_end_quantum {
-        Some(quantum) if config.eagle_block_drop => admission
-            .with_chunk_end_quantum(quantum)
-            .with_eagle_block_drop(),
+        Some(quantum) if config.eagle_block_drop => {
+            let admission = admission
+                .with_chunk_end_quantum(quantum)
+                .with_eagle_block_drop();
+            match prefix_match_unit {
+                Some(unit) => admission.with_prefix_match_unit(unit),
+                None => admission,
+            }
+        }
         Some(quantum) => admission.with_chunk_end_quantum(quantum),
         None => admission,
     };
@@ -332,6 +357,7 @@ mod tests {
         eagle_block_drop: bool,
         checkpoint_tokens: Option<u64>,
         max_retained_tokens: Option<u64>,
+        prefix_match_unit_tokens: Option<u32>,
     ) -> (u32, u32) {
         let requests = shared_with(&[(0, 40, OUTPUT_TOKENS), (1, 10, OUTPUT_TOKENS)]);
         {
@@ -360,6 +386,7 @@ mod tests {
             speculative_draft_tokens: DRAFT_TOKENS,
             speculative_acceptance_seed: Some(7),
             eagle_block_drop,
+            prefix_match_unit_tokens,
             prefix_cache: PrefixCacheConfig::Opportunistic {
                 policy: PrefixCachePolicy::Lru,
                 max_retained_bytes: max_retained_tokens.map(|tokens| tokens * KV_BYTES_PER_TOKEN),
@@ -400,10 +427,10 @@ mod tests {
         // P = 40 with 16-token blocks: the replay boundaries are both
         // floor(40 / 16) * 16 - 16 = 16. Turn two reaches all 40 declared
         // tokens, drops one block from the 32 it matches, and resumes at 16.
-        assert_eq!(second_turn(true, None, None), (16, 50 - 16));
+        assert_eq!(second_turn(true, None, None, None), (16, 50 - 16));
         // Without the drop the store resumes from the decoded context, capped
         // at the declared prefix's last whole block.
-        assert_eq!(second_turn(false, None, None), (32, 50 - 32));
+        assert_eq!(second_turn(false, None, None, None), (32, 50 - 32));
     }
 
     #[test]
@@ -411,7 +438,26 @@ mod tests {
         // The entry keeps 32 attention tokens plus one checkpoint. A 60-token
         // retained-prefix ceiling holds it at a 10-token checkpoint, but not
         // at the 100-token state a running request pins.
-        assert_eq!(second_turn(true, Some(10), Some(60)), (16, 50 - 16));
-        assert_eq!(second_turn(true, None, Some(60)), (0, 50));
+        assert_eq!(second_turn(true, Some(10), Some(60), None), (16, 50 - 16));
+        assert_eq!(second_turn(true, None, Some(60), None), (0, 50));
+    }
+
+    #[test]
+    fn a_finer_prefix_match_unit_resumes_one_unit_below_the_previous_prompt() {
+        // P = 40, 16-token blocks, a 4-token unit: turn two reaches 40 tokens,
+        // drops one unit, and resumes at floor(40 / 4) * 4 - 4 = 36 rather
+        // than the block boundary 16.
+        assert_eq!(second_turn(true, None, None, Some(4)), (36, 50 - 36));
+        // A unit equal to the block is the default rule.
+        assert_eq!(
+            second_turn(true, None, None, Some(CHECKPOINT_INTERVAL)),
+            (16, 50 - 16)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must be a multiple of 4 dividing")]
+    fn a_prefix_match_unit_must_divide_the_checkpoint_interval() {
+        second_turn(true, None, None, Some(12));
     }
 }

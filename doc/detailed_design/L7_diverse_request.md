@@ -226,6 +226,16 @@ state 只写在 prompt 内，所以上一轮的 output 总是由下一轮重算�
 是较高边界之上的那个 block（`floor(P/Q)*Q`），每个非零边界计一份 checkpoint。
 同理，运行中的 decode 在 prompt 之外不留下任何可复用 state：默认规则下 live decode
 每跨过一个 `Q` 边界计一份 soft staircase charge，此规则下该 charge 为 0。
+
+worker 选项 `prefix_match_unit_tokens = u`（vLLM `--prefix-match-unit`，默认等于 `Q`，
+必须整除 `Q` 且为 4 的倍数，只在 `eagle_block_drop` 下建模）在 `u < Q` 时增加同一对
+边界的 `u` 粒度版本：retained 再并入 `{floor((P-1)/u)*u - u, floor(P/u)*u - u}`，
+`candidate = floor(M/u)*u - u`，`Q` 边界保留不变；每个不同的非零边界计一份 checkpoint，
+保留的 attention KV 扩到包含最高边界之上那个 `u` 的 `Q` page（vLLM
+`_cache_partial_tail_block` 缓存 prompt 的 partial tail page）。chunk split 同时加上
+`scheduler.py` 的 `tail_boundary` 停点（`floor(P/u)*u - u`，位于最后一个可缓存 block
+边界之后时）。H200 实测（MTP 5，`u = 64`）：15 轮中 13 轮命中 `floor(P/64)*64 - 64`，
+2 轮回落到 `Q` 边界；模型只实现确定性规则，这一回落是已知差异。
 已知限制（backlog）：每个 session 只保留最近一次 completed request 的条目，
 更早轮次留下、vLLM LRU pool 里可能仍存活的 checkpoint 不会被命中；也不模拟
 跨 session 的共享（radix / ref-counted page）。

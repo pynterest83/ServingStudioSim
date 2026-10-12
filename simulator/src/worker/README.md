@@ -52,7 +52,9 @@ position). A retained prefix snapshot is charged the arch's
 `recurrent_checkpoint_bytes`; with `eagle_block_drop` the speculative recipe
 switches the store to vLLM's EAGLE replay boundaries
 (`HybridGdnKv::with_eagle_replay_boundaries`, `CheckpointRetention` in
-`kv/shared/prefix_cache.rs`).
+`kv/shared/prefix_cache.rs`); `prefix_match_unit_tokens` (vLLM's
+`--prefix-match-unit`) adds the finer partial-tail boundaries
+(`HybridGdnKv::with_prefix_match_unit`).
 
 Aliases such as `BareboneWorker<M>` and `DisaggAttnWorker<M>` name these concrete
 generic compositions. They are not wrapper runtimes.

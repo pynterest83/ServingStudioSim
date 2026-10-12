@@ -532,6 +532,10 @@ pub struct WorkerConfig {
     /// Reproduce vLLM's `use_eagle_block_drop` chunk split (from the
     /// `speculative` selector). Only the hybrid speculative recipe reads it.
     pub eagle_block_drop: bool,
+    /// vLLM's `--prefix-match-unit` (from the `speculative` selector). `None`
+    /// is the recurrent checkpoint interval. Only the hybrid speculative recipe
+    /// reads it, and only under `eagle_block_drop` with prefix caching.
+    pub prefix_match_unit_tokens: Option<u32>,
     /// Reproduce vLLM's async scheduling (from the `speculative` selector):
     /// one-step-ahead batch formation, a trailing verify row after a request
     /// finished by accepted drafts, the idle engine's first-input step, and
@@ -562,6 +566,7 @@ impl Default for WorkerConfig {
             speculative_draft_tokens: 0,
             speculative_acceptance_seed: None,
             eagle_block_drop: false,
+            prefix_match_unit_tokens: None,
             async_scheduling: false,
             async_output_processing: Time::ZERO,
         }

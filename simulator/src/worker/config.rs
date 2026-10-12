@@ -493,6 +493,15 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(default = false)]
         eagle_block_drop: bool,
+        /// vLLM's `--prefix-match-unit`, in tokens: the hash granularity a
+        /// hybrid arch's prefix lookup matches at. None (the default) is the
+        /// recurrent checkpoint interval, the engine's own default. A finer unit
+        /// must divide that interval and be a multiple of 4; with
+        /// `eagle_block_drop` it adds a resumable partial-tail state one unit
+        /// below each prompt's last whole unit. Modeled only together with
+        /// `eagle_block_drop` and prefix caching.
+        #[serde(default)]
+        prefix_match_unit_tokens: Option<u32>,
         /// vLLM's async scheduling: the batch for step k+1 is formed when step k
         /// launches, without k's output. A request queued while k runs first
         /// runs in k+2, a request finished at N by accepted drafts still runs

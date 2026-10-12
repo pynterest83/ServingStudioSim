@@ -189,6 +189,7 @@ impl Deployment for UnifiedDeployment {
             speculative_draft_tokens: speculative_draft_tokens(&g.worker),
             speculative_acceptance_seed: speculative_acceptance_seed(&g.worker),
             eagle_block_drop: eagle_block_drop(&g.worker),
+            prefix_match_unit_tokens: prefix_match_unit_tokens(&g.worker)?,
             async_scheduling: async_scheduling(&g.worker),
             async_output_processing: async_output_processing(&g.worker)?,
             ..WorkerConfig::default()
@@ -893,6 +894,31 @@ fn eagle_block_drop(worker: &IterWorkerSel) -> bool {
     }
 }
 
+/// vLLM's `--prefix-match-unit`, carried by the `speculative` selector only.
+/// A unit is a positive multiple of 4 (vLLM's index-pool granularity) and only
+/// takes effect under `eagle_block_drop`; whether it divides the recurrent
+/// checkpoint interval is checked by the recipe, which knows that interval.
+fn prefix_match_unit_tokens(worker: &IterWorkerSel) -> anyhow::Result<Option<u32>> {
+    match worker {
+        IterWorkerSel::Speculative {
+            prefix_match_unit_tokens: Some(unit),
+            eagle_block_drop,
+            ..
+        } => {
+            ensure!(
+                *unit > 0 && unit.is_multiple_of(4),
+                "unified: prefix_match_unit_tokens must be a positive multiple of 4, got {unit}"
+            );
+            ensure!(
+                *eagle_block_drop,
+                "unified: prefix_match_unit_tokens is modeled only with eagle_block_drop: true"
+            );
+            Ok(Some(*unit))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// vLLM's async scheduling, carried by the `speculative` selector only.
 fn async_scheduling(worker: &IterWorkerSel) -> bool {
     match worker {
@@ -1377,6 +1403,7 @@ pools:
             prefill_gpu_time_multiplier: None,
             host_time: Default::default(),
             eagle_block_drop: false,
+            prefix_match_unit_tokens: None,
             async_scheduling: false,
             async_output_processing_ms: 0.0,
             what_if_kernel_time_scale: Vec::new(),
@@ -1496,6 +1523,33 @@ pools:
         }
         assert!(eagle_block_drop(&reproduce_vllm));
         assert!(!eagle_block_drop(&barebone_worker()));
+    }
+
+    #[test]
+    fn a_prefix_match_unit_is_a_multiple_of_four_under_the_eagle_block_drop() {
+        let with_unit = |unit: Option<u32>, block_drop: bool| {
+            let mut worker = speculative_worker(5);
+            if let IterWorkerSel::Speculative {
+                eagle_block_drop,
+                prefix_match_unit_tokens,
+                ..
+            } = &mut worker
+            {
+                *eagle_block_drop = block_drop;
+                *prefix_match_unit_tokens = unit;
+            }
+            prefix_match_unit_tokens(&worker)
+        };
+        assert_eq!(with_unit(None, false).unwrap(), None);
+        assert_eq!(with_unit(None, true).unwrap(), None);
+        assert_eq!(with_unit(Some(64), true).unwrap(), Some(64));
+        for unit in [0, 66] {
+            let error = with_unit(Some(unit), true).unwrap_err().to_string();
+            assert!(error.contains("positive multiple of 4"), "{error}");
+        }
+        let error = with_unit(Some(64), false).unwrap_err().to_string();
+        assert!(error.contains("eagle_block_drop"), "{error}");
+        assert_eq!(prefix_match_unit_tokens(&barebone_worker()).unwrap(), None);
     }
 
     #[test]
