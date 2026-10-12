@@ -439,7 +439,10 @@ def _workload_block(
         "backend": {"type": backend},
         "text_file": host.text_corpus_path(corpus_key),
         "tokenizer": host.checkpoint_path(variant.tokenizer),
-        "token_pool_limit": 1_000_000,
+        # A session trace draws its fresh prompt tokens from the pool across many long sessions (the agentic sample
+        # needs ~12M); a 1M pool would wrap and hand two sessions the same prompt prefix, a fabricated cross-session
+        # cache hit. The shape traces keep their original 1M pool.
+        "token_pool_limit": 1_000_000 if case.session_trace is None else 100_000_000,
         "arrival_mode": case.profile_arrival_mode,
     }
     if case.max_concurrency is not None:
