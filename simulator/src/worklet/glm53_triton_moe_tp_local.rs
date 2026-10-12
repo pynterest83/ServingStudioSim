@@ -45,6 +45,34 @@ const SMALL_BATCH_BLOCK_M: u32 = 16;
 const LARGE_BATCH_BLOCK_M: u32 = 64;
 const SMALL_BATCH_MAX_TOKENS: u32 = 64;
 
+/// Which measured `vllm_fused_moe` rows price the two Triton launches. vLLM
+/// reads a tuned config folder (`VLLM_TUNED_CONFIG_FOLDER`) before its shipped
+/// tables, so a tuned deployment runs the same kernel with other tile
+/// configs; its rows live under their own L1 backend so they never overwrite
+/// the default ones.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FusedMoeBackend {
+    /// No tuned folder: vLLM's shipped table or `get_default_config`.
+    #[default]
+    VllmTriton,
+    /// `VLLM_TUNED_CONFIG_FOLDER` holding the H200 E=288, N=512 block-FP8
+    /// config whose sha256 begins 212d200c (`profiling/configs/vllm_fused_moe/
+    /// tuned_212d200c`).
+    #[serde(rename = "vllm_triton_tuned_212d200c")]
+    VllmTritonTuned212d200c,
+}
+
+impl FusedMoeBackend {
+    /// The `vllm_fused_moe` L1 backend that prices both launches.
+    pub fn l1_backend(self) -> &'static str {
+        match self {
+            Self::VllmTriton => "vllm_triton",
+            Self::VllmTritonTuned212d200c => "vllm_triton_tuned_212d200c",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Glm53TritonMoeRouterLocalWorkletConfig {
     pub hidden: Dim,

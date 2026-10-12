@@ -73,7 +73,7 @@ use crate::timing::{
 };
 use crate::worklet::glm53_fp8_mlp_local::COLUMN_MAJOR_SCALE_FORMAT;
 use crate::worklet::{
-    Glm53DsaSpecAttnLocalWorklet, Glm53DsaSpecAttnLocalWorkletConfig,
+    FusedMoeBackend, Glm53DsaSpecAttnLocalWorklet, Glm53DsaSpecAttnLocalWorkletConfig,
     Glm53DsaSpecAttnLocalWorkletInput, Glm53DsaSpecAttnLocalWorkletResolved,
     Glm53Fp8MlpLocalWorklet, Glm53Fp8MlpLocalWorkletConfig, Glm53Fp8MlpLocalWorkletInput,
     Glm53Fp8MlpLocalWorkletResolved, Glm53KdaSpecAttnLocalWorklet,
@@ -157,7 +157,6 @@ const TOPK_PREFILL_BACKENDS: &[&str] = &["vllm_cuda"];
 const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
 /// vLLM's `FlashAttnPrefillBackend` FA3 varlen calls of dense-MHA prefill.
 const DENSE_PREFILL_ATTENTION_BACKENDS: &[&str] = &["vllm_fa3"];
-const FUSED_MOE_BACKENDS: &[&str] = &["vllm_triton"];
 const MOE_ALIGN_BACKENDS: &[&str] = &["vllm_cuda"];
 const MOE_SUM_BACKENDS: &[&str] = &["vllm_cuda"];
 const ALL_REDUCE_FUSION_BACKENDS: &[&str] = &["flashinfer_trtllm"];
@@ -175,6 +174,9 @@ pub struct Glm53FlashSpecParallel {
     /// vLLM's sparse-MLA backend for the MQA rows: `FLASH_ATTN_MLA_SPARSE`
     /// (the production recipe without nvcc on PATH) unless set.
     pub sparse_mla_backend: SparseMlaBackend,
+    /// Which `vllm_fused_moe` rows price the Triton MoE launches: vLLM's
+    /// default configs unless a tuned config folder's backend is selected.
+    pub moe_backend: FusedMoeBackend,
 }
 
 /// The routing demand of each MoE forward kind: the body and the MTP step 0
@@ -283,7 +285,7 @@ pub fn build_configs(
         activation_dtype: ACTIVATION_DTYPE,
         gpu_name: gpu.clone(),
         quant_backends: FP8_QUANT_BACKENDS.to_vec(),
-        fused_moe_backends: FUSED_MOE_BACKENDS.to_vec(),
+        fused_moe_backends: vec![parallel.moe_backend.l1_backend()],
         align_backends: MOE_ALIGN_BACKENDS.to_vec(),
         sum_backends: MOE_SUM_BACKENDS.to_vec(),
         elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
@@ -1555,6 +1557,10 @@ mod tests {
     }
 
     fn configs() -> Glm53FlashSpecConfigs {
+        configs_with_moe(FusedMoeBackend::default())
+    }
+
+    fn configs_with_moe(moe_backend: FusedMoeBackend) -> Glm53FlashSpecConfigs {
         let uniform = ExpertDemand::popularity(&RoutingDistribution::uniform(288), 43);
         build_configs(
             &model_cfg(),
@@ -1565,6 +1571,7 @@ mod tests {
                 cudagraph_capture_sizes: vec![1, 2, 4, 6, 8, 12, 16, 24, 32, 512],
                 draft_tokens: 5,
                 sparse_mla_backend: SparseMlaBackend::default(),
+                moe_backend,
             },
             &Glm53FlashSpecDemand {
                 body: uniform.clone(),
@@ -1627,6 +1634,62 @@ mod tests {
         );
         assert_eq!((c.mtp_eh_proj.n.get(), c.mtp_eh_proj.k.get()), (4096, 8192));
         assert_eq!(c.lm_head.n.get(), 154_880 / 4);
+    }
+
+    /// The defect this catches: a tuned-config deployment priced from the
+    /// default `vllm_triton` rows, or the tuned rows leaking into the default
+    /// presets. Every routed MoE launch (body and both MTP steps, gate/up and
+    /// down) follows the selector; nothing else changes backend.
+    #[test]
+    fn the_moe_backend_selects_which_fused_moe_rows_price_every_routed_launch() {
+        for (moe_backend, expected) in [
+            (FusedMoeBackend::VllmTriton, "vllm_triton"),
+            (
+                FusedMoeBackend::VllmTritonTuned212d200c,
+                "vllm_triton_tuned_212d200c",
+            ),
+        ] {
+            let c = configs_with_moe(moe_backend);
+            for routed in [&c.routed_body, &c.routed_mtp_step0, &c.routed_mtp_recurrent] {
+                assert_eq!(routed.fused_moe_backends, [expected]);
+            }
+            let r = resolve_configs(&c);
+            assert_eq!(r.routed_body.gate_up.backends, [expected]);
+            assert_eq!(r.routed_body.down.backends, [expected]);
+            assert_eq!(
+                r.routed_body.align.backends,
+                configs().routed_body.align_backends
+            );
+        }
+        assert_eq!(FusedMoeBackend::default(), FusedMoeBackend::VllmTriton);
+    }
+
+    /// Existing presets omit the field and keep the default rows; the tuned
+    /// spelling is the L1 backend name.
+    #[test]
+    fn the_moe_backend_parses_from_a_preset_and_defaults_to_vllm_triton() {
+        use crate::arch::config::IterArchSel;
+        let parse = |extra: &[(&str, &str)]| {
+            let mut arch = serde_json::json!({
+                "type": ARCH_KIND,
+                "model_config": "model/config/glm53_flash.json",
+                "fp8": true,
+            });
+            for (key, value) in extra {
+                arch[*key] = serde_json::Value::from(*value);
+            }
+            match serde_json::from_value::<IterArchSel>(arch).unwrap() {
+                IterArchSel::Glm53FlashVllmFp8KdaDsaMoeSpeculative { moe_backend, .. } => {
+                    moe_backend
+                }
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(parse(&[]), FusedMoeBackend::VllmTriton);
+        assert_eq!(
+            parse(&[("moe_backend", "vllm_triton_tuned_212d200c")]).l1_backend(),
+            "vllm_triton_tuned_212d200c"
+        );
     }
 
     /// The case-03 capture sizes: MTP 5 adds 6 and 12 to vLLM's default list.

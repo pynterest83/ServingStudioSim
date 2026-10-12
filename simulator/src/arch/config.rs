@@ -31,7 +31,7 @@ use serde::Deserialize;
 use schema_derive::{ParamStruct, ProviderSchema};
 
 use super::glm52_model_cfg::Glm52MtpMode;
-pub use crate::worklet::SparseMlaBackend;
+pub use crate::worklet::{FusedMoeBackend, SparseMlaBackend};
 
 /// Model identity + layer controls. Flattened into every arch tag (§4), so it
 /// carries no `deny_unknown_fields` (the flattened struct must let the arch's
@@ -100,6 +100,10 @@ const GLM52_MTP_MODES: [&str; 3] = ["off", "full_index", "index_share"];
 /// vLLM sparse-MLA backends of the H200 GLM-5.3-Flash speculative selector.
 /// This mirrors [`SparseMlaBackend`]'s serde representation.
 const SPARSE_MLA_BACKENDS: [&str; 2] = ["flash_attn_mla_sparse", "flashinfer_mla_sparse_sm90"];
+
+/// `vllm_fused_moe` row sets of the H200 GLM-5.3-Flash speculative selector.
+/// This mirrors [`FusedMoeBackend`]'s serde representation.
+const FUSED_MOE_BACKENDS: [&str; 2] = ["vllm_triton", "vllm_triton_tuned_212d200c"];
 
 const fn default_glm52_parallel_size() -> u16 {
     8
@@ -631,6 +635,14 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(string, default = "flash_attn_mla_sparse", choices = SPARSE_MLA_BACKENDS, cache_key)]
         sparse_mla_backend: SparseMlaBackend,
+        /// Which `vllm_fused_moe` rows price the Triton MoE launches.
+        /// `vllm_triton` is vLLM without a tuned config folder (production);
+        /// `vllm_triton_tuned_212d200c` is the same kernel under
+        /// `VLLM_TUNED_CONFIG_FOLDER` with the tuned H200 E=288, N=512 config
+        /// (sha256 212d200c...), profiled as its own L1 backend.
+        #[serde(default)]
+        #[param(string, default = "vllm_triton", choices = FUSED_MOE_BACKENDS, cache_key)]
+        moe_backend: FusedMoeBackend,
     },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by

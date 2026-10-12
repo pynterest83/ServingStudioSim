@@ -199,7 +199,7 @@ pub use glm53_triton_moe_tp_local::{
     Glm53TritonMoeRouterLocalWorklet, Glm53TritonMoeRouterLocalWorkletConfig,
     Glm53TritonMoeRouterLocalWorkletInput, Glm53TritonMoeRouterLocalWorkletResolved,
     Glm53TritonMoeTpLocalWorklet, Glm53TritonMoeTpLocalWorkletConfig,
-    Glm53TritonMoeTpLocalWorkletInput, Glm53TritonMoeTpLocalWorkletResolved,
+    Glm53TritonMoeTpLocalWorkletInput, Glm53TritonMoeTpLocalWorkletResolved, FusedMoeBackend,
 };
 pub use mlp_block_tp::{
     MlpBlockTpWorklet, MlpBlockTpWorkletConfig, MlpBlockTpWorkletInput, MlpBlockTpWorkletResolved,
