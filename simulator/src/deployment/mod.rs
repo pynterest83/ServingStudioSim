@@ -343,6 +343,45 @@ mod tests {
         );
     }
 
+    /// vLLM answers a request whose prompt plus output exceeds
+    /// `max_model_len` with HTTP 400. The simulator has no per-request
+    /// rejection, so it refuses the trace before the run instead: a session
+    /// round counts its declared prefix, and the refusal names that round.
+    #[test]
+    fn a_session_round_whose_prefix_overflows_max_model_len_is_refused_by_name() {
+        use crate::sim::{
+            ArrivalSchedule, CapacityLimit, InputFileFormat, InputFileSchema, TraceFrontend,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.csv");
+        std::fs::write(
+            &path,
+            "request_id,session_id,round_idx,arrival_time_ms,prefix_len,input_len,output_len,tool_wait_after_ms\n\
+             session_s_round_000000,s,0,0.0,0,100000,1000,0.0\n\
+             session_s_round_000001,s,1,0.0,100000,30000,1072,0.0\n\
+             session_s_round_000002,s,2,0.0,130000,1000,73,0.0\n",
+        )
+        .unwrap();
+        let sessions = TraceFrontend::load(
+            &[path],
+            &InputFileSchema::new(
+                InputFileFormat::TextGenerationSessionExecutionV2,
+                Vec::new(),
+            )
+            .unwrap(),
+            ArrivalSchedule::parse("trace_timed", 1.0).unwrap(),
+            CapacityLimit::parse(None).unwrap(),
+        )
+        .unwrap();
+        let barebone = llama_config("", "{type: barebone, attn_gpu_memory_gb: 80.0}");
+        let error = check_trace(&barebone, &sessions).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "1 of 3 requests exceed pool main's max_model_len 131072 \
+             (prefix_len + input_len + output_len), first ids [\"session_s_round_000002\"]"
+        );
+    }
+
     #[test]
     fn a_speculative_worker_counts_its_draft_tokens_and_its_acceptance_width() {
         let dir = tempfile::tempdir().unwrap();
