@@ -224,6 +224,8 @@ resident = retained 中不超过 candidate 的最大边界，否则 0
 
 state 只写在 prompt 内，所以上一轮的 output 总是由下一轮重算；保留的 attention KV
 是较高边界之上的那个 block（`floor(P/Q)*Q`），每个非零边界计一份 checkpoint。
+同理，运行中的 decode 在 prompt 之外不留下任何可复用 state：默认规则下 live decode
+每跨过一个 `Q` 边界计一份 soft staircase charge，此规则下该 charge 为 0。
 已知限制（backlog）：每个 session 只保留最近一次 completed request 的条目，
 更早轮次留下、vLLM LRU pool 里可能仍存活的 checkpoint 不会被命中；也不模拟
 跨 session 的共享（radix / ref-counted page）。

@@ -7,7 +7,7 @@
 //! | tier | contents | evictable | enters [`KvStore::fits`] |
 //! |---|---|---|---|
 //! | hard | full-attention KV (context + future decode) + **one** live recurrent state per resident request | no | yes |
-//! | soft | retained prefix KV and its snapshots; snapshots a live decode drops while running | yes | no |
+//! | soft | retained prefix KV and its snapshots; snapshots a live decode drops while running (none under the EAGLE replay rule) | yes | no |
 //!
 //! The hard tier is what admission reserves atomically: one request's footprint
 //! is `post_prefill_context + remaining_output + state_tokens`, all three
@@ -510,10 +510,7 @@ impl ChunkedPrefillKv for HybridGdnKv {
             + self.ledger.partition_held(partition);
         let capacity = partition_state.capacity_tokens();
         let slack_after_step = capacity.saturating_sub(protected.saturating_add(required));
-        let live_checkpoints = partition_state
-            .live_checkpoint_count(self.checkpoint_interval_tokens)
-            .saturating_mul(self.state_tokens_per_request)
-            .min(slack_after_step);
+        let live_checkpoints = self.live_checkpoint_charge(partition).min(slack_after_step);
         let cache_limit = slack_after_step - live_checkpoints;
         let evictions = self.prefix_caches[partition as usize].shrink_to(cache_limit);
         for eviction in evictions {
@@ -700,14 +697,25 @@ impl HybridGdnKv {
     /// copies. Every `checkpoint_interval_tokens` of context a decode produces
     /// leaves one more resumable snapshot on the way.
     ///
-    /// This is a soft, evictable staircase: it is clamped to the slack the hard
-    /// tier leaves, and never participates in [`KvStore::fits`]. It therefore
-    /// cannot starve a resident request, only the retained-prefix tier.
-    fn clamped_live_checkpoint_charge(&self, partition: PartitionId) -> u64 {
-        let checkpoints = self.partitions[partition as usize]
-            .live_checkpoint_count(self.checkpoint_interval_tokens);
-        checkpoints
+    /// Under the EAGLE replay rule there is no staircase: vLLM's align mode
+    /// writes reusable states only inside the prompt (the replay boundaries
+    /// [`PrefixCache`] charges on release), so a running decode leaves nothing
+    /// behind beyond the one live state the hard tier already holds.
+    fn live_checkpoint_charge(&self, partition: PartitionId) -> u64 {
+        if self.eagle_replay_boundaries {
+            return 0;
+        }
+        self.partitions[partition as usize]
+            .live_checkpoint_count(self.checkpoint_interval_tokens)
             .saturating_mul(self.state_tokens_per_request)
+    }
+
+    /// [`Self::live_checkpoint_charge`] clamped to the slack the hard tier
+    /// leaves. This is a soft, evictable staircase that never participates in
+    /// [`KvStore::fits`]. It therefore cannot starve a resident request, only
+    /// the retained-prefix tier.
+    fn clamped_live_checkpoint_charge(&self, partition: PartitionId) -> u64 {
+        self.live_checkpoint_charge(partition)
             .min(self.soft_slack(partition))
     }
 
@@ -1138,6 +1146,34 @@ mod tests {
         // A truncated history below both boundaries recomputes everything.
         let truncated = kv_store.preview_prefill_context(0, 50, session(10_000));
         assert_eq!(truncated.resident_prefix_tokens(), 0);
+    }
+
+    #[test]
+    fn eagle_replay_decodes_leave_no_live_staircase() {
+        // A decode crossing many block boundaries past its prompt drops
+        // nothing reusable under the EAGLE replay rule; the default rule
+        // charges one state per crossed boundary.
+        for (eagle, expected_checkpoints) in [(true, 0), (false, 21)] {
+            let mut kv_store = glm_store(eagle);
+            let resolved = kv_store.preview_prefill_context(0, 20 * GLM_BLOCK, session(0));
+            let footprint = kv_store.footprint(RequestId(0), 20 * GLM_BLOCK, 2 * GLM_BLOCK);
+            kv_store.reserve_prefill_context(RequestId(0), 0, resolved, footprint, Time::ZERO);
+            kv_store.drain_ready();
+            kv_store.commit_resident(RequestId(0), 0, u64::from(20 * GLM_BLOCK), 2 * GLM_BLOCK);
+            let limit_before = kv_store.prefix_cache_physical_limit(0);
+            kv_store.advance(AdvanceScope::WholePartition(0), GLM_BLOCK + 1);
+            assert_eq!(
+                kv_store.clamped_live_checkpoint_charge(0),
+                expected_checkpoints * GLM_STATE_TOKENS,
+            );
+            if eagle {
+                assert_eq!(
+                    kv_store.prefix_cache_physical_limit(0),
+                    limit_before,
+                    "decoding past a block boundary leaves the retained tier untouched",
+                );
+            }
+        }
     }
 
     // ── soft tier: the live-decode staircase ─────────────────────────────────
