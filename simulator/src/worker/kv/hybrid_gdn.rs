@@ -664,6 +664,24 @@ impl HybridGdnKv {
         self
     }
 
+    /// vLLM's `--prefix-match-unit` under the EAGLE replay rule: lookups match
+    /// at `match_unit_tokens`, a divisor of the checkpoint interval, and each
+    /// prompt also retains its replay boundaries at that granularity
+    /// ([`PrefixCache::with_match_unit`]). Needs
+    /// [`Self::with_eagle_replay_boundaries`] first.
+    pub(crate) fn with_prefix_match_unit(mut self, match_unit_tokens: u32) -> Self {
+        assert!(
+            self.eagle_replay_boundaries,
+            "a prefix match unit is modeled only under EAGLE replay boundaries"
+        );
+        self.prefix_caches = self
+            .prefix_caches
+            .into_iter()
+            .map(|cache| cache.with_match_unit(match_unit_tokens))
+            .collect();
+        self
+    }
+
     /// How far a lookup for a prompt of `prompt_tokens` may reach into its
     /// declared prefix. vLLM caps every hit at `num_tokens - 1` so the last
     /// prompt token is computed for logits; the default rule instead borrows
@@ -1146,6 +1164,24 @@ mod tests {
         // A truncated history below both boundaries recomputes everything.
         let truncated = kv_store.preview_prefill_context(0, 50, session(10_000));
         assert_eq!(truncated.resident_prefix_tokens(), 0);
+    }
+
+    #[test]
+    fn a_prefix_match_unit_resumes_one_unit_below_each_previous_prompt() {
+        // The measured H200 chain (--prefix-match-unit 64): prompts of 20000,
+        // 21200 and 22400 tokens, each turn declaring the previous prompt plus
+        // its output, resume at floor(P / 64) * 64 - 64 of the previous prompt.
+        let mut kv_store = glm_store(true).with_prefix_match_unit(64);
+        run_round(&mut kv_store, 0, 20_000, 0, 500);
+        let second = run_round(&mut kv_store, 1, 700, 20_500, 500);
+        assert_eq!(second.resident_prefix_tokens(), 19_904);
+        let third = run_round(&mut kv_store, 2, 700, 21_700, 500);
+        assert_eq!(third.resident_prefix_tokens(), 21_120);
+        // Without the unit the same chain resumes on the block boundaries.
+        let mut kv_store = glm_store(true);
+        run_round(&mut kv_store, 0, 20_000, 0, 500);
+        let second = run_round(&mut kv_store, 1, 700, 20_500, 500);
+        assert_eq!(second.resident_prefix_tokens(), 16 * GLM_BLOCK);
     }
 
     #[test]

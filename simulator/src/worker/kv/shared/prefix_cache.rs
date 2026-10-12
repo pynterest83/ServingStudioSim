@@ -18,8 +18,8 @@
 //! [`CheckpointRetention::EveryQuantum`] (the default) keeps a snapshot at
 //! every quantum boundary of the retained length, and any of them can serve a
 //! later request. [`CheckpointRetention::EagleReplayBoundaries`] instead keeps
-//! only the at most two positions vLLM retains for a speculating hybrid with
-//! the EAGLE block drop: see that variant for the rule. Only one entry is kept
+//! only the few positions vLLM retains for a speculating hybrid with the EAGLE
+//! block drop (two per lookup granularity): see that variant for the rule. Only one entry is kept
 //! per session (the latest completed request's), so checkpoints an earlier
 //! turn left behind are never resumed from, even where vLLM's LRU pool might
 //! still hold them.
@@ -146,8 +146,23 @@ pub(crate) enum CheckpointRetention {
     /// the largest retained boundary not above `floor(M / Q) * Q - Q`
     /// (`find_longest_cache_hit`), or recomputes everything. Output tokens
     /// are therefore always recomputed by the next turn.
+    ///
+    /// A match unit `u` finer than `Q` ([`PrefixCache::with_match_unit`],
+    /// vLLM's `--prefix-match-unit`) adds the same two boundaries at `u`
+    /// granularity, `floor((P - 1) / u) * u - u` and `floor(P / u) * u - u`
+    /// (the scheduler's `tail_boundary` chunk stop writes that state), and the
+    /// lookup candidate becomes `floor(M / u) * u - u`; the `Q` boundaries
+    /// stay. Each distinct nonzero boundary is one charged state, and the
+    /// attention KV kept extends to the `Q`-page holding the unit above the
+    /// highest boundary (vLLM caches the prompt's partial tail page,
+    /// `_cache_partial_tail_block`). At `u = Q` both sets coincide.
     EagleReplayBoundaries,
 }
+
+/// The resumable positions of one entry under
+/// [`CheckpointRetention::EagleReplayBoundaries`]: the resend and extension
+/// boundaries at the quantum, then at the match unit. Zero means no state.
+type ReplayBoundaries = [u64; 4];
 
 #[derive(Clone, Copy, Debug)]
 struct PrefixEntry {
@@ -155,10 +170,10 @@ struct PrefixEntry {
     tokens: u64,
     /// Charged snapshots this entry keeps.
     checkpoints: u64,
-    /// `(resend, extension)` replay boundaries under
+    /// Replay boundaries under
     /// [`CheckpointRetention::EagleReplayBoundaries`]; `None` when every
     /// quantum boundary up to `tokens` is resumable.
-    replay_boundaries: Option<(u64, u64)>,
+    replay_boundaries: Option<ReplayBoundaries>,
     insertion_sequence: u64,
     last_access_sequence: u64,
     frequency: u64,
@@ -215,7 +230,7 @@ pub(crate) struct PrefixCacheInsertResult {
 struct RetainedSpan {
     tokens: u64,
     checkpoints: u64,
-    replay_boundaries: Option<(u64, u64)>,
+    replay_boundaries: Option<ReplayBoundaries>,
 }
 
 /// One attention partition's evictable retained-session tier.
@@ -231,6 +246,9 @@ pub(crate) struct PrefixCache {
     /// Extra occupancy every retained snapshot costs on top of its context KV.
     charge_per_checkpoint: u64,
     retention: CheckpointRetention,
+    /// Lookup granularity under [`CheckpointRetention::EagleReplayBoundaries`];
+    /// divides `quantum_tokens`, and equals it unless a finer unit is set.
+    match_unit_tokens: u64,
     entries: HashMap<u32, PrefixEntry>,
     next_sequence: u64,
 }
@@ -250,6 +268,7 @@ impl PrefixCache {
             quantum_tokens: u64::from(quantum_tokens.max(1)),
             charge_per_checkpoint,
             retention: CheckpointRetention::EveryQuantum,
+            match_unit_tokens: u64::from(quantum_tokens.max(1)),
             entries: HashMap::new(),
             next_sequence: 0,
         }
@@ -260,6 +279,21 @@ impl PrefixCache {
     pub(crate) fn with_checkpoint_retention(mut self, retention: CheckpointRetention) -> Self {
         debug_assert!(self.entries.is_empty());
         self.retention = retention;
+        self
+    }
+
+    /// Match prefixes at `match_unit_tokens`, a divisor of the quantum, under
+    /// [`CheckpointRetention::EagleReplayBoundaries`] (see that variant). The
+    /// quantum itself is the default. Set it before the first insert.
+    pub(crate) fn with_match_unit(mut self, match_unit_tokens: u32) -> Self {
+        let unit = u64::from(match_unit_tokens);
+        assert!(
+            unit > 0 && self.quantum_tokens.is_multiple_of(unit),
+            "prefix match unit {unit} must divide the reuse quantum {}",
+            self.quantum_tokens
+        );
+        debug_assert!(self.entries.is_empty());
+        self.match_unit_tokens = unit;
         self
     }
 
@@ -311,20 +345,18 @@ impl PrefixCache {
                     .tokens
                     .min(self.floor_to_quantum(u64::from(requested_tokens)))
                     as u32,
-                Some((resend, extension)) => {
-                    // The attention lookup matches whole blocks and drops the
-                    // last one; the recurrent finder then needs a retained
+                Some(boundaries) => {
+                    // The attention lookup matches whole match units and drops
+                    // the last one; the recurrent finder then needs a retained
                     // state at or below that candidate.
-                    let candidate = self
-                        .floor_to_quantum(u64::from(requested_tokens))
-                        .saturating_sub(self.quantum_tokens);
-                    if extension <= candidate {
-                        extension as u32
-                    } else if resend <= candidate {
-                        resend as u32
-                    } else {
-                        0
-                    }
+                    let unit = self.match_unit_tokens;
+                    let candidate =
+                        (u64::from(requested_tokens) / unit * unit).saturating_sub(unit);
+                    boundaries
+                        .into_iter()
+                        .filter(|&boundary| boundary <= candidate)
+                        .max()
+                        .unwrap_or(0) as u32
                 }
             })
             .unwrap_or(0)
@@ -446,25 +478,44 @@ impl PrefixCache {
         }
     }
 
-    /// The replay boundaries of a prompt of `prompt_tokens`, both if they fit
-    /// `capacity`, else the resend boundary alone, else nothing. A boundary
-    /// at 0 needs no state and keeps nothing worth retaining.
+    /// The replay boundaries of a prompt of `prompt_tokens`, resend and
+    /// extension if they fit `capacity`, else the resend boundaries alone, else
+    /// nothing. A boundary at 0 needs no state and keeps nothing worth
+    /// retaining.
     fn eagle_replay_span(&self, prompt_tokens: u64, capacity: u64) -> RetainedSpan {
         let quantum = self.quantum_tokens;
-        let resend_block = self.floor_to_quantum(prompt_tokens.saturating_sub(1));
-        let extension_block = self.floor_to_quantum(prompt_tokens);
-        let resend = resend_block.saturating_sub(quantum);
-        let extension = extension_block.saturating_sub(quantum);
-        let both = RetainedSpan {
-            tokens: extension_block,
-            checkpoints: u64::from(resend > 0) + u64::from(extension > resend),
-            replay_boundaries: Some((resend, extension)),
+        let unit = self.match_unit_tokens;
+        // One step below the last whole step a lookup reaching `reach` sees.
+        let boundary = |reach: u64, step: u64| (reach / step * step).saturating_sub(step);
+        let resend_reach = prompt_tokens.saturating_sub(1);
+        let span = |boundaries: ReplayBoundaries| {
+            let mut states = boundaries;
+            states.sort_unstable();
+            let checkpoints = states
+                .iter()
+                .enumerate()
+                .filter(|&(index, &state)| state > 0 && (index == 0 || states[index - 1] != state))
+                .count() as u64;
+            // The attention pages up to the match unit the highest boundary
+            // drops back from; at `unit == quantum` the block above it.
+            let top = states[3];
+            RetainedSpan {
+                tokens: (top + unit).div_ceil(quantum) * quantum,
+                checkpoints,
+                replay_boundaries: Some(boundaries),
+            }
         };
-        let resend_only = RetainedSpan {
-            tokens: resend_block,
-            checkpoints: u64::from(resend > 0),
-            replay_boundaries: Some((resend, resend)),
-        };
+        let resend = [
+            boundary(resend_reach, quantum),
+            boundary(resend_reach, unit),
+        ];
+        let both = span([
+            resend[0],
+            boundary(prompt_tokens, quantum),
+            resend[1],
+            boundary(prompt_tokens, unit),
+        ]);
+        let resend_only = span([resend[0], resend[0], resend[1], resend[1]]);
         [both, resend_only]
             .into_iter()
             .filter(|span| span.checkpoints > 0)
@@ -748,6 +799,86 @@ mod tests {
             0
         );
         assert_eq!(cache.used_charge(), 0);
+    }
+
+    // ── A finer prefix match unit (vLLM `--prefix-match-unit 64`) ────────────
+
+    const UNIT: u32 = 64;
+
+    fn unit_cache(max_retained_tokens: u64) -> PrefixCache {
+        eagle_cache(max_retained_tokens).with_match_unit(UNIT)
+    }
+
+    #[test]
+    fn a_match_unit_equal_to_the_block_is_the_default_rule() {
+        for prompt in [20_000, 18 * BLOCK_TOKENS, 2 * BLOCK_TOKENS, 26_600] {
+            let mut default = eagle_cache(u64::MAX);
+            let mut explicit = eagle_cache(u64::MAX).with_match_unit(BLOCK);
+            assert_eq!(
+                default.insert(7, prompt, u64::MAX, None),
+                explicit.insert(7, prompt, u64::MAX, None)
+            );
+            assert_eq!(default.used_charge(), explicit.used_charge());
+            for reach in [prompt as u32 - 1, prompt as u32, prompt as u32 + 1_200] {
+                assert_eq!(default.peek(7, reach), explicit.peek(7, reach));
+            }
+        }
+    }
+
+    #[test]
+    fn a_unit_of_64_resumes_one_unit_below_the_previous_prompt() {
+        // Measured on H200 (MTP 5, align mode, --prefix-match-unit 64): the
+        // next turn after a prompt of P hits floor(P / 64) * 64 - 64.
+        for (prompt, hit) in [(20_000, 19_904), (26_600, 26_496), (21_200, 21_120)] {
+            let mut cache = unit_cache(u64::MAX);
+            cache.insert(7, prompt, u64::MAX, None);
+            assert_eq!(cache.peek(7, prompt as u32 + 1_199), hit, "P = {prompt}");
+        }
+    }
+
+    #[test]
+    fn a_unit_of_64_keeps_the_block_boundaries_and_charges_each_distinct_state() {
+        let mut cache = unit_cache(u64::MAX);
+        // P = 20000: block boundaries 16 blocks (resend = extension), unit
+        // boundaries 19904 (resend = extension). The partial tail page holding
+        // 19904..19968 is kept, so the attention KV covers 18 blocks.
+        let insert = cache.insert(7, 20_000, u64::MAX, None);
+        assert_eq!(insert.retained_tokens, 18 * BLOCK_TOKENS);
+        assert_eq!(
+            cache.used_charge(),
+            18 * BLOCK_TOKENS + 2 * CHECKPOINT_CHARGE
+        );
+        // A reach whose candidate falls below the unit boundary resumes at
+        // the block boundary, and one below that recomputes.
+        assert_eq!(cache.peek(7, 19_967), 16 * BLOCK);
+        assert_eq!(cache.peek(7, 16 * BLOCK + UNIT), 16 * BLOCK);
+        assert_eq!(cache.peek(7, 16 * BLOCK + UNIT - 1), 0);
+        // A resend of the same prompt reaches 19999, still 312 whole units.
+        assert_eq!(cache.peek(7, 19_999), 19_904);
+    }
+
+    #[test]
+    fn a_unit_aligned_prompt_keeps_both_unit_boundaries() {
+        let mut cache = unit_cache(u64::MAX);
+        // P = 19968 = 312 units: resend 19840, extension 19904; block
+        // boundaries both 16 blocks: three distinct charged states.
+        let insert = cache.insert(7, 19_968, u64::MAX, None);
+        assert_eq!(insert.retained_tokens, 18 * BLOCK_TOKENS);
+        assert_eq!(
+            cache.used_charge(),
+            18 * BLOCK_TOKENS + 3 * CHECKPOINT_CHARGE
+        );
+        assert_eq!(cache.peek(7, 19_968), 19_904);
+        assert_eq!(cache.peek(7, 19_967), 19_840);
+    }
+
+    #[test]
+    fn a_unit_of_64_makes_a_prompt_shorter_than_two_blocks_resumable() {
+        let mut cache = unit_cache(u64::MAX);
+        let insert = cache.insert(7, 1_500, u64::MAX, None);
+        assert_eq!(insert.retained_tokens, 2 * BLOCK_TOKENS);
+        assert_eq!(cache.used_charge(), 2 * BLOCK_TOKENS + CHECKPOINT_CHARGE);
+        assert_eq!(cache.peek(7, 2_000), 1_408);
     }
 
     #[test]
