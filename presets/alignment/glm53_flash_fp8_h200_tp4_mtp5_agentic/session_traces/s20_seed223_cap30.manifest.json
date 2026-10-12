@@ -2,12 +2,12 @@
   "schema": "session-execution-v2",
   "generator": "coding-session",
   "millisecond_decimals": 6,
-  "sessions": 608,
-  "rounds": 4649,
-  "total_prompt_tokens": 482058880,
-  "total_prefix_tokens": 455136832,
-  "total_output_tokens": 4519458,
-  "planned_prefix_hit_rate": 0.9441519508986123,
+  "sessions": 223,
+  "rounds": 2099,
+  "total_prompt_tokens": 217526208,
+  "total_prefix_tokens": 205511808,
+  "total_output_tokens": 2066613,
+  "planned_prefix_hit_rate": 0.9447680345717239,
   "parameters": {
     "arrival_pattern": "poisson",
     "arrival_rate_per_second": 1.0,
@@ -22,9 +22,9 @@
     "seed": 0,
     "selection_rule": "first_n_in_emitted_session_order",
     "session_order": "shuffle",
-    "source_bytes": 218995,
-    "source_path": "logs/20261012_0_glm53_h200_agentic_p0/trace/s40_seed171_cap60_b60.rounds.csv",
+    "source_bytes": 99208,
+    "source_path": "logs/20261012_0_glm53_h200_agentic_p0/trace/s20_seed223_cap30.rounds.csv",
     "source_schema": "session-rounds-v2",
-    "source_sha256": "cf0432b15db936a932d6b708f59b092740b4c9d428accd2b820f3ec0aeacbec6"
+    "source_sha256": "975183804a40e72313d7cebefb198b8b1fda305bd62e9b3058ebbe57f2ef4412"
   }
 }

@@ -1,14 +1,16 @@
 schema_version: 1
 pack: glm53_flash_fp8_h200_tp4_mtp5_agentic
 description: >-
-  Campaign 2 (agentic coding) on GLM-5.3-Flash FP8, H200 TP4/DP1, BF16 KV, MTP 5. One case replays a committed
-  session-execution-v2 trace (req-frontend tracegen `coding-session` over 40 Weka cc-traces sessions, seed 171,
-  tool waits capped at 60 s, 60-minute budget; 608 sessions / 4649 rounds, planned prefix hit rate 94.4%) against
-  prefix caching ON, with prompts drawn from a source-code corpus. Variant tp4_dp1_mtp5 is the production
-  deployment (glm53_flash_fp8_h200_tp4_mtp5: default capture 512, default Triton MoE config, attention backend
-  left to vLLM's auto-selection); variant cg1024_moetuned_fi mirrors glm53_flash_fp8_h200_tp4_mtp5_cg1024_moetuned
-  (capture 1024, tuned MoE config folder, FlashInfer SM90 sparse MLA pinned), campaign 1's three retains, for the
-  later Tock. Rate, KV budget and MTP acceptance are PROVISIONAL until the phase-1 GPU passes measure them.
+  Campaign 2 (agentic coding) on GLM-5.3-Flash FP8, H200 TP4/DP1, BF16 KV, MTP 5. Every case replays one committed
+  session-execution-v2 trace (req-frontend tracegen `coding-session` over 20 Weka cc-traces traces, seed 223,
+  tool waits capped at 30 s, 60-minute budget; 223 sessions / 2099 rounds, planned prefix hit rate 94.5%) against
+  prefix caching ON, with prompts drawn from a source-code corpus; the cases differ only in the variant. Variant
+  tp4_dp1_mtp5 (case 20) is the production deployment (glm53_flash_fp8_h200_tp4_mtp5: default capture 512, default
+  Triton MoE config, the FA3 sparse MLA backend production auto-selects, pinned); tp4_dp1_mtp5_pmu64 (case 22) is
+  production plus --prefix-match-unit 64 for the MTP block-drop Tock; cg1024_moetuned_fi (case 21) mirrors
+  glm53_flash_fp8_h200_tp4_mtp5_cg1024_moetuned (capture 1024, tuned MoE config folder, FlashInfer SM90 sparse MLA
+  pinned), campaign 1's three retains. KV budget and MTP acceptance are measured (case 21's KV budget is
+  provisional); the rate is a placeholder the Tock sets per pass.
 recorded_on:
   host: h200
   gpu: NVIDIA H200
@@ -52,12 +54,13 @@ variants:
       api_server_count: 4
       # As glm53_flash_fp8_h200_tp4_mtp5, plus --enable-prompt-tokens-details: req-frontend reads each round's
       # cached prompt tokens off the usage block, which vLLM only reports with it. Prefix caching stays at
-      # vLLM's default (on; hybrid "align" mode), so no --no-enable-prefix-caching. No --attention-backend:
-      # production auto-selection, which is FLASH_ATTN_MLA_SPARSE (FA3) without nvcc on PATH and
-      # FLASHINFER_MLA_SPARSE_SM90 with it; the server log's backend line must say FA3 for this variant's
-      # simulated side to apply.
+      # vLLM's default (on; hybrid "align" mode), so no --no-enable-prefix-caching. --attention-backend
+      # FLASH_ATTN_MLA_SPARSE pins what production auto-selects on its image (FA3, no nvcc on PATH); this host has
+      # nvcc, where auto-selection would pick FLASHINFER_MLA_SPARSE_SM90 (campaign 1's prodpin pinned it the same
+      # way). The simulated arch defaults to FA3.
       extra_args: [--kv-cache-dtype, auto, --speculative-config, '{"method":"mtp","num_speculative_tokens":5}',
-        --limit-mm-per-prompt, '{"image":0,"video":0}', --enable-prompt-tokens-details]
+        --limit-mm-per-prompt, '{"image":0,"video":0}', --attention-backend, FLASH_ATTN_MLA_SPARSE,
+        --enable-prompt-tokens-details]
     # The production pack's arch. Routing: glm53_flash_fp8_h200_tp4_mtp5's case-03 capture (enwik9 prompts), until
     # this case's own profile_corpus pass replaces it.
     arch:
@@ -88,9 +91,55 @@ variants:
     - {kind: token_corpus, name: profile_corpus, trace: workload}
     input_builder: {type: speculative_engine_text, draft_tokens: 5, measured_phase: forward, group_assignment: per_dp_rank}
     label_rules: label_rules/manifest.json
-  # glm53_flash_fp8_h200_tp4_mtp5_cg1024_moetuned's variant (campaign 1's retains) for the later Tock: capture
+  # Production P plus vLLM's --prefix-match-unit 64, for the MTP block-drop Tock: a finer hash unit adds a
+  # partial-tail state one unit below each prompt's last whole unit, so the next round resumes at
+  # floor(P/64)*64 - 64 instead of floor(P/1152)*1152 - 1152 (measured 13/15 rounds exact, 2/15 fell back to the
+  # 1152 boundary: logs/20261012_4_glm53_h200_gpu1/mtpblock_result.json, A2_unit64). The simulated worker models
+  # the deterministic rule (prefix_match_unit_tokens), not the fallback.
+  tp4_dp1_mtp5_pmu64:
+    deployment: unified
+    gpu: NVIDIA H200
+    replicas: 1
+    checkpoint: glm53_flash
+    engine: vllm
+    backend: vllm_tokens
+    run_name_prefix: glm53_flash_h200_tp4_mtp5_agentic_pmu64
+    server:
+      tp_size: 4
+      dp_size: 1
+      chunk_size: 8192
+      enable_server_load_tracking: true
+      api_server_count: 4
+      extra_args: [--kv-cache-dtype, auto, --speculative-config, '{"method":"mtp","num_speculative_tokens":5}',
+        --limit-mm-per-prompt, '{"image":0,"video":0}', --attention-backend, FLASH_ATTN_MLA_SPARSE,
+        --enable-prompt-tokens-details, --prefix-match-unit, '64']
+    arch:
+      type: glm53_flash_vllm_fp8_kda_dsa_moe_speculative
+      model_config: model/config/glm53_flash.json
+      fp8: true
+      tp_size: 4
+      draft_tokens: 5
+      routing: corpus
+      token_corpus_file: ../../../logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32/profile_corpus/token_corpus/manifest.json
+      cudagraph_capture_sizes: [1, 2, 4, 6, 8, 12, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120,
+        128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304,
+        320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512]
+    worker: {type: speculative, max_batch_tokens: 8192, batch_policy: mix, draft_tokens: 5, acceptance_seed: 73,
+      host_fixed_ms: 1.02, host_floor_full_graph_ms: 0.0, host_floor_piecewise_ms: 0.0,
+      host_floor_eager_prefill_ms: 153.65, host_floor_eager_decode_ms: 125.13,
+      eagle_block_drop: true,
+      prefix_match_unit_tokens: 64,
+      async_scheduling: true,
+      async_output_processing_ms: 0.4}
+    profile_passes:
+    - {kind: workload_metrics, name: profile_workload, trace: workload, warmup: true}
+    - {kind: nsys, name: profile_nsys, trace: kernel, warmup: true}
+    - {kind: token_corpus, name: profile_corpus, trace: workload}
+    input_builder: {type: speculative_engine_text, draft_tokens: 5, measured_phase: forward, group_assignment: per_dp_rank}
+    label_rules: label_rules/manifest.json
+  # glm53_flash_fp8_h200_tp4_mtp5_cg1024_moetuned's variant (campaign 1's retains) for the Tock (case 21): capture
   # 1024, the tuned Triton MoE config (moe_configs/, sha256 212d200c..., exported as VLLM_TUNED_CONFIG_FOLDER by the
-  # run script; see recorded_on), FlashInfer SM90 sparse MLA pinned. No case uses it yet.
+  # run script; see recorded_on), FlashInfer SM90 sparse MLA pinned.
   cg1024_moetuned_fi:
     deployment: unified
     gpu: NVIDIA H200
@@ -141,12 +190,12 @@ variants:
     label_rules: label_rules_cg1024_moetuned_fi/manifest.json
 cases:
 - index: 20
-  name: agentic_s40_seed171
+  name: agentic_s20_seed223_cap30
   variant: tp4_dp1_mtp5
   purpose: >-
     Agentic coding baseline: multi-turn main sessions with subagent and side sessions, long contexts (rounds up to
-    255,924 tokens with prefix) and heavy prefix reuse, replayed open-loop against the production server.
-  coverage:
+    255,744 tokens with prefix) and heavy prefix reuse, replayed open-loop against the production server.
+  coverage: &agentic_coverage
   - session_prefix_reuse
   - long_context_prefill
   - tool_wait_chains
@@ -157,40 +206,95 @@ cases:
   gpu_memory_utilization: 0.92
   capture_seconds: 15.0
   device_role: primary
-  session_trace:
-    file: session_traces/s40_seed171_cap60_b60.csv
-    manifest: session_traces/s40_seed171_cap60_b60.manifest.json
-    # sha256 of the canonical CSV itself; the manifest records only its source (rounds CSV) sha256 cf0432b1...
+  session_trace: &agentic_session_trace
+    file: session_traces/s20_seed223_cap30.csv
+    manifest: session_traces/s20_seed223_cap30.manifest.json
+    # sha256 of the canonical CSV itself; the manifest records only its source (rounds CSV) sha256 97518380...
     # The manifest is tracegen's, with parameters.source_path made repo-relative (it named a home directory).
-    sha256: a766aedd665e7e6d42aa795ccb6dc779308154dd85784a4370d4a4cb9ddb2fcd
-  text_corpus:
+    sha256: 8a1cd053961993bf225527560a5fe09e38543fd937f2dfd62fcdb29d9ef5b133
+  text_corpus: &agentic_text_corpus
     host_key: code_vllm_sglang_pytorch
     sha256: e9c771457c8b44b97c99397bc19cf5cdd8df06ae4e1b5e3dd01fb40b43480e89
     provenance: logs/20261012_0_glm53_h200_agentic_p0/corpus/code_vllm_sglang_pytorch.manifest.json (see recorded_on)
-  # Target sessions per second (req-frontend --rate; the trace's own start rate is 0.959/s). A placeholder: the
-  # phase-1 max-rate-under-SLO sweep sets the real one.
-  rate:
+  # Target sessions per second (req-frontend --rate). A placeholder: the Tock sets the rate per pass.
+  rate: &agentic_rate
     value: 1.0
     status: provisional
-    derived_from: placeholder at about the trace's native session start rate (tracegen --arrival-rate 1.0, poisson);
-      replace with the rate the phase-1 max-rate-under-SLO sweep picks
+    derived_from: placeholder at the trace's generated session start rate (tracegen --arrival-rate 1.0, poisson);
+      the Tock sets the rate of each pass
   attn_gpu_memory_gb:
-    value: 40.09
-    status: provisional
-    derived_from: 'per-GPU `Available KV cache memory: 37.34 GiB` in the H200 production recipe run (vLLM v0.31.0,
-      TP4, BF16 KV, MTP 5, gpu_memory_utilization 0.92, max_model_len 1048576); replace with this case''s own workload-pass
-      value at max_model_len 262144'
-    evidence: reports/glm53-flash/evidence/vllm-0.31-recipe-h200.log (workspace root)
-  # One chain per round from its output_len. Case 05's per-position chain (long outputs, enwik9 prompts): the
-  # code corpus's acceptance is measured by the phase-1 GPU acceptance pass, which replaces it.
-  speculative_acceptance:
-    value: [0.8993, 0.8543, 0.8727, 0.8802, 0.9060]
-    status: provisional
-    derived_from: glm53_flash_fp8_h200_tp4_mtp5 case 05 (decode_spectrum_c64) measured chain, enwik9 prompts; replace
-      with the phase-1 acceptance measurement on the code corpus
-    evidence: logs/20261008_5_glm53_flash_h200_tuned/05_decode_spectrum_c64/profile_workload/spec_decode_metrics.json
-  provenance:
+    value: 45.13
+    status: measured
+    derived_from: 'per-GPU `Available KV cache memory: 42.03 GiB` (45.13 GB) logged by this variant''s server (vLLM
+      v0.31.0 fork 6364508b6a, TP4, BF16 KV, MTP 5, FA3 sparse MLA, gpu_memory_utilization 0.92, max_model_len 262144)
+      on 2026-10-12'
+    evidence: logs/20261012_4_glm53_h200_gpu1/runs/A1_prod/server.log
+  # One chain per round from its output_len.
+  speculative_acceptance: &agentic_acceptance
+    value: [0.9063, 0.8562, 0.8181, 0.8095, 0.7846]
+    status: measured
+    derived_from: conditional per-position acceptance measured on the code corpus with the production server on
+      2026-10-12, output-token-weighted over 4 context strata (8k/32k/96k/192k) by this sample's output-token shares
+      (0.055/0.119/0.414/0.412); mean accepted length 4.23 (acceptance_pack_vector.json)
+    evidence: logs/20261012_4_glm53_h200_gpu1/acceptance_result.json
+  provenance: &agentic_provenance
     trace: logs/20261012_0_glm53_h200_agentic_p0/trace (tracegen coding-session --policy trace-reported --session-order
-      shuffle --arrival-rate 1.0 --arrival-pattern poisson --seed 0 over s40_seed171_cap60_b60.rounds.csv; command.txt)
-    sample: 40 of 393 Weka cc-traces-weka-062126 256k sessions, seed 171, tool waits capped at 60 s, 60-minute budget
-      (s40_seed171_cap60_b60_stats.json)
+      shuffle --arrival-rate 1.0 --arrival-pattern poisson --seed 0 over s20_seed223_cap30.rounds.csv;
+      tracegen_s20_cap30.yaml / .log)
+    sample: 20 of 393 Weka cc-traces-weka-062126 256k traces, seed 223 (converter tools/weka_to_rounds.py
+      --tool-wait-cap-ms 30000 --budget-cap-ms 60000 --trace-budget-min 60 --sample-traces 20 --sample-seed 223);
+      tool waits capped at 30 s, with the request set of the 60-minute budget measured on the 60-s-capped timeline
+      (s20_seed223_cap30_stats.json); 223 sessions, 2099 rounds
+    selection: seed 223 minimizes, over 500 seeds, the maximum relative deviation of the sample's context, reuse,
+      subagent-share, new-token and output percentiles from the full corpus (4.9%; tools/pick_sample.py,
+      trace/pick_sample_n20_b60.json); tools/ is logs/20261012_0_glm53_h200_agentic_p0/tools
+- index: 21
+  name: agentic_s20_seed223_cap30_cg1024_moetuned_fi
+  variant: cg1024_moetuned_fi
+  purpose: >-
+    Case 20's agentic trace on campaign 1's three retains (capture 1024, tuned MoE config, FlashInfer SM90 sparse
+    MLA), the Tock's candidate deployment.
+  coverage: *agentic_coverage
+  max_model_len: 262144
+  profile_arrival_mode: trace-timed
+  simulation_arrival_mode: trace_timed
+  gpu_memory_utilization: 0.92
+  capture_seconds: 15.0
+  device_role: primary
+  session_trace: *agentic_session_trace
+  text_corpus: *agentic_text_corpus
+  rate: *agentic_rate
+  attn_gpu_memory_gb:
+    value: 44.25
+    status: provisional
+    derived_from: 'case 20''s measured 42.03 GiB less the 0.82 GiB a 1024 capture cost in campaign 1 (at max_model_len
+      8192: 41.97 GiB for cg1024 vs 42.79 GiB for production) = 41.21 GiB (44.25 GB); replace with this variant''s
+      own `Available KV cache memory` at max_model_len 262144'
+    evidence: logs/20261012_4_glm53_h200_gpu1/runs/A1_prod/server.log
+  # Measured with the production variant; MTP acceptance does not depend on the capture size or the MoE config.
+  speculative_acceptance: *agentic_acceptance
+  provenance: *agentic_provenance
+- index: 22
+  name: agentic_s20_seed223_cap30_pmu64
+  variant: tp4_dp1_mtp5_pmu64
+  purpose: >-
+    Case 20's agentic trace on production plus --prefix-match-unit 64: each round resumes one 64-token unit, not one
+    1152-token block, below the previous prompt (the MTP block-drop Tock).
+  coverage: *agentic_coverage
+  max_model_len: 262144
+  profile_arrival_mode: trace-timed
+  simulation_arrival_mode: trace_timed
+  gpu_memory_utilization: 0.92
+  capture_seconds: 15.0
+  device_role: primary
+  session_trace: *agentic_session_trace
+  text_corpus: *agentic_text_corpus
+  rate: *agentic_rate
+  attn_gpu_memory_gb:
+    value: 45.13
+    status: measured
+    derived_from: 'per-GPU `Available KV cache memory: 42.03 GiB` (45.13 GB) logged by this variant''s server
+      (production plus --prefix-match-unit 64, max_model_len 262144) on 2026-10-12, equal to case 20''s'
+    evidence: logs/20261012_4_glm53_h200_gpu1/runs/A2_unit64/server.log
+  speculative_acceptance: *agentic_acceptance
+  provenance: *agentic_provenance

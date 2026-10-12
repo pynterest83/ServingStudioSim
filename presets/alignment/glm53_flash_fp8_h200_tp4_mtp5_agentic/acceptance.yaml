@@ -1,7 +1,7 @@
 # Acceptance policy of the agentic pack: glm53_flash_fp8_h200_tp4_mtp5's tolerances, unchanged until this
 # workload's own evidence re-earns them. Its stochastic_scoring block needs per-request acceptance chains, which a
 # session-trace case does not take (one chain per round from speculative_acceptance), so it does not apply to
-# case 20 yet.
+# cases 20-22 yet.
 #
 # Inherited header: acceptance policy for the GLM-5.3-Flash FP8 H200 TP4/MTP5 matrix (inherited from the B200
 # TP4/EP4 pack; no H200 evidence yet).
