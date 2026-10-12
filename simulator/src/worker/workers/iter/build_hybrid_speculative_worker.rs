@@ -8,7 +8,11 @@
 //! per-request state already counts one state copy per draft position (vLLM's
 //! Mamba `align` mode keeps `2 + num_speculative_tokens` pages per group).
 //! With prefix caching on, non-final prefill chunks end on the arch's
-//! checkpoint interval, as in the non-speculating hybrid recipe.
+//! checkpoint interval, as in the non-speculating hybrid recipe. A retained
+//! prefix snapshot is charged the arch's `recurrent_checkpoint_bytes`, which
+//! can be smaller than the state a running request pins. Under
+//! `eagle_block_drop` the store also retains and resumes only vLLM's EAGLE
+//! replay boundaries of each prompt (`HybridGdnKv::with_eagle_replay_boundaries`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -69,6 +73,9 @@ pub(crate) fn build_hybrid_speculative_worker<M: SpeculativeUnifiedModel>(
     let state_tokens_per_request = model
         .recurrent_state_bytes_per_request()
         .div_ceil(model.total_kv_bytes_per_token().max(1));
+    let checkpoint_charge_tokens = model
+        .recurrent_checkpoint_bytes()
+        .div_ceil(model.total_kv_bytes_per_token().max(1));
     let checkpoint_interval_tokens = config
         .ssm_checkpoint_interval_tokens
         .unwrap_or_else(|| model.recurrent_checkpoint_interval_tokens());
@@ -80,6 +87,7 @@ pub(crate) fn build_hybrid_speculative_worker<M: SpeculativeUnifiedModel>(
         pool_tag,
         draft_tokens,
         state_tokens_per_request,
+        checkpoint_charge_tokens,
         checkpoint_interval_tokens,
         chunk_end_quantum,
         max_batch_tokens,
@@ -111,10 +119,19 @@ pub(crate) fn build_hybrid_speculative_worker<M: SpeculativeUnifiedModel>(
         essentials.kv_capacity,
         state_tokens_per_request,
         checkpoint_interval_tokens,
+        checkpoint_charge_tokens,
         prefix_cache,
         essentials.sampler,
         prefix_cache_logger,
     );
+    // The same vLLM constraint the chunk split below reproduces also decides
+    // which prompt boundaries a completed request leaves resumable.
+    let eagle_replay_boundaries = chunk_end_quantum.is_some() && config.eagle_block_drop;
+    let kv_store = if eagle_replay_boundaries {
+        kv_store.with_eagle_replay_boundaries()
+    } else {
+        kv_store
+    };
     let balance = if num_partitions == 1 {
         LoadBalance::Single
     } else {
@@ -170,11 +187,12 @@ mod tests {
     use super::*;
 
     use crate::arch::contract::SpeculativeArchInput;
-    use crate::common::{AcceptanceProfile, DecodingStrategy, RequestId, Time};
+    use crate::common::{AcceptanceProfile, DecodingStrategy, RequestId, SessionInput, Time};
     use crate::test_helpers::{lm, shared_with, test_cluster};
     use crate::timing::LeafMetrics;
     use crate::worker::config::KvAdmissionConfig;
     use crate::worker::iter_worker::IterWorker;
+    use crate::worker::kv::PrefixCachePolicy;
     use crate::worker::types::WorkerMsgCommon;
 
     const DRAFT_TOKENS: u32 = 5;
@@ -184,9 +202,14 @@ mod tests {
     /// 100 tokens' worth of pinned recurrent state per request.
     const STATE_TOKENS: u64 = 100;
 
+    /// The hybrid model's checkpoint interval, in tokens.
+    const CHECKPOINT_INTERVAL: u32 = 16;
+
     /// 1 ms per iteration; records the most requests one iteration carried.
     struct HybridModel {
         state_tokens: u64,
+        /// A retained checkpoint's size when it differs from the state.
+        checkpoint_tokens: Option<u64>,
         most_requests: AtomicU32,
     }
 
@@ -223,7 +246,11 @@ mod tests {
         }
 
         fn recurrent_checkpoint_interval_tokens(&self) -> u32 {
-            16
+            CHECKPOINT_INTERVAL
+        }
+
+        fn recurrent_checkpoint_bytes(&self) -> u64 {
+            self.checkpoint_tokens.unwrap_or(self.state_tokens) * KV_BYTES_PER_TOKEN
         }
     }
 
@@ -244,6 +271,7 @@ mod tests {
         }
         let model = Arc::new(HybridModel {
             state_tokens,
+            checkpoint_tokens: None,
             most_requests: AtomicU32::new(0),
         });
         let config = WorkerConfig {
@@ -294,5 +322,96 @@ mod tests {
         // state would admit all six.
         assert_eq!(most_concurrent_requests(STATE_TOKENS, 6), 2);
         assert_eq!(most_concurrent_requests(0, 6), 6);
+    }
+
+    /// Runs a two-turn session through the recipe and returns the second
+    /// turn's `(prefix-cache hit, prefill tokens processed)`. Turn one sends a
+    /// 40-token prompt and decodes 12; turn two declares those 40 tokens as its
+    /// prefix and adds 10 fresh ones.
+    fn second_turn(
+        eagle_block_drop: bool,
+        checkpoint_tokens: Option<u64>,
+        max_retained_tokens: Option<u64>,
+    ) -> (u32, u32) {
+        let requests = shared_with(&[(0, 40, OUTPUT_TOKENS), (1, 10, OUTPUT_TOKENS)]);
+        {
+            let mut requests = requests.borrow_mut();
+            for (id, declared_prefix_tokens) in [(0, 0), (1, 40)] {
+                let definition = &mut requests[RequestId(id)].request.definition;
+                definition.decoding = DecodingStrategy::Speculative {
+                    accept_rate: AcceptanceProfile::Uniform(1.0),
+                };
+                definition.session = SessionInput::Session {
+                    session_id: 7,
+                    session_start_time: Time::ZERO,
+                    declared_prefix_tokens,
+                };
+            }
+        }
+        let model = Arc::new(HybridModel {
+            state_tokens: STATE_TOKENS,
+            checkpoint_tokens,
+            most_requests: AtomicU32::new(0),
+        });
+        let config = WorkerConfig {
+            attn_kv_bytes: 100_000 * KV_BYTES_PER_TOKEN,
+            max_batch_tokens: Some(2048),
+            kv_admission: KvAdmissionConfig::FullFootprint,
+            speculative_draft_tokens: DRAFT_TOKENS,
+            speculative_acceptance_seed: Some(7),
+            eagle_block_drop,
+            prefix_cache: PrefixCacheConfig::Opportunistic {
+                policy: PrefixCachePolicy::Lru,
+                max_retained_bytes: max_retained_tokens.map(|tokens| tokens * KV_BYTES_PER_TOKEN),
+            },
+            ..WorkerConfig::default()
+        };
+        let mut worker = build_hybrid_speculative_worker(
+            WorkerId(0),
+            "test",
+            model,
+            requests.clone(),
+            config,
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        for (id, ticks) in [(0u32, 0..200), (1, 200..400)] {
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(id)));
+            for tick in ticks {
+                worker.tick(Time::from_ms(tick as f64), &mut Vec::new());
+            }
+            assert!(
+                requests.borrow()[RequestId(id)].lifecycle.completed,
+                "turn {id}"
+            );
+        }
+        let requests = requests.borrow();
+        let second = &requests[RequestId(1)];
+        (
+            second.telemetry.prefix_cache_hit_tokens.expect("resolved"),
+            second.progress.prefill_tokens_processed,
+        )
+    }
+
+    #[test]
+    fn eagle_block_drop_resumes_one_block_below_the_previous_prompt() {
+        // P = 40 with 16-token blocks: the replay boundaries are both
+        // floor(40 / 16) * 16 - 16 = 16. Turn two reaches all 40 declared
+        // tokens, drops one block from the 32 it matches, and resumes at 16.
+        assert_eq!(second_turn(true, None, None), (16, 50 - 16));
+        // Without the drop the store resumes from the decoded context, capped
+        // at the declared prefix's last whole block.
+        assert_eq!(second_turn(false, None, None), (32, 50 - 32));
+    }
+
+    #[test]
+    fn a_retained_boundary_is_charged_the_arch_checkpoint_not_the_running_state() {
+        // The entry keeps 32 attention tokens plus one checkpoint. A 60-token
+        // retained-prefix ceiling holds it at a 10-token checkpoint, but not
+        // at the 100-token state a running request pins.
+        assert_eq!(second_turn(true, Some(10), Some(60)), (16, 50 - 16));
+        assert_eq!(second_turn(true, None, Some(60)), (0, 50));
     }
 }

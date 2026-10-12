@@ -92,6 +92,8 @@ pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         essentials.kv_capacity,
         state_tokens_per_request,
         checkpoint_interval_tokens,
+        // A retained snapshot costs one whole per-request state.
+        state_tokens_per_request,
         prefix_cache,
         essentials.sampler,
         prefix_cache_logger,

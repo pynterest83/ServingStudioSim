@@ -34,9 +34,15 @@
 //! only at multiples of an aligned block size and quantizes hits to it (see
 //! `arch::qwen36_local` for the alignment formula and its verification against
 //! measured vLLM numbers). This store passes that interval to
-//! [`PrefixCache`] as its reuse quantum, and the per-request state size as its
-//! per-snapshot charge, so a retained prefix pays for the snapshots that make it
-//! resumable.
+//! [`PrefixCache`] as its reuse quantum, and the arch's retained-checkpoint
+//! size as its per-snapshot charge, so a retained prefix pays for the snapshots
+//! that make it resumable.
+//!
+//! By default every interval boundary of the completed request's resident
+//! context is resumable. A speculating vLLM baseline with the EAGLE block drop
+//! ([`HybridGdnKv::with_eagle_replay_boundaries`]) keeps only the prompt's two
+//! replay boundaries and backs every hit off one block
+//! ([`CheckpointRetention::EagleReplayBoundaries`]).
 //!
 //! ## Not modeled
 //!
@@ -52,7 +58,7 @@ use crate::log::{
     PrefixCacheEvictionReason, PrefixCacheLogger, PrefixCacheRetentionReason,
 };
 use crate::worker::kv::shared::prefix_cache::{
-    PrefixCache, PrefixCacheMutation, PrefixCacheReturnMetadata,
+    CheckpointRetention, PrefixCache, PrefixCacheMutation, PrefixCacheReturnMetadata,
 };
 use crate::worker::kv::shared::prefix_cache_journal::PrefixCacheJournal;
 use crate::worker::kv::shared::request_ledger::RequestLedger;
@@ -93,6 +99,9 @@ pub struct HybridGdnKv {
     state_tokens_per_request: u64,
     /// Context-token spacing of resumable snapshots. `0` = no recurrent state.
     checkpoint_interval_tokens: u32,
+    /// vLLM's EAGLE replay boundaries: retain from the prompt only, and cap a
+    /// lookup at the prompt minus its last token.
+    eagle_replay_boundaries: bool,
 }
 
 impl KvStore for HybridGdnKv {
@@ -304,6 +313,7 @@ impl PrefixKv for HybridGdnKv {
         let mut best_partition = None;
         let mut best_resident_tokens = 0;
         for (partition_index, prefix_cache) in self.prefix_caches.iter().enumerate() {
+            // No fresh prompt length here: rank by the uncapped declaration.
             let resident_tokens = prefix_cache.peek(session_id, declared_prefix_tokens);
             if resident_tokens > best_resident_tokens {
                 best_resident_tokens = resident_tokens;
@@ -328,7 +338,13 @@ impl PrefixKv for HybridGdnKv {
                 session_id,
                 declared_prefix_tokens,
                 ..
-            } => self.prefix_caches[partition as usize].peek(session_id, declared_prefix_tokens),
+            } => self.prefix_caches[partition as usize].peek(
+                session_id,
+                self.lookup_reach(
+                    declared_prefix_tokens,
+                    declared_prefix_tokens.saturating_add(fresh_prompt_tokens),
+                ),
+            ),
         };
         ResolvedPrefillContext::new(session_input, resident_prefix_tokens, fresh_prompt_tokens)
     }
@@ -342,8 +358,11 @@ impl PrefixKv for HybridGdnKv {
         now: Time,
     ) {
         if let Some(session_id) = resolved_prefill.session_id() {
-            let take_result = self.prefix_caches[partition as usize]
-                .take(session_id, resolved_prefill.declared_prefix_tokens());
+            let lookup_reach = self.lookup_reach(
+                resolved_prefill.declared_prefix_tokens(),
+                resolved_prefill.post_prefill_context_tokens(),
+            );
+            let take_result = self.prefix_caches[partition as usize].take(session_id, lookup_reach);
             // `ResolvedPrefillContext::new` borrows one token back from a fully
             // resident prefix so that a zero-length prefill never reaches the
             // model. The snapshot still physically sits at the boundary, so the
@@ -390,12 +409,18 @@ impl PrefixKv for HybridGdnKv {
 
     fn release_retaining_prefix(&mut self, request: RequestId, partition: PartitionId, now: Time) {
         let resolved_prefill = self.ledger.prefill_context(request);
-        let retained_tokens = self.partitions[partition as usize]
-            .decode_current_kv(request)
-            .or_else(|| {
-                resolved_prefill.map(|value| u64::from(value.post_prefill_context_tokens()))
-            })
-            .unwrap_or(0);
+        let prompt_tokens =
+            resolved_prefill.map(|value| u64::from(value.post_prefill_context_tokens()));
+        // Under the EAGLE replay rule states exist only inside the prompt, so
+        // the prompt, not the decoded context, bounds what survives.
+        let retained_tokens = if self.eagle_replay_boundaries {
+            prompt_tokens
+        } else {
+            self.partitions[partition as usize]
+                .decode_current_kv(request)
+                .or(prompt_tokens)
+        }
+        .unwrap_or(0);
         let session_id = resolved_prefill.and_then(ResolvedPrefillContext::session_id);
         let cache_return_metadata =
             resolved_prefill.and_then(ResolvedPrefillContext::cache_return_metadata);
@@ -571,14 +596,21 @@ impl ChunkedPrefillKv for HybridGdnKv {
 }
 
 impl HybridGdnKv {
-    /// `state_tokens_per_request` and `checkpoint_interval_tokens` come from the
-    /// arch (`recurrent_state_bytes_per_request` divided by
-    /// `total_kv_bytes_per_token`, and `recurrent_checkpoint_interval_tokens`).
+    /// `state_tokens_per_request`, `checkpoint_interval_tokens` and
+    /// `checkpoint_charge_tokens` come from the arch
+    /// (`recurrent_state_bytes_per_request` divided by
+    /// `total_kv_bytes_per_token`, `recurrent_checkpoint_interval_tokens`, and
+    /// the bytes of one retained checkpoint in the same token unit).
+    /// `checkpoint_charge_tokens` is what one retained prefix snapshot costs;
+    /// the resident state and the live-decode staircase keep
+    /// `state_tokens_per_request`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         num_partitions: usize,
         kv_capacity: u64,
         state_tokens_per_request: u64,
         checkpoint_interval_tokens: u32,
+        checkpoint_charge_tokens: u64,
         prefix_cache: PrefixCacheTokenConfig,
         sampler: Option<KvSampler>,
         prefix_cache_logger: Option<PrefixCacheLogger>,
@@ -589,7 +621,7 @@ impl HybridGdnKv {
         let (quantum_tokens, charge_per_checkpoint) = if checkpoint_interval_tokens == 0 {
             (1, 0)
         } else {
-            (checkpoint_interval_tokens, state_tokens_per_request)
+            (checkpoint_interval_tokens, checkpoint_charge_tokens)
         };
         Self {
             partitions: (0..num_partitions)
@@ -610,6 +642,40 @@ impl HybridGdnKv {
             sampler,
             state_tokens_per_request,
             checkpoint_interval_tokens,
+            eagle_replay_boundaries: false,
+        }
+    }
+
+    /// Retain and resume as vLLM does for a speculating hybrid with the EAGLE
+    /// block drop ([`CheckpointRetention::EagleReplayBoundaries`]): only the
+    /// prompt's replay boundaries survive a request, and a lookup reaches at
+    /// most the prompt minus its last token. Needs a recurrent checkpoint
+    /// interval.
+    pub(crate) fn with_eagle_replay_boundaries(mut self) -> Self {
+        assert!(
+            self.checkpoint_interval_tokens > 0,
+            "EAGLE replay boundaries need a recurrent checkpoint interval"
+        );
+        self.prefix_caches = self
+            .prefix_caches
+            .into_iter()
+            .map(|cache| {
+                cache.with_checkpoint_retention(CheckpointRetention::EagleReplayBoundaries)
+            })
+            .collect();
+        self.eagle_replay_boundaries = true;
+        self
+    }
+
+    /// How far a lookup for a prompt of `prompt_tokens` may reach into its
+    /// declared prefix. vLLM caps every hit at `num_tokens - 1` so the last
+    /// prompt token is computed for logits; the default rule instead borrows
+    /// that token in `ResolvedPrefillContext::new`, which keeps it unchanged.
+    fn lookup_reach(&self, declared_prefix_tokens: u32, prompt_tokens: u32) -> u32 {
+        if self.eagle_replay_boundaries {
+            declared_prefix_tokens.min(prompt_tokens.saturating_sub(1))
+        } else {
+            declared_prefix_tokens
         }
     }
 
@@ -725,6 +791,7 @@ mod tests {
             kv_capacity,
             state_tokens,
             interval,
+            state_tokens,
             uncapped(kv_capacity),
             None,
             None,
@@ -971,6 +1038,106 @@ mod tests {
         }
         assert_eq!(kv_store.prefix_cache_physical_limit(0), 0);
         assert_eq!(kv_store.prefix_caches[0].used_charge(), 0);
+    }
+
+    // ── soft tier: EAGLE replay boundaries ───────────────────────────────────
+
+    /// GLM-5.3-Flash on H200 with MTP 5: 1152-token blocks, 19 resident state
+    /// pages per decoding request, 3 per retained boundary.
+    const GLM_BLOCK: u32 = 1_152;
+    const GLM_STATE_TOKENS: u64 = 19 * GLM_BLOCK as u64;
+    const GLM_CHECKPOINT_TOKENS: u64 = 3 * GLM_BLOCK as u64;
+
+    fn glm_store(eagle: bool) -> HybridGdnKv {
+        let kv_store = HybridGdnKv::new(
+            1,
+            10_000_000,
+            GLM_STATE_TOKENS,
+            GLM_BLOCK,
+            GLM_CHECKPOINT_TOKENS,
+            uncapped(10_000_000),
+            None,
+            None,
+        );
+        if eagle {
+            kv_store.with_eagle_replay_boundaries()
+        } else {
+            kv_store
+        }
+    }
+
+    fn session(declared_prefix_tokens: u32) -> SessionInput {
+        SessionInput::Session {
+            session_id: 7,
+            session_start_time: Time::ZERO,
+            declared_prefix_tokens,
+        }
+    }
+
+    /// Run one request of the session to completion, decoding `output` tokens,
+    /// and return its resolved prefill.
+    fn run_round(
+        kv_store: &mut HybridGdnKv,
+        request: u32,
+        fresh: u32,
+        declared: u32,
+        output: u32,
+    ) -> ResolvedPrefillContext {
+        let resolved = kv_store.preview_prefill_context(0, fresh, session(declared));
+        let context = resolved.post_prefill_context_tokens();
+        let footprint = kv_store.footprint(RequestId(request), context, output);
+        kv_store.reserve_prefill_context(RequestId(request), 0, resolved, footprint, Time::ZERO);
+        kv_store.drain_ready();
+        kv_store.commit_resident(RequestId(request), 0, u64::from(context), output);
+        kv_store.advance(AdvanceScope::WholePartition(0), output);
+        kv_store.release_retaining_prefix(RequestId(request), 0, Time::from_ms(1.0));
+        resolved
+    }
+
+    #[test]
+    fn the_glm_store_charges_three_pages_per_retained_boundary() {
+        let mut kv_store = glm_store(true);
+        run_round(&mut kv_store, 0, 20_000, 0, 500);
+        assert_eq!(
+            kv_store.prefix_caches[0].used_charge(),
+            17 * u64::from(GLM_BLOCK) + GLM_CHECKPOINT_TOKENS,
+        );
+    }
+
+    #[test]
+    fn eagle_replay_retains_from_the_prompt_and_recomputes_the_output() {
+        let mut kv_store = glm_store(true);
+        run_round(&mut kv_store, 0, 20_000, 0, 500);
+        // The output decoded past the prompt left no state behind.
+        assert_eq!(kv_store.prefix_caches[0].used_tokens(), 17 * 1_152);
+        // The next turn declares prompt + output as its prefix.
+        let next = kv_store.preview_prefill_context(0, 376, session(20_500));
+        assert_eq!(next.resident_prefix_tokens(), 16 * 1_152);
+        assert_eq!(next.prefill_tokens_to_compute(), 20_876 - 16 * 1_152);
+
+        // The default rule resumes from the decoded context instead.
+        let mut kv_store = glm_store(false);
+        run_round(&mut kv_store, 0, 20_000, 0, 500);
+        let next = kv_store.preview_prefill_context(0, 376, session(20_500));
+        assert_eq!(next.resident_prefix_tokens(), 17 * 1_152);
+    }
+
+    #[test]
+    fn eagle_replay_chains_across_turns_and_caps_a_resend_at_its_last_token() {
+        let mut kv_store = glm_store(true);
+        run_round(&mut kv_store, 0, 18 * GLM_BLOCK, 0, 100);
+        // An exact resend (nothing fresh) reaches only P - 1: the resend
+        // boundary, two blocks below the prompt.
+        let resend = run_round(&mut kv_store, 1, 0, 18 * GLM_BLOCK, 100);
+        assert_eq!(resend.resident_prefix_tokens(), 16 * GLM_BLOCK);
+        assert_eq!(resend.prefill_tokens_to_compute(), 2 * GLM_BLOCK);
+        // The resend retained the same prompt again; an extension now resumes
+        // at the extension boundary, one block below the prompt.
+        let extension = run_round(&mut kv_store, 2, 1_000, 18 * GLM_BLOCK, 100);
+        assert_eq!(extension.resident_prefix_tokens(), 17 * GLM_BLOCK);
+        // A truncated history below both boundaries recomputes everything.
+        let truncated = kv_store.preview_prefill_context(0, 50, session(10_000));
+        assert_eq!(truncated.resident_prefix_tokens(), 0);
     }
 
     // ── soft tier: the live-decode staircase ─────────────────────────────────

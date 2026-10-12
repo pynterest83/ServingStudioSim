@@ -12,6 +12,17 @@
 //! quantizes to that interval and each retained entry additionally carries one
 //! `charge_per_checkpoint` for every snapshot it keeps. Both knobs are
 //! constructor parameters; `(1, 0)` is exactly the pre-hybrid behavior.
+//!
+//! ## Which boundaries survive
+//!
+//! [`CheckpointRetention::EveryQuantum`] (the default) keeps a snapshot at
+//! every quantum boundary of the retained length, and any of them can serve a
+//! later request. [`CheckpointRetention::EagleReplayBoundaries`] instead keeps
+//! only the at most two positions vLLM retains for a speculating hybrid with
+//! the EAGLE block drop: see that variant for the rule. Only one entry is kept
+//! per session (the latest completed request's), so checkpoints an earlier
+//! turn left behind are never resumed from, even where vLLM's LRU pool might
+//! still hold them.
 
 use std::collections::HashMap;
 
@@ -108,9 +119,46 @@ impl PrefixCacheConfig {
     }
 }
 
+/// Which positions of a completed request a later request can resume from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CheckpointRetention {
+    /// Every quantum boundary of the retained length, one charged snapshot
+    /// each. At quantum one this is plain per-token full-attention reuse.
+    #[default]
+    EveryQuantum,
+    /// vLLM v0.31's hybrid prefix caching with `mamba_cache_mode = "align"`,
+    /// an EAGLE/MTP drafter (`use_eagle_block_drop`) and no retention interval.
+    ///
+    /// States are written only inside the prompt, so a completed request of
+    /// prompt length `P` (fresh plus declared prefix, output excluded) retains
+    /// the replay boundaries of `KVCacheCoordinator.get_replay_boundaries`,
+    /// with `Q` the quantum:
+    ///
+    /// ```text
+    /// resend    = floor((P - 1) / Q) * Q - Q     (the same prompt sent again)
+    /// extension = floor(P / Q) * Q - Q           (a longer sibling)
+    /// ```
+    ///
+    /// each clamped at 0, one charged state per distinct nonzero boundary.
+    /// The attention KV kept is the block above the higher boundary, which the
+    /// EAGLE lookup matches and drops back from. A later request whose lookup
+    /// may reach `M = min(declared prefix, its prompt - 1)` tokens resumes at
+    /// the largest retained boundary not above `floor(M / Q) * Q - Q`
+    /// (`find_longest_cache_hit`), or recomputes everything. Output tokens
+    /// are therefore always recomputed by the next turn.
+    EagleReplayBoundaries,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PrefixEntry {
+    /// Retained context KV, the occupancy half of the entry.
     tokens: u64,
+    /// Charged snapshots this entry keeps.
+    checkpoints: u64,
+    /// `(resend, extension)` replay boundaries under
+    /// [`CheckpointRetention::EagleReplayBoundaries`]; `None` when every
+    /// quantum boundary up to `tokens` is resumable.
+    replay_boundaries: Option<(u64, u64)>,
     insertion_sequence: u64,
     last_access_sequence: u64,
     frequency: u64,
@@ -162,6 +210,14 @@ pub(crate) struct PrefixCacheInsertResult {
     pub(crate) retained_tokens: u64,
 }
 
+/// What one insert keeps: context KV, charged snapshots and, under
+/// [`CheckpointRetention::EagleReplayBoundaries`], the resumable positions.
+struct RetainedSpan {
+    tokens: u64,
+    checkpoints: u64,
+    replay_boundaries: Option<(u64, u64)>,
+}
+
 /// One attention partition's evictable retained-session tier.
 pub(crate) struct PrefixCache {
     max_retained_tokens: u64,
@@ -174,6 +230,7 @@ pub(crate) struct PrefixCache {
     quantum_tokens: u64,
     /// Extra occupancy every retained snapshot costs on top of its context KV.
     charge_per_checkpoint: u64,
+    retention: CheckpointRetention,
     entries: HashMap<u32, PrefixEntry>,
     next_sequence: u64,
 }
@@ -192,9 +249,18 @@ impl PrefixCache {
             policy,
             quantum_tokens: u64::from(quantum_tokens.max(1)),
             charge_per_checkpoint,
+            retention: CheckpointRetention::EveryQuantum,
             entries: HashMap::new(),
             next_sequence: 0,
         }
+    }
+
+    /// Select which boundaries of a completed request survive. Changes the
+    /// meaning of [`Self::insert`]'s `tokens`; set it before the first insert.
+    pub(crate) fn with_checkpoint_retention(mut self, retention: CheckpointRetention) -> Self {
+        debug_assert!(self.entries.is_empty());
+        self.retention = retention;
+        self
     }
 
     /// Context tokens held. Deliberately test-only: every production decision
@@ -217,12 +283,6 @@ impl PrefixCache {
         tokens / self.quantum_tokens * self.quantum_tokens
     }
 
-    /// Occupancy a quantized `tokens` would add: the context KV plus one charge
-    /// for each snapshot inside it.
-    fn charge_of(&self, tokens: u64) -> u64 {
-        tokens + tokens / self.quantum_tokens * self.charge_per_checkpoint
-    }
-
     /// The largest quantized length not exceeding `tokens` whose charge fits
     /// `capacity`. Each retained snapshot costs `quantum + charge_per_checkpoint`,
     /// so the count is a plain division; at quantum one with no charge this is
@@ -238,13 +298,34 @@ impl PrefixCache {
     /// A request declaring `requested_tokens` can only resume at a boundary it
     /// shares with the retained entry, so the hit is the smaller of the two
     /// quantized lengths. At quantum one this is the plain `min`.
+    ///
+    /// Under [`CheckpointRetention::EagleReplayBoundaries`] `requested_tokens`
+    /// is the longest prefix the engine's lookup may reach (the caller caps the
+    /// declared prefix at the prompt minus its last token), and the hit is the
+    /// replay boundary that variant describes.
     pub(crate) fn peek(&self, session_id: u32, requested_tokens: u32) -> u32 {
         self.entries
             .get(&session_id)
-            .map(|entry| {
-                entry
+            .map(|entry| match entry.replay_boundaries {
+                None => entry
                     .tokens
-                    .min(self.floor_to_quantum(u64::from(requested_tokens))) as u32
+                    .min(self.floor_to_quantum(u64::from(requested_tokens)))
+                    as u32,
+                Some((resend, extension)) => {
+                    // The attention lookup matches whole blocks and drops the
+                    // last one; the recurrent finder then needs a retained
+                    // state at or below that candidate.
+                    let candidate = self
+                        .floor_to_quantum(u64::from(requested_tokens))
+                        .saturating_sub(self.quantum_tokens);
+                    if extension <= candidate {
+                        extension as u32
+                    } else if resend <= candidate {
+                        resend as u32
+                    } else {
+                        0
+                    }
+                }
             })
             .unwrap_or(0)
     }
@@ -274,6 +355,9 @@ impl PrefixCache {
 
     /// Retain a completed request's physically resident KV.
     ///
+    /// `tokens` is the request's resident context under
+    /// [`CheckpointRetention::EveryQuantum`] and its prompt length (fresh plus
+    /// declared prefix) under [`CheckpointRetention::EagleReplayBoundaries`].
     /// `physical_limit` is the current slack left by active/promised/held KV in
     /// the partition. An optional experiment ceiling was already resolved into
     /// `max_retained_tokens`; the inserted entry is clamped to the smaller limit.
@@ -292,16 +376,15 @@ impl PrefixCache {
         }
         let effective_capacity = self.max_retained_tokens.min(physical_limit);
         mutations.extend(self.shrink_to(effective_capacity));
-        // Only whole snapshots are resumable, so a tail shorter than one quantum
-        // is dropped rather than retained as unusable KV.
-        let retained_tokens = self.largest_fitting_length(tokens, effective_capacity);
+        let retained = self.retained_span(tokens, effective_capacity);
+        let retained_tokens = retained.tokens;
         if retained_tokens == 0 {
             return PrefixCacheInsertResult {
                 mutations,
                 retained_tokens,
             };
         }
-        let retained_charge = self.charge_of(retained_tokens);
+        let retained_charge = retained_tokens + retained.checkpoints * self.charge_per_checkpoint;
         while self.used_charge().saturating_add(retained_charge) > effective_capacity {
             let Some(victim) = self.victim() else {
                 break;
@@ -322,13 +405,15 @@ impl PrefixCache {
             session_id,
             PrefixEntry {
                 tokens: retained_tokens,
+                checkpoints: retained.checkpoints,
+                replay_boundaries: retained.replay_boundaries,
                 insertion_sequence,
                 last_access_sequence: sequence,
                 frequency,
             },
         );
         self.used_tokens += retained_tokens;
-        self.used_checkpoints += retained_tokens / self.quantum_tokens;
+        self.used_checkpoints += retained.checkpoints;
         mutations.push(PrefixCacheMutation {
             kind: PrefixCacheMutationKind::Retain,
             session_id,
@@ -341,6 +426,54 @@ impl PrefixCache {
             mutations,
             retained_tokens,
         }
+    }
+
+    /// What an insert of `tokens` keeps within `capacity` under the selected
+    /// retention.
+    fn retained_span(&self, tokens: u64, capacity: u64) -> RetainedSpan {
+        match self.retention {
+            CheckpointRetention::EveryQuantum => {
+                // Only whole snapshots are resumable, so a tail shorter than
+                // one quantum is dropped rather than retained as unusable KV.
+                let tokens = self.largest_fitting_length(tokens, capacity);
+                RetainedSpan {
+                    tokens,
+                    checkpoints: tokens / self.quantum_tokens,
+                    replay_boundaries: None,
+                }
+            }
+            CheckpointRetention::EagleReplayBoundaries => self.eagle_replay_span(tokens, capacity),
+        }
+    }
+
+    /// The replay boundaries of a prompt of `prompt_tokens`, both if they fit
+    /// `capacity`, else the resend boundary alone, else nothing. A boundary
+    /// at 0 needs no state and keeps nothing worth retaining.
+    fn eagle_replay_span(&self, prompt_tokens: u64, capacity: u64) -> RetainedSpan {
+        let quantum = self.quantum_tokens;
+        let resend_block = self.floor_to_quantum(prompt_tokens.saturating_sub(1));
+        let extension_block = self.floor_to_quantum(prompt_tokens);
+        let resend = resend_block.saturating_sub(quantum);
+        let extension = extension_block.saturating_sub(quantum);
+        let both = RetainedSpan {
+            tokens: extension_block,
+            checkpoints: u64::from(resend > 0) + u64::from(extension > resend),
+            replay_boundaries: Some((resend, extension)),
+        };
+        let resend_only = RetainedSpan {
+            tokens: resend_block,
+            checkpoints: u64::from(resend > 0),
+            replay_boundaries: Some((resend, resend)),
+        };
+        [both, resend_only]
+            .into_iter()
+            .filter(|span| span.checkpoints > 0)
+            .find(|span| span.tokens + span.checkpoints * self.charge_per_checkpoint <= capacity)
+            .unwrap_or(RetainedSpan {
+                tokens: 0,
+                checkpoints: 0,
+                replay_boundaries: None,
+            })
     }
 
     pub(crate) fn shrink_to(&mut self, physical_limit: u64) -> Vec<PrefixCacheMutation> {
@@ -388,9 +521,7 @@ impl PrefixCache {
     fn remove(&mut self, session_id: u32) -> Option<PrefixEntry> {
         let entry = self.entries.remove(&session_id)?;
         self.used_tokens = self.used_tokens.saturating_sub(entry.tokens);
-        self.used_checkpoints = self
-            .used_checkpoints
-            .saturating_sub(entry.tokens / self.quantum_tokens);
+        self.used_checkpoints = self.used_checkpoints.saturating_sub(entry.checkpoints);
         Some(entry)
     }
 
@@ -517,6 +648,118 @@ mod tests {
         assert_eq!(cache.peek(1, 70), 0);
         assert_eq!(cache.peek(2, 20), 20);
         assert_eq!(cache.peek(3, 30), 30);
+    }
+
+    // ── EAGLE replay boundaries ──────────────────────────────────────────────
+
+    /// GLM-5.3-Flash on H200: a 1152-token hybrid block, and one retained
+    /// boundary costs three state pages.
+    const BLOCK: u32 = 1_152;
+    const BLOCK_TOKENS: u64 = BLOCK as u64;
+    const CHECKPOINT_CHARGE: u64 = 3 * BLOCK_TOKENS;
+
+    fn eagle_cache(max_retained_tokens: u64) -> PrefixCache {
+        PrefixCache::new(
+            max_retained_tokens,
+            PrefixCachePolicy::Lru,
+            BLOCK,
+            CHECKPOINT_CHARGE,
+        )
+        .with_checkpoint_retention(CheckpointRetention::EagleReplayBoundaries)
+    }
+
+    #[test]
+    fn an_unaligned_prompt_retains_one_boundary_one_block_below_its_last() {
+        let mut cache = eagle_cache(u64::MAX);
+        // P = 20000: resend and extension both floor to 17 blocks (19584), so
+        // the single retained boundary is 16 blocks.
+        let insert = cache.insert(7, 20_000, u64::MAX, None);
+        assert_eq!(insert.retained_tokens, 17 * BLOCK_TOKENS);
+        assert_eq!(
+            cache.used_charge(),
+            17 * BLOCK_TOKENS + CHECKPOINT_CHARGE,
+            "one state, not one per block"
+        );
+        // Next turn declares 20376: candidate = 17 blocks - 1 = 16 blocks.
+        assert_eq!(cache.peek(7, 20_376), 16 * BLOCK);
+        // A longer sibling sharing exactly the prompt resumes there too.
+        assert_eq!(cache.peek(7, 20_000), 16 * BLOCK);
+        // Truncated below one block above the boundary: candidate 15 blocks.
+        assert_eq!(cache.peek(7, 17 * BLOCK - 1), 0);
+        assert_eq!(cache.peek(7, 17 * BLOCK), 16 * BLOCK);
+    }
+
+    #[test]
+    fn an_aligned_prompt_keeps_both_the_resend_and_the_extension_boundary() {
+        let mut cache = eagle_cache(u64::MAX);
+        let prompt = 18 * BLOCK_TOKENS;
+        let insert = cache.insert(7, prompt, u64::MAX, None);
+        assert_eq!(insert.retained_tokens, prompt);
+        assert_eq!(cache.used_charge(), prompt + 2 * CHECKPOINT_CHARGE);
+        // An extension reaches all 18 blocks: drop one, resume at 17.
+        assert_eq!(cache.peek(7, 18 * BLOCK), 17 * BLOCK);
+        // A resend of the same prompt reaches only P - 1 (17 whole blocks):
+        // drop one, resume at the resend boundary, 16 blocks.
+        assert_eq!(cache.peek(7, 18 * BLOCK - 1), 16 * BLOCK);
+        assert_eq!(cache.peek(7, 17 * BLOCK - 1), 0);
+    }
+
+    #[test]
+    fn a_hit_never_passes_the_retained_prompt_boundaries() {
+        let mut cache = eagle_cache(u64::MAX);
+        cache.insert(7, 20_000, u64::MAX, None);
+        // A declaration far past the prompt (it included the output the next
+        // turn recomputes) still resumes at the prompt's boundary.
+        assert_eq!(cache.peek(7, 40_000), 16 * BLOCK);
+    }
+
+    #[test]
+    fn a_prompt_shorter_than_two_blocks_retains_nothing_resumable() {
+        let mut cache = eagle_cache(u64::MAX);
+        assert_eq!(
+            cache
+                .insert(7, 2 * BLOCK_TOKENS - 1, u64::MAX, None)
+                .retained_tokens,
+            0
+        );
+        assert_eq!(cache.used_charge(), 0);
+        // Two blocks exactly: the resend boundary is 0, the extension one block.
+        let insert = cache.insert(7, 2 * BLOCK_TOKENS, u64::MAX, None);
+        assert_eq!(insert.retained_tokens, 2 * BLOCK_TOKENS);
+        assert_eq!(cache.used_charge(), 2 * BLOCK_TOKENS + CHECKPOINT_CHARGE);
+        assert_eq!(cache.peek(7, 2 * BLOCK), BLOCK);
+        assert_eq!(cache.peek(7, 2 * BLOCK - 1), 0);
+    }
+
+    #[test]
+    fn a_tight_cache_falls_back_to_the_resend_boundary_alone() {
+        let resend_only = 17 * BLOCK_TOKENS + CHECKPOINT_CHARGE;
+        let mut cache = eagle_cache(resend_only);
+        let insert = cache.insert(7, 18 * BLOCK_TOKENS, u64::MAX, None);
+        assert_eq!(insert.retained_tokens, 17 * BLOCK_TOKENS);
+        assert_eq!(cache.used_charge(), resend_only);
+        assert_eq!(cache.peek(7, 18 * BLOCK), 16 * BLOCK);
+
+        let mut cache = eagle_cache(resend_only - 1);
+        assert_eq!(
+            cache
+                .insert(7, 18 * BLOCK_TOKENS, u64::MAX, None)
+                .retained_tokens,
+            0
+        );
+        assert_eq!(cache.used_charge(), 0);
+    }
+
+    #[test]
+    fn eviction_returns_every_charged_state() {
+        let mut cache = eagle_cache(u64::MAX);
+        cache.insert(1, 18 * BLOCK_TOKENS, u64::MAX, None);
+        cache.insert(2, 20_000, u64::MAX, None);
+        let take = cache.take(1, 18 * BLOCK);
+        assert_eq!(take.hit_tokens, 17 * BLOCK);
+        assert_eq!(cache.used_charge(), 17 * BLOCK_TOKENS + CHECKPOINT_CHARGE);
+        cache.shrink_to(0);
+        assert_eq!(cache.used_charge(), 0);
     }
 
     #[test]
