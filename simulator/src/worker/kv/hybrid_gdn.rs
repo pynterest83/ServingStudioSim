@@ -490,8 +490,31 @@ impl PrefixKv for HybridGdnKv {
         let session_id = resolved_prefill.and_then(ResolvedPrefillContext::session_id);
         let cache_return_metadata =
             resolved_prefill.and_then(ResolvedPrefillContext::cache_return_metadata);
+        let context_tokens = self.partitions[partition as usize]
+            .decode_current_kv(request)
+            .or(prompt_tokens)
+            .unwrap_or(0);
         self.release(request, partition);
         if let Some(session_id) = session_id {
+            if self.checkpoint_release.at_prefill_end() {
+                let physical_limit = self.prefix_cache_physical_limit(partition);
+                let evictions = self.prefix_caches[partition as usize].queue_freed_tail(
+                    session_id,
+                    retained_tokens,
+                    context_tokens,
+                    physical_limit,
+                );
+                for eviction in evictions {
+                    self.journal.record_mutation(
+                        request,
+                        partition,
+                        now,
+                        eviction,
+                        PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::ReplacementPolicy),
+                        0,
+                    );
+                }
+            }
             self.retain_prefix(
                 request,
                 partition,

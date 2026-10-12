@@ -787,6 +787,54 @@ impl PrefixCache {
         }
     }
 
+    /// The full attention blocks a finished request frees beyond the context
+    /// segment [`Self::complete_context`] retains: its output, and the prompt
+    /// above the replay boundary. vLLM caches them (`cache_blocks` hashes every
+    /// computed full block) and `free_blocks` appends them in reverse order,
+    /// tail first, so they enter the LRU just ahead of the context segment.
+    /// They resume nothing, so they join as an orphan. Call it right before
+    /// [`Self::complete_context`]; `context_tokens` is prompt plus output.
+    pub(crate) fn queue_freed_tail(
+        &mut self,
+        session_id: u32,
+        prompt_tokens: u64,
+        context_tokens: u64,
+        physical_limit: u64,
+    ) -> Vec<PrefixCacheMutation> {
+        debug_assert!(self.release.at_prefill_end());
+        let retained = match self.entries.get(&session_id) {
+            Some(entry) if entry.context_pending => entry.tokens,
+            _ => {
+                self.retained_span(prompt_tokens, self.max_retained_tokens)
+                    .tokens
+            }
+        };
+        let tail = self
+            .floor_to_quantum(context_tokens)
+            .saturating_sub(retained);
+        let mut mutations = Vec::new();
+        if tail == 0 {
+            return mutations;
+        }
+        let effective_capacity = self.max_retained_tokens.min(physical_limit);
+        while self.used_charge().saturating_add(tail) > effective_capacity {
+            let Some(victim) = self.victim() else {
+                break;
+            };
+            if let Some(mutation) =
+                self.evict(victim, PrefixCacheMutationKind::ReplacementPolicyEviction)
+            {
+                mutations.push(mutation);
+            }
+        }
+        if self.used_charge().saturating_add(tail) <= effective_capacity {
+            let sequence = self.take_sequence();
+            self.orphans.insert(sequence, tail);
+            self.orphan_tokens += tail;
+        }
+        mutations
+    }
+
     /// Give up one victim. Under [`CheckpointRelease::AtPrefillEnd`] evicting
     /// an entry means its snapshot segment, the older one: the entry dies and
     /// its charged context KV stays queued at its own position as an orphan.
@@ -1371,5 +1419,27 @@ mod tests {
             32,
             "only the context returns, as an orphan"
         );
+    }
+
+    #[test]
+    fn a_finished_requests_freed_tail_queues_ahead_of_its_context() {
+        let mut cache = prefill_end_cache(1_000);
+        cache.insert_checkpoints(7, 40, 1_000);
+        // 40 prompt + 30 output: four full 16-token blocks, two of them kept
+        // as the context segment, two (the output) queued as an orphan.
+        cache.queue_freed_tail(7, 40, 70, 1_000);
+        assert_eq!(cache.used_charge(), 10 + 32);
+        cache.complete_context(7, 40, 1_000);
+        assert_eq!(cache.used_charge(), 10 + 32 + 32);
+        assert_eq!(
+            cache.peek(7, 39),
+            16,
+            "the tail resumes nothing but costs nothing to the hit"
+        );
+        // The snapshots go first, then the tail, then the (orphaned) context.
+        cache.shrink_to(64);
+        assert_eq!(cache.used_charge(), 64);
+        cache.shrink_to(63);
+        assert_eq!(cache.used_charge(), 32);
     }
 }
