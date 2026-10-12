@@ -1,0 +1,30 @@
+{
+  "schema": "session-execution-v2",
+  "generator": "coding-session",
+  "millisecond_decimals": 6,
+  "sessions": 608,
+  "rounds": 4649,
+  "total_prompt_tokens": 482058880,
+  "total_prefix_tokens": 455136832,
+  "total_output_tokens": 4519458,
+  "planned_prefix_hit_rate": 0.9441519508986123,
+  "parameters": {
+    "arrival_pattern": "poisson",
+    "arrival_rate_per_second": 1.0,
+    "context_policy": "trace_reported",
+    "folded_first_rounds": 0,
+    "folded_prefix_tokens": 0,
+    "folded_rounds": 0,
+    "major_compaction_min_drop_ratio": 0.5,
+    "major_compaction_min_drop_tokens": 64000,
+    "major_compaction_rounds": 0,
+    "max_sessions": null,
+    "seed": 0,
+    "selection_rule": "first_n_in_emitted_session_order",
+    "session_order": "shuffle",
+    "source_bytes": 218995,
+    "source_path": "logs/20261012_0_glm53_h200_agentic_p0/trace/s40_seed171_cap60_b60.rounds.csv",
+    "source_schema": "session-rounds-v2",
+    "source_sha256": "cf0432b15db936a932d6b708f59b092740b4c9d428accd2b820f3ec0aeacbec6"
+  }
+}

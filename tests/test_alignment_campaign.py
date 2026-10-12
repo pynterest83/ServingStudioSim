@@ -194,6 +194,8 @@ def test_update_invariants_adds_a_trace_but_will_not_rewrite_one(pack, tmp_path)
     changing a shape and re-running the command would turn a failing check green
     in a one-line diff.
     """
+    if pack.cases[0].workload_trace is None:
+        pytest.skip("a session-trace case is committed bytes, not an invariants entry")
     shutil.copytree(pack.root, tmp_path / pack.name)
     copy = load_pack(tmp_path / pack.name)
     path = check_module.invariants_path(copy)
@@ -1373,6 +1375,8 @@ def test_per_request_acceptance_gives_each_trace_request_one_measured_chain(pack
     chains handed out regardless of request length (acceptance correlates with
     output length; H200 GLM-5.3-Flash case 05 fell from 4.46 to 3.62 tokens/verify)."""
     original_case = pack.cases[0]
+    if original_case.workload_trace is None:
+        pytest.skip("per-request chains are keyed by independent shapes; a session case refuses them")
     calibrated = original_case.attn_gpu_memory_gb
     shapes = sorted({tuple(shape) for shape in original_case.workload_trace.shapes})
     (i0, o0) = shapes[0]

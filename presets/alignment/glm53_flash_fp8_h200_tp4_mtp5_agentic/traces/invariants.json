@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "note": "The traces themselves are not committed: they are `shapes` x `repeats` from campaign.yaml, and `alignment-campaign check` regenerates and compares against this record. Written by `check --update-invariants`, which only ever ADDS a trace. Re-recording an existing one means deleting its entry here first, on purpose, in a reviewable diff. This pack has no shape trace: its session trace is committed under session_traces/ and pinned by the sha256 in campaign.yaml.",
+  "traces": {}
+}
