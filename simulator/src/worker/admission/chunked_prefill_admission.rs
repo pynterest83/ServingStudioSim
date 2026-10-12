@@ -37,6 +37,18 @@
 //!
 //! The shell owns the other half: it delivers a request that arrived during k
 //! only after the decision for k+1, so it first runs in k+2.
+//!
+//! Under incremental KV admission (`KvAdmissionConfig::Incremental`, vLLM v1)
+//! nothing is reserved ahead: each decision first allocates the next step of
+//! every running decode, then of every started prompt, in admission order,
+//! preempting the most recently admitted running request whenever one of them
+//! cannot be allocated (`preempt_newest_running`); a decision that preempted
+//! admits nobody. A waiting prompt is admitted when the KV store says its
+//! whole prompt fits the blocks no running request holds; its chunk is then
+//! allocated like any other. A preempted decode recomputes its prompt and
+//! output from the front of the queue; a preempted unfinished prompt restarts.
+//! `with_max_running_requests` (vLLM's `max_num_seqs`) caps admission in
+//! every KV mode.
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -111,6 +123,9 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     /// Async scheduling only: per request and partition, completions whose KV
     /// the next decision must still see held. Released when it is made.
     deferred_releases: Vec<(RequestId, u16)>,
+    /// vLLM's `max_num_seqs`: most running requests (live decodes, trailing
+    /// rows and started prompts) after which no waiting request is admitted.
+    max_running_requests: Option<u32>,
 }
 
 impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P, SingleTokenDecodeCompletion> {
@@ -160,8 +175,13 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             ),
             "bounded-future currently requires page_size=1; larger pages need allocated-length state"
         );
+        assert!(
+            !matches!(kv_admission, KvAdmissionConfig::Incremental)
+                || partition_policies.len() == 1,
+            "incremental KV admission is validated only for one attention partition"
+        );
         let current_new_token_ratio = match kv_admission {
-            KvAdmissionConfig::FullFootprint => 1.0,
+            KvAdmissionConfig::FullFootprint | KvAdmissionConfig::Incremental => 1.0,
             KvAdmissionConfig::BoundedFuture(config) => config.initial_new_token_ratio,
         };
         Self {
@@ -187,7 +207,16 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             last_decision_boundary: Time::ZERO,
             pipelined_decision_time: None,
             deferred_releases: Vec::new(),
+            max_running_requests: None,
         }
+    }
+
+    /// Admit no waiting request while `max_running` requests run (vLLM's
+    /// `max_num_seqs`, checked against `len(self.running)`).
+    pub(crate) fn with_max_running_requests(mut self, max_running: u32) -> Self {
+        assert!(max_running > 0, "max running requests must be positive");
+        self.max_running_requests = Some(max_running);
+        self
     }
 
     /// End every non-final chunk on a multiple of `quantum` context tokens.
@@ -250,12 +279,15 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
     /// same way; that is not applied with the option off, where `queued_time`
     /// is the arrival.)
     ///
-    /// Full-footprint KV only: retracting a finished trailing row is not a
-    /// modeled transition.
+    /// Full-footprint or incremental KV only: retracting a finished trailing
+    /// row is not a modeled transition, so preemption never picks one.
     pub(crate) fn with_async_scheduling(mut self) -> Self {
         assert!(
-            matches!(self.kv_admission, KvAdmissionConfig::FullFootprint),
-            "async scheduling is modeled only with full-footprint KV admission"
+            matches!(
+                self.kv_admission,
+                KvAdmissionConfig::FullFootprint | KvAdmissionConfig::Incremental
+            ),
+            "async scheduling is modeled only with full-footprint or incremental KV admission"
         );
         self.async_scheduling = true;
         self
@@ -274,9 +306,238 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
 
     fn bounded_config(&self) -> Option<BoundedFutureKvAdmissionConfig> {
         match self.kv_admission {
-            KvAdmissionConfig::FullFootprint => None,
+            KvAdmissionConfig::FullFootprint | KvAdmissionConfig::Incremental => None,
             KvAdmissionConfig::BoundedFuture(config) => Some(config),
         }
+    }
+
+    fn incremental(&self) -> bool {
+        matches!(self.kv_admission, KvAdmissionConfig::Incremental)
+    }
+
+    /// Incremental KV: allocate every live decode's next step, `query_width`
+    /// rows past its context, in admission order. A decode that cannot be
+    /// allocated preempts the newest running request until it can or it was
+    /// the newest itself. Returns whether anything was preempted.
+    fn allocate_decode_steps<K: ChunkedPrefillKv>(
+        &mut self,
+        kv_store: &mut K,
+        context: &WorkerContext,
+        now: Time,
+        query_width: u32,
+    ) -> bool {
+        let mut preempted = false;
+        for partition_index in 0..kv_store.num_partitions() {
+            let partition = partition_index as u16;
+            let mut decodes = Vec::new();
+            kv_store.visit_decode_states(partition, |request, current_kv, remaining| {
+                // A trailing row already holds its last allocation.
+                if remaining > 0 {
+                    decodes.push((self.admission_order[&request], request, current_kv));
+                }
+            });
+            decodes.sort_unstable();
+            let mut preempted_requests = Vec::new();
+            for (_, request, current_kv) in decodes {
+                if preempted_requests.contains(&request) {
+                    continue;
+                }
+                while !kv_store.allocate_incremental(
+                    request,
+                    partition,
+                    current_kv + u64::from(query_width),
+                    now,
+                ) {
+                    let victim = self.preempt_newest_running(kv_store, context, partition, now);
+                    preempted = true;
+                    preempted_requests.push(victim);
+                    if victim == request {
+                        break;
+                    }
+                }
+            }
+        }
+        preempted
+    }
+
+    /// vLLM's FCFS preemption under incremental KV (`scheduler.py`
+    /// `self.running.pop()`): the running request admitted last, a live decode
+    /// or a started prompt, frees its KV and returns to the queue front.
+    /// Trailing rows are never chosen. Returns the victim.
+    fn preempt_newest_running<K: ChunkedPrefillKv>(
+        &mut self,
+        kv_store: &mut K,
+        context: &WorkerContext,
+        partition: u16,
+        now: Time,
+    ) -> RequestId {
+        let mut newest: Option<(u64, RequestId, bool)> = None;
+        kv_store.visit_decode_states(partition, |request, _, remaining| {
+            let order = self.admission_order[&request];
+            if remaining > 0 && newest.is_none_or(|(best, _, _)| order > best) {
+                newest = Some((order, request, false));
+            }
+        });
+        for candidate in &self.started_prefills[partition as usize] {
+            let order = self.admission_order[&candidate.request_id];
+            if newest.is_none_or(|(best, _, _)| order > best) {
+                newest = Some((order, candidate.request_id, true));
+            }
+        }
+        let (_, victim, started) =
+            newest.expect("an allocation shortfall needs a running request to preempt");
+        if started {
+            self.restart_started_prefill(kv_store, context, partition, victim, now);
+        } else {
+            // The prompt's snapshots and context return to the retained tier
+            // as at completion, so recomputation can resume from its prefix.
+            kv_store.release_retaining_prefix(victim, partition, now);
+            self.requeue_retracted(
+                kv_store,
+                context,
+                partition,
+                victim,
+                DecodeRetractionPolicy::Fcfs,
+                now,
+            );
+        }
+        victim
+    }
+
+    /// A preempted prompt that had not finished its prefill: free its KV and
+    /// queue it again at the front to start over. The prefix it took from
+    /// the retained tier is not returned (vLLM would return the attention
+    /// blocks; the state it resumed from was already freed into the pool).
+    fn restart_started_prefill<K: ChunkedPrefillKv>(
+        &mut self,
+        kv_store: &mut K,
+        context: &WorkerContext,
+        partition: u16,
+        request: RequestId,
+        now: Time,
+    ) {
+        kv_store.release(request, partition);
+        self.started_prefills[partition as usize]
+            .retain(|candidate| candidate.request_id != request);
+        self.admission_order.remove(&request);
+        let reprocessed = self
+            .prefill_episodes
+            .remove(&request)
+            .expect("a started prompt has a prefill episode");
+        let (fresh_prompt_tokens, remaining_output_tokens, session_input, conversation_start_time) = {
+            let mut store = context.requests.borrow_mut();
+            let record = &mut store[request];
+            record.record_retraction();
+            record.restart_unfinished_prefill();
+            context.stamp_stage(record, now, UnifiedStage::Pending as u16);
+            let definition = &record.request.definition;
+            (
+                definition
+                    .prompt_tokens
+                    .checked_add(record.progress.output_tokens_emitted)
+                    .expect("reprocessed input length overflow"),
+                definition
+                    .target_output_tokens
+                    .saturating_sub(record.progress.output_tokens_emitted),
+                definition.session,
+                definition
+                    .session
+                    .session_start_or(record.request.core.arrival_time),
+            )
+        };
+        let resident_prefix_tokens =
+            kv_store.resident_prefix_tokens(fresh_prompt_tokens, session_input);
+        let candidate = if reprocessed {
+            self.enqueue_sequence.freeze_retracted(
+                request,
+                fresh_prompt_tokens,
+                remaining_output_tokens,
+                session_input,
+                conversation_start_time,
+                resident_prefix_tokens,
+            )
+        } else {
+            self.enqueue_sequence.freeze(
+                request,
+                fresh_prompt_tokens,
+                remaining_output_tokens,
+                session_input,
+                conversation_start_time,
+                resident_prefix_tokens,
+            )
+        };
+        let (policy, policy_context) = &mut self.partition_policies[partition as usize];
+        policy.push_front(candidate, policy_context);
+    }
+
+    /// Requests counted against `max_running_requests` before this decision
+    /// admits anyone: live decodes and trailing rows, started prompts, and
+    /// completions whose release waits for the decision (vLLM removes a
+    /// finished request from `running` only when it processes that output).
+    fn running_count<K: ChunkedPrefillKv>(&self, kv_store: &K, partition: usize) -> u32 {
+        let deferred = self
+            .deferred_releases
+            .iter()
+            .filter(|(_, owner)| usize::from(*owner) == partition)
+            .count() as u32;
+        kv_store.live_decode_count(partition as u16)
+            + self.started_prefills[partition].len() as u32
+            + deferred
+    }
+
+    /// Incremental KV: give each started prompt, in start order, its next
+    /// chunk of `budget` and allocate it. A chunk that cannot be allocated
+    /// preempts the newest running request until it can; if the prompt was
+    /// the newest itself, vLLM stops scheduling running requests for the step.
+    /// Returns whether anything was preempted.
+    fn schedule_started_prefills_incremental<K: ChunkedPrefillKv>(
+        &mut self,
+        kv_store: &mut K,
+        context: &WorkerContext,
+        partition_index: usize,
+        budget: &mut u32,
+        now: Time,
+    ) -> bool {
+        let partition = partition_index as u16;
+        let mut preempted = false;
+        let mut index = 0;
+        while index < self.started_prefills[partition_index].len() {
+            let candidate = self.started_prefills[partition_index][index];
+            let resolved_prefill = kv_store.resolved_prefill_context(candidate.request_id);
+            let chunk_tokens = next_chunk_tokens(
+                resolved_prefill,
+                budget.saturating_sub(self.drafting_slots),
+                self.chunk_end_quantum,
+                self.eagle_block_drop,
+                self.partial_tail_unit,
+                self.max_batch_tokens,
+            );
+            if chunk_tokens == 0 {
+                index += 1;
+                continue;
+            }
+            let chunk_end = u64::from(resolved_prefill.active_chunk().0 + chunk_tokens);
+            let mut runs = true;
+            while !kv_store.allocate_incremental(candidate.request_id, partition, chunk_end, now) {
+                let victim = self.preempt_newest_running(kv_store, context, partition, now);
+                preempted = true;
+                if victim == candidate.request_id {
+                    runs = false;
+                    break;
+                }
+            }
+            if !runs {
+                break;
+            }
+            kv_store.schedule_prefill_chunk(candidate.request_id, partition, chunk_tokens);
+            *budget -= chunk_tokens + self.drafting_slots;
+            if chunk_tokens < resolved_prefill.remaining_prefill_tokens() {
+                index += 1;
+            } else {
+                self.started_prefills[partition_index].remove(index);
+            }
+        }
+        preempted
     }
 
     fn decay_new_token_ratio(&mut self, config: BoundedFutureKvAdmissionConfig) {
@@ -555,12 +816,19 @@ where
         // claiming KV for its next step, and admits no waiting request in a step
         // that had to preempt. A separate-prefill engine (SGLang) checks decode
         // headroom only on the decode-only steps it runs, below.
-        let retracted_before_admission = match bounded_config {
+        let incremental = self.incremental();
+        let mut retracted_before_admission = match bounded_config {
             Some(config) if mixes_prefill_with_decode && has_live_decode(kv_store) => {
                 self.prepare_decode(kv_store, context, now, config, query_width)
             }
             _ => false,
         };
+        // vLLM v1 allocates each running decode's step first, in running
+        // order, and preempts on a shortfall.
+        if incremental && has_live_decode(kv_store) {
+            retracted_before_admission |=
+                self.allocate_decode_steps(kv_store, context, now, query_width);
+        }
         let had_decode = has_live_decode(kv_store);
         let current_new_token_ratio = self.current_new_token_ratio;
         // Every scheduled request, decode or prefill chunk, also spends the
@@ -609,6 +877,16 @@ where
         // their prompt is complete, matching one EngineCore scheduler queue per
         // DP partition. One that cannot run this iteration keeps its place.
         for partition_index in 0..num_partitions {
+            if incremental {
+                retracted_before_admission |= self.schedule_started_prefills_incremental(
+                    kv_store,
+                    context,
+                    partition_index,
+                    &mut remaining_budgets[partition_index],
+                    now,
+                );
+                continue;
+            }
             let mut started_prefills = std::mem::take(&mut self.started_prefills[partition_index]);
             started_prefills.retain(|candidate| {
                 let resolved_prefill = kv_store.resolved_prefill_context(candidate.request_id);
@@ -636,8 +914,16 @@ where
 
         for partition_index in 0..num_partitions {
             let partition = partition_index as u16;
+            let running_before_admission = self.running_count(kv_store, partition_index);
+            let mut admitted = 0u32;
             while !retracted_before_admission && remaining_budgets[partition_index] > drafting_slots
             {
+                if self
+                    .max_running_requests
+                    .is_some_and(|max_running| running_before_admission + admitted >= max_running)
+                {
+                    break;
+                }
                 let (policy, policy_context) = &mut self.partition_policies[partition_index];
                 policy.refresh_head(&mut |candidate| {
                     kv_store.resident_prefix_tokens(
@@ -689,6 +975,11 @@ where
                     ),
                 };
                 let fits = match bounded_config {
+                    None if incremental => kv_store.incremental_prompt_fits(
+                        partition,
+                        resolved_prefill.post_prefill_context_tokens(),
+                        resolved_prefill.active_chunk().0 + chunk_tokens,
+                    ),
                     None => kv_store.fits(partition, &footprint),
                     Some(config) => kv_store.fits_bounded_future(
                         partition,
@@ -722,6 +1013,19 @@ where
                     footprint,
                     now,
                 );
+                admitted += 1;
+                if incremental {
+                    let allocated = kv_store.allocate_incremental(
+                        candidate.request_id,
+                        partition,
+                        u64::from(resolved_prefill.active_chunk().0 + chunk_tokens),
+                        now,
+                    );
+                    assert!(
+                        allocated,
+                        "an admitted prompt's first chunk fits the blocks its admission checked"
+                    );
+                }
                 {
                     let mut store = context.requests.borrow_mut();
                     store.mark_admitted(candidate.request_id);
@@ -917,7 +1221,12 @@ where
                             .target_output_tokens
                             .saturating_sub(record.progress.output_tokens_emitted)
                     };
-                    kv_store.finish_chunked_prefill(request, partition, remaining_output_tokens);
+                    kv_store.finish_chunked_prefill(
+                        request,
+                        partition,
+                        remaining_output_tokens,
+                        now,
+                    );
                     if context.requests.borrow()[request].is_complete() {
                         completed.push(request);
                     }

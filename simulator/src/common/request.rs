@@ -263,6 +263,29 @@ impl ActiveRequest<TextGenerationDefinition> {
             .expect("reprocessed prefill token count overflow");
     }
 
+    /// A preempted request whose current prefill had not finished starts that
+    /// prefill over: an open reprocessed episode is dropped, or, for the first
+    /// prefill, its progress and recorded cache hit are reset (the next
+    /// admission records a fresh one). Output already emitted is kept.
+    pub fn restart_unfinished_prefill(&mut self) {
+        if self
+            .telemetry
+            .reprocessed_prefills
+            .last()
+            .is_some_and(|episode| !episode.completed)
+        {
+            self.telemetry.reprocessed_prefills.pop();
+        } else {
+            assert_eq!(
+                self.progress.output_tokens_emitted, 0,
+                "request {} restarted a first prefill after emitting output",
+                self.request.core.id.0,
+            );
+            self.progress.prefill_tokens_processed = 0;
+            self.telemetry.prefix_cache_hit_tokens = None;
+        }
+    }
+
     pub fn complete_reprocessed_prefill(&mut self) {
         let episode = self
             .telemetry

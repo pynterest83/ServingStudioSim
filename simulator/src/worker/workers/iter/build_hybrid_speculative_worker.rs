@@ -27,6 +27,7 @@ use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{
     ChunkedPrefillAdmission, LoadBalance, PendingOrder, SpeculativeDecodeCompletion,
 };
+use crate::worker::config::KvAdmissionConfig;
 use crate::worker::execution::SpeculativeIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::kv::{HybridGdnKv, PrefixCacheConfig};
@@ -151,6 +152,23 @@ pub(crate) fn build_hybrid_speculative_worker<M: SpeculativeUnifiedModel>(
         (true, None) => kv_store.with_eagle_replay_boundaries(),
         (false, _) => kv_store,
     };
+    // vLLM v1 block allocation: every step also allocates the drafter's
+    // `num_lookahead_tokens` (= the speculative tokens) slots.
+    let kv_store = if matches!(config.kv_admission, KvAdmissionConfig::Incremental) {
+        kv_store.with_incremental_allocation(draft_tokens)
+    } else {
+        kv_store
+    };
+    let kv_store = if config.checkpoint_release_at_prefill_end {
+        assert!(
+            eagle_replay_boundaries,
+            "recurrent_checkpoint_release: prefill-end is modeled only under eagle_block_drop \
+             with prefix caching"
+        );
+        kv_store.with_checkpoint_release_at_prefill_end()
+    } else {
+        kv_store
+    };
     let balance = if num_partitions == 1 {
         LoadBalance::Single
     } else {
@@ -170,6 +188,10 @@ pub(crate) fn build_hybrid_speculative_worker<M: SpeculativeUnifiedModel>(
         ),
         drafting_slots,
     );
+    let admission = match config.max_running_requests {
+        Some(max_running) => admission.with_max_running_requests(max_running),
+        None => admission,
+    };
     let admission = match chunk_end_quantum {
         Some(quantum) if config.eagle_block_drop => {
             let admission = admission
@@ -459,5 +481,193 @@ mod tests {
     #[should_panic(expected = "must be a multiple of 4 dividing")]
     fn a_prefix_match_unit_must_divide_the_checkpoint_interval() {
         second_turn(true, None, None, Some(12));
+    }
+
+    /// Runs `count` fully-accepting 8-token prompts that each decode `output`
+    /// tokens on a 260-token pool with 20 tokens of state per request, and
+    /// returns the most requests one iteration carried and every request's
+    /// preemption count.
+    fn run_pool(
+        kv_admission: KvAdmissionConfig,
+        output: u32,
+        count: u32,
+        max_running_requests: Option<u32>,
+    ) -> (u32, Vec<u32>) {
+        run_pool_with(
+            kv_admission,
+            PROMPT_TOKENS,
+            output,
+            count,
+            max_running_requests,
+            2048,
+        )
+    }
+
+    fn run_pool_with(
+        kv_admission: KvAdmissionConfig,
+        prompt: u32,
+        output: u32,
+        count: u32,
+        max_running_requests: Option<u32>,
+        max_batch_tokens: u32,
+    ) -> (u32, Vec<u32>) {
+        let rows: Vec<_> = (0..count).map(|id| (id, prompt, output)).collect();
+        let requests = shared_with(&rows);
+        for id in 0..count {
+            requests.borrow_mut()[RequestId(id)]
+                .request
+                .definition
+                .decoding = DecodingStrategy::Speculative {
+                accept_rate: AcceptanceProfile::Uniform(1.0),
+            };
+        }
+        let model = Arc::new(HybridModel {
+            state_tokens: 20,
+            checkpoint_tokens: None,
+            most_requests: AtomicU32::new(0),
+        });
+        let config = WorkerConfig {
+            attn_kv_bytes: 260 * KV_BYTES_PER_TOKEN,
+            max_batch_tokens: Some(max_batch_tokens),
+            kv_admission,
+            max_running_requests,
+            speculative_draft_tokens: DRAFT_TOKENS,
+            speculative_acceptance_seed: Some(7),
+            ..WorkerConfig::default()
+        };
+        let mut worker = build_hybrid_speculative_worker(
+            WorkerId(0),
+            "test",
+            model.clone(),
+            requests.clone(),
+            config,
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        for id in 0..count {
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(id)));
+        }
+        for tick in 0..2_000 {
+            worker.tick(Time::from_ms(tick as f64), &mut Vec::new());
+        }
+        let requests = requests.borrow();
+        let preemptions = (0..count)
+            .map(|id| {
+                let record = &requests[RequestId(id)];
+                assert!(record.lifecycle.completed, "request {id}");
+                assert_eq!(record.progress.output_tokens_emitted, output);
+                assert_eq!(record.progress.prefill_tokens_processed, prompt);
+                assert!(record
+                    .telemetry
+                    .reprocessed_prefills
+                    .iter()
+                    .all(|episode| episode.completed));
+                record.telemetry.retraction_count
+            })
+            .collect();
+        (model.most_requests.load(Ordering::Relaxed), preemptions)
+    }
+
+    #[test]
+    fn incremental_admission_reserves_no_output_and_preempts_the_newest() {
+        // Full footprint: 8 + 60 + 20 = 88 tokens each, two at once, never
+        // preempted.
+        let (most, preemptions) = run_pool(KvAdmissionConfig::FullFootprint, 60, 6, None);
+        assert_eq!(most, 2);
+        assert!(preemptions.iter().all(|&count| count == 0));
+        // Incremental: a prompt needs one 16-token block (8 + 5 lookahead)
+        // and its state, so more start; their decodes then outgrow the pool
+        // and the most recently admitted is preempted, never the oldest.
+        let (most, preemptions) = run_pool(KvAdmissionConfig::Incremental, 60, 6, None);
+        assert!(most > 2, "admission ignores the output: {most}");
+        assert_eq!(preemptions[0], 0, "the oldest request runs through");
+        assert!(
+            preemptions.iter().any(|&count| count > 0),
+            "{preemptions:?}"
+        );
+    }
+
+    #[test]
+    fn a_preempted_unfinished_prompt_restarts_its_prefill() {
+        // 40-token prompts in 16-token-aligned chunks of a 40-token budget,
+        // decoding 120 tokens each: several prompts are partially prefilled
+        // when decodes outgrow the pool, so the newest running request is
+        // sometimes a started prompt (this case restarts four), whose
+        // progress must restart cleanly (checked by `run_pool_with`).
+        let (_, preemptions) = run_pool_with(KvAdmissionConfig::Incremental, 40, 120, 6, None, 40);
+        assert_eq!(preemptions[0], 0);
+        assert!(
+            preemptions.iter().any(|&count| count > 0),
+            "{preemptions:?}"
+        );
+    }
+
+    #[test]
+    fn max_running_requests_caps_admission() {
+        let (most, _) = run_pool(KvAdmissionConfig::Incremental, 4, 6, Some(2));
+        assert_eq!(most, 2);
+        let (most, _) = run_pool(KvAdmissionConfig::Incremental, 4, 6, None);
+        assert!(most > 2);
+    }
+
+    #[test]
+    fn prefill_end_release_still_chains_an_idle_session() {
+        // With no pressure the split segments behave like one entry.
+        let requests = shared_with(&[(0, 40, OUTPUT_TOKENS), (1, 10, OUTPUT_TOKENS)]);
+        {
+            let mut requests = requests.borrow_mut();
+            for (id, declared_prefix_tokens) in [(0, 0), (1, 40)] {
+                let definition = &mut requests[RequestId(id)].request.definition;
+                definition.decoding = DecodingStrategy::Speculative {
+                    accept_rate: AcceptanceProfile::Uniform(1.0),
+                };
+                definition.session = SessionInput::Session {
+                    session_id: 7,
+                    session_start_time: Time::ZERO,
+                    declared_prefix_tokens,
+                };
+            }
+        }
+        let model = Arc::new(HybridModel {
+            state_tokens: STATE_TOKENS,
+            checkpoint_tokens: None,
+            most_requests: AtomicU32::new(0),
+        });
+        let config = WorkerConfig {
+            attn_kv_bytes: 100_000 * KV_BYTES_PER_TOKEN,
+            max_batch_tokens: Some(2048),
+            kv_admission: KvAdmissionConfig::Incremental,
+            checkpoint_release_at_prefill_end: true,
+            speculative_draft_tokens: DRAFT_TOKENS,
+            speculative_acceptance_seed: Some(7),
+            eagle_block_drop: true,
+            async_scheduling: true,
+            ..WorkerConfig::default()
+        };
+        let mut worker = build_hybrid_speculative_worker(
+            WorkerId(0),
+            "test",
+            model,
+            requests.clone(),
+            config,
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        for (id, ticks) in [(0u32, 0..200), (1, 200..400)] {
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(id)));
+            for tick in ticks {
+                worker.tick(Time::from_ms(tick as f64), &mut Vec::new());
+            }
+        }
+        let requests = requests.borrow();
+        assert!(requests[RequestId(1)].lifecycle.completed);
+        assert_eq!(
+            requests[RequestId(1)].telemetry.prefix_cache_hit_tokens,
+            Some(16)
+        );
     }
 }

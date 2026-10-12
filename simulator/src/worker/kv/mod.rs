@@ -276,7 +276,29 @@ pub trait ChunkedPrefillKv: PrefixKv + IterWorkerKv {
         request: RequestId,
         partition: PartitionId,
         remaining_output_tokens: u32,
+        now: Time,
     );
+    /// Incremental allocation only: whether a waiting prompt of
+    /// `prompt_tokens` passes vLLM's full-sequence admission check against the
+    /// blocks no running request holds, and its first chunk, ending at
+    /// `first_chunk_end_tokens` context tokens, can be allocated.
+    fn incremental_prompt_fits(
+        &self,
+        partition: PartitionId,
+        prompt_tokens: u32,
+        first_chunk_end_tokens: u32,
+    ) -> bool;
+    /// Incremental allocation only: grow `request`'s allocation to cover
+    /// `context_tokens` scheduled positions, evicting retained KV as needed.
+    /// Returns false, allocating nothing, when even an empty retained tier
+    /// would not make room; the lifecycle then preempts.
+    fn allocate_incremental(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        context_tokens: u64,
+        now: Time,
+    ) -> bool;
     /// Keep a resident decode that has no output left in live decode
     /// membership for one more iteration, without advancing it: an async
     /// scheduler already issued its next verify row. Its KV stays charged

@@ -544,6 +544,15 @@ pub struct WorkerConfig {
     /// Async scheduling only: delay from a step's end to the moment its tokens
     /// and completions are visible.
     pub async_output_processing: Time,
+    /// Most requests running at once (vLLM's `max_num_seqs`, from the
+    /// chunked-prefill and speculative selectors). `None` is unlimited. Only
+    /// `ChunkedPrefillAdmission` reads it.
+    pub max_running_requests: Option<u32>,
+    /// A hybrid arch's prompt snapshots enter the retained tier at the prefill
+    /// end rather than at completion (the speculative selector's
+    /// `recurrent_checkpoint_release: prefill-end`). Only the hybrid
+    /// speculative recipe reads it.
+    pub checkpoint_release_at_prefill_end: bool,
 }
 
 impl Default for WorkerConfig {
@@ -569,6 +578,8 @@ impl Default for WorkerConfig {
             prefix_match_unit_tokens: None,
             async_scheduling: false,
             async_output_processing: Time::ZERO,
+            max_running_requests: None,
+            checkpoint_release_at_prefill_end: false,
         }
     }
 }

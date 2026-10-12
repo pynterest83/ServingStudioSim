@@ -34,15 +34,32 @@ const BATCH_POLICY_CHOICES: [&str; 2] = ["mix", "separate-prefill-priority"];
 /// KV-capacity rule paired with chunked prefill. `FullFootprint` preserves the
 /// historical no-retraction lifecycle. `BoundedFuture` uses an explicit
 /// future-token estimate and therefore requires decode retraction.
+/// `Incremental` is vLLM v1: admit a prompt when it fits the unheld blocks,
+/// allocate block by block as steps run, preempt FCFS when a step cannot.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum KvAdmissionPolicy {
     #[default]
     FullFootprint,
     BoundedFuture,
+    Incremental,
 }
 
-const KV_ADMISSION_POLICY_CHOICES: [&str; 2] = ["full-footprint", "bounded-future"];
+const KV_ADMISSION_POLICY_CHOICES: [&str; 3] = ["full-footprint", "bounded-future", "incremental"];
+
+/// When a hybrid arch's prompt snapshots become evictable retained KV (the
+/// speculative selector's `recurrent_checkpoint_release`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecurrentCheckpointRelease {
+    /// With the context KV, when the request finishes.
+    #[default]
+    Completion,
+    /// When the prefill ends (vLLM's Mamba `align` mode).
+    PrefillEnd,
+}
+
+const CHECKPOINT_RELEASE_CHOICES: [&str; 2] = ["completion", "prefill-end"];
 
 /// Ordering used when the next physical decode allocation does not fit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -76,6 +93,22 @@ pub enum KvAdmissionConfig {
     #[default]
     FullFootprint,
     BoundedFuture(BoundedFutureKvAdmissionConfig),
+    /// vLLM v1's scheduler and `KVCacheManager` (v0.31 defaults:
+    /// `scheduler_reserve_full_isl=True`, watermark 0, FCFS policy):
+    ///
+    /// - a waiting request is admitted when its whole prompt fits the blocks
+    ///   no running request holds, evictable retained KV included
+    ///   (`allocate_slots(full_sequence_must_fit=True)`); nothing is reserved
+    ///   for its output or for the chunks earlier admissions still owe;
+    /// - every step allocates the whole blocks its scheduled tokens reach plus
+    ///   the speculative lookahead, evicting retained KV LRU-first;
+    /// - a running request whose step cannot be allocated preempts the most
+    ///   recently admitted running request, which frees its KV and returns to
+    ///   the front of the queue to recompute; a step that preempted admits
+    ///   no waiting request.
+    ///
+    /// Modeled for the hybrid stores only (block size = checkpoint interval).
+    Incremental,
 }
 
 /// Selector-level KV admission settings for chunked-prefill and speculative workers.
@@ -129,6 +162,14 @@ impl KvAdmissionSpec {
                 "full-footprint KV admission does not accept bounded-future knobs"
             );
             return Ok(KvAdmissionConfig::FullFootprint);
+        }
+        if self.kv_admission_policy == KvAdmissionPolicy::Incremental {
+            ensure!(
+                knobs_are_absent,
+                "incremental KV admission does not accept bounded-future knobs \
+                 (its preemption is always vLLM's FCFS)"
+            );
+            return Ok(KvAdmissionConfig::Incremental);
         }
 
         let config = BoundedFutureKvAdmissionConfig {
@@ -423,6 +464,11 @@ pub enum IterWorkerSel {
         /// compatibility but kept as one typed selector component.
         #[serde(flatten)]
         kv_admission: KvAdmissionSpec,
+        /// Most requests running at once, prefilling or decoding (vLLM's
+        /// `max_num_seqs`); a waiting request is not admitted past it. None
+        /// (the default) is unlimited.
+        #[serde(default)]
+        max_running_requests: Option<u32>,
         /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
         /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
         #[serde(default = "default_gpu_time_multiplier")]
@@ -470,9 +516,24 @@ pub enum IterWorkerSel {
         batch_policy: BatchPolicy,
         /// KV capacity and decode-retraction policy. See
         /// [`IterWorkerSel::ChunkedPrefill`]; bounded-future sizes each decode's
-        /// next-step headroom at the verify width.
+        /// next-step headroom at the verify width, and incremental allocates
+        /// the verify width plus `draft_tokens` lookahead slots per step.
         #[serde(flatten)]
         kv_admission: KvAdmissionSpec,
+        /// Most requests running at once (vLLM's `max_num_seqs`). See
+        /// [`IterWorkerSel::ChunkedPrefill`]. None (the default) is unlimited.
+        #[serde(default)]
+        max_running_requests: Option<u32>,
+        /// When a hybrid arch's prompt snapshots become evictable retained KV:
+        /// `completion` (the default) retains the whole entry when the request
+        /// finishes; `prefill-end` reproduces vLLM's Mamba `align` mode, which
+        /// frees the replay-boundary states into the LRU block pool when the
+        /// prefill ends and the attention blocks when the request finishes, so
+        /// a long decode ages its own successor's hit. Modeled only under
+        /// `eagle_block_drop` with prefix caching.
+        #[serde(default)]
+        #[param(string, default = "completion", choices = CHECKPOINT_RELEASE_CHOICES)]
+        recurrent_checkpoint_release: RecurrentCheckpointRelease,
         /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
         /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
         #[serde(default = "default_gpu_time_multiplier")]
@@ -817,6 +878,72 @@ mod tests {
                 }
             ))
         ));
+    }
+
+    #[test]
+    fn the_speculative_selector_parses_the_vllm_block_pool_knobs() {
+        let worker: IterWorkerSel = serde_yaml::from_str(
+            "type: speculative\n\
+             attn_gpu_memory_gb: 80.0\n\
+             max_batch_tokens: 8192\n\
+             draft_tokens: 5\n\
+             kv_admission_policy: incremental\n\
+             max_running_requests: 64\n\
+             recurrent_checkpoint_release: prefill-end\n",
+        )
+        .expect("parse the vLLM block-pool speculative YAML");
+        let IterWorkerSel::Speculative {
+            kv_admission,
+            max_running_requests,
+            recurrent_checkpoint_release,
+            ..
+        } = worker
+        else {
+            panic!("expected the speculative selector")
+        };
+        assert_eq!(
+            kv_admission.resolve().unwrap(),
+            KvAdmissionConfig::Incremental
+        );
+        assert_eq!(max_running_requests, Some(64));
+        assert_eq!(
+            recurrent_checkpoint_release,
+            RecurrentCheckpointRelease::PrefillEnd
+        );
+        // The defaults are the historical behavior.
+        let worker: IterWorkerSel = serde_yaml::from_str(
+            "type: speculative\nattn_gpu_memory_gb: 80.0\nmax_batch_tokens: 8192\ndraft_tokens: 5\n",
+        )
+        .expect("parse the default speculative YAML");
+        let IterWorkerSel::Speculative {
+            kv_admission,
+            max_running_requests,
+            recurrent_checkpoint_release,
+            ..
+        } = worker
+        else {
+            panic!("expected the speculative selector")
+        };
+        assert_eq!(
+            kv_admission.resolve().unwrap(),
+            KvAdmissionConfig::FullFootprint
+        );
+        assert_eq!(max_running_requests, None);
+        assert_eq!(
+            recurrent_checkpoint_release,
+            RecurrentCheckpointRelease::Completion
+        );
+    }
+
+    #[test]
+    fn incremental_kv_admission_refuses_bounded_future_knobs() {
+        assert!(KvAdmissionSpec {
+            kv_admission_policy: KvAdmissionPolicy::Incremental,
+            decode_retraction_policy: Some(DecodeRetractionPolicy::Fcfs),
+            ..KvAdmissionSpec::default()
+        }
+        .resolve()
+        .is_err());
     }
 
     fn speculative_host_time(extra: &str) -> Result<Option<HostTimeModel>> {

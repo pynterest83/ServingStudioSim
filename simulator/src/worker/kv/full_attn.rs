@@ -308,6 +308,7 @@ impl ChunkedPrefillKv for FullAttnKv {
         request: RequestId,
         partition: PartitionId,
         remaining_output_tokens: u32,
+        _now: Time,
     ) {
         let context_tokens = self
             .ledger
@@ -321,6 +322,29 @@ impl ChunkedPrefillKv for FullAttnKv {
             u64::from(context_tokens),
             remaining_output_tokens,
         );
+    }
+
+    fn incremental_prompt_fits(
+        &self,
+        _partition: PartitionId,
+        _prompt_tokens: u32,
+        _first_chunk_end_tokens: u32,
+    ) -> bool {
+        unreachable!(
+            "incremental KV admission is modeled only for HybridGdnKv; the recipe rejects it"
+        )
+    }
+
+    fn allocate_incremental(
+        &mut self,
+        _request: RequestId,
+        _partition: PartitionId,
+        _context_tokens: u64,
+        _now: Time,
+    ) -> bool {
+        unreachable!(
+            "incremental KV admission is modeled only for HybridGdnKv; the recipe rejects it"
+        )
     }
 
     fn hold_trailing_decode_row(&mut self, request: RequestId, partition: PartitionId) {

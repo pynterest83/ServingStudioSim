@@ -7,6 +7,7 @@ use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{ChunkedPrefillAdmission, LoadBalance, PendingOrder};
+use crate::worker::config::KvAdmissionConfig;
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::kv::FullAttnKv;
@@ -70,6 +71,10 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
     } else {
         LoadBalance::RoundRobin { next: 0 }
     };
+    assert!(
+        !matches!(config.kv_admission, KvAdmissionConfig::Incremental),
+        "incremental KV admission is modeled only for the hybrid stores"
+    );
     let admission = ChunkedPrefillAdmission::new(
         (0..num_partitions)
             .map(|_| (PendingOrder::new(config.pending_order), ()))
@@ -79,6 +84,10 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         config.kv_admission,
         balance,
     );
+    let admission = match config.max_running_requests {
+        Some(max_running) => admission.with_max_running_requests(max_running),
+        None => admission,
+    };
 
     IterBatchWorker::from_components(
         essentials.context,

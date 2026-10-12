@@ -16,6 +16,7 @@ use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{
     ChunkedPrefillAdmission, LoadBalance, PendingOrder, SpeculativeDecodeCompletion,
 };
+use crate::worker::config::KvAdmissionConfig;
 use crate::worker::execution::SpeculativeIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::kv::FullAttnKv;
@@ -93,6 +94,10 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
     } else {
         LoadBalance::RoundRobin { next: 0 }
     };
+    assert!(
+        !matches!(config.kv_admission, KvAdmissionConfig::Incremental),
+        "incremental KV admission is modeled only for the hybrid stores"
+    );
     let admission = ChunkedPrefillAdmission::with_decode_completion(
         (0..num_partitions)
             .map(|_| (PendingOrder::new(config.pending_order), ()))
@@ -107,6 +112,10 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
         ),
         drafting_slots,
     );
+    let admission = match config.max_running_requests {
+        Some(max_running) => admission.with_max_running_requests(max_running),
+        None => admission,
+    };
     // vLLM's async scheduling has a lifecycle half (decisions from the state
     // at the previous launch, the trailing verify row, the QUEUED stamp) and a
     // cadence half (between-step message pickup, the first-input step, output

@@ -24,7 +24,7 @@
 //! turn left behind are never resumed from, even where vLLM's LRU pool might
 //! still hold them.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::Deserialize;
 
@@ -159,6 +159,32 @@ pub(crate) enum CheckpointRetention {
     EagleReplayBoundaries,
 }
 
+/// When a completed request's resumable state enters the evictable tier, and
+/// how that tier picks victims.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CheckpointRelease {
+    /// The whole entry, context KV and snapshots, is retained when the request
+    /// completes and is evicted as one unit by the replacement policy.
+    #[default]
+    OnCompletion,
+    /// vLLM v0.31's block pool under `mamba_cache_mode = "align"`.
+    ///
+    /// `MambaManager.remove_skipped_blocks` frees a prompt's boundary state
+    /// blocks into the free queue once the request computes past them, at the
+    /// end of its prefill, while the attention blocks return only when the
+    /// request finishes (`single_type_kv_cache_manager.py` `free`, reversed).
+    /// The free queue is one LRU in free order (`block_pool.py` `free_blocks`
+    /// appends cached blocks, `get_new_blocks` pops the head), so an entry is
+    /// two segments: its snapshots, stamped at the prefill end
+    /// ([`PrefixCache::insert_checkpoints`]), and its context KV, stamped at
+    /// completion ([`PrefixCache::complete_context`]). Eviction takes the
+    /// oldest segment. Losing the snapshots loses the hit; the context KV of
+    /// such a dead entry stays in the queue at its own position as an orphan
+    /// segment that only occupies capacity until it is reached. Only the LRU
+    /// policy is defined in this mode.
+    AtPrefillEnd,
+}
+
 /// The resumable positions of one entry under
 /// [`CheckpointRetention::EagleReplayBoundaries`]: the resend and extension
 /// boundaries at the quantum, then at the match unit. Zero means no state.
@@ -177,6 +203,23 @@ struct PrefixEntry {
     insertion_sequence: u64,
     last_access_sequence: u64,
     frequency: u64,
+    /// [`CheckpointRelease::AtPrefillEnd`] only: the snapshots are retained but
+    /// the context KV is still owned by the running request, so `tokens` is
+    /// not yet charged and the entry cannot serve a hit.
+    context_pending: bool,
+    /// When the snapshot segment entered the tier. Equals
+    /// `last_access_sequence` under [`CheckpointRelease::OnCompletion`].
+    checkpoint_sequence: u64,
+}
+
+/// The next segment the replacement policy gives up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Victim {
+    /// A live entry; under [`CheckpointRelease::AtPrefillEnd`] its snapshot
+    /// segment, which kills the entry and orphans its context KV.
+    Entry(u32),
+    /// The context KV of a dead entry, keyed by its sequence.
+    Orphan(u64),
 }
 
 /// Replacement metadata that follows a destructively consumed session until
@@ -251,6 +294,11 @@ pub(crate) struct PrefixCache {
     match_unit_tokens: u64,
     entries: HashMap<u32, PrefixEntry>,
     next_sequence: u64,
+    release: CheckpointRelease,
+    /// [`CheckpointRelease::AtPrefillEnd`] only: context KV of dead entries,
+    /// by the sequence it entered the tier at, and its total.
+    orphans: BTreeMap<u64, u64>,
+    orphan_tokens: u64,
 }
 
 impl PrefixCache {
@@ -271,7 +319,22 @@ impl PrefixCache {
             match_unit_tokens: u64::from(quantum_tokens.max(1)),
             entries: HashMap::new(),
             next_sequence: 0,
+            release: CheckpointRelease::OnCompletion,
+            orphans: BTreeMap::new(),
+            orphan_tokens: 0,
         }
+    }
+
+    /// Select when snapshots enter the tier and how victims are picked (see
+    /// [`CheckpointRelease`]). Set it before the first insert.
+    pub(crate) fn with_checkpoint_release(mut self, release: CheckpointRelease) -> Self {
+        debug_assert!(self.entries.is_empty());
+        assert!(
+            release == CheckpointRelease::OnCompletion || self.policy == PrefixCachePolicy::Lru,
+            "checkpoint release at the prefill end is defined only for the LRU policy"
+        );
+        self.release = release;
+        self
     }
 
     /// Select which boundaries of a completed request survive. Changes the
@@ -309,7 +372,7 @@ impl PrefixCache {
     /// retained snapshot. Equals [`Self::used_tokens`] when there is no per-
     /// checkpoint charge.
     pub(crate) fn used_charge(&self) -> u64 {
-        self.used_tokens + self.used_checkpoints * self.charge_per_checkpoint
+        self.used_tokens + self.used_checkpoints * self.charge_per_checkpoint + self.orphan_tokens
     }
 
     /// Round a length down to the coarsest boundary this cache can resume from.
@@ -340,6 +403,7 @@ impl PrefixCache {
     pub(crate) fn peek(&self, session_id: u32, requested_tokens: u32) -> u32 {
         self.entries
             .get(&session_id)
+            .filter(|entry| !entry.context_pending)
             .map(|entry| match entry.replay_boundaries {
                 None => entry
                     .tokens
@@ -422,7 +486,7 @@ impl PrefixCache {
                 break;
             };
             if let Some(mutation) =
-                self.remove_with_receipt(victim, PrefixCacheMutationKind::ReplacementPolicyEviction)
+                self.evict(victim, PrefixCacheMutationKind::ReplacementPolicyEviction)
             {
                 mutations.push(mutation);
             }
@@ -442,6 +506,8 @@ impl PrefixCache {
                 insertion_sequence,
                 last_access_sequence: sequence,
                 frequency,
+                context_pending: false,
+                checkpoint_sequence: sequence,
             },
         );
         self.used_tokens += retained_tokens;
@@ -534,16 +600,235 @@ impl PrefixCache {
             let Some(victim) = self.victim() else {
                 break;
             };
-            if let Some(mutation) =
-                self.remove_with_receipt(victim, PrefixCacheMutationKind::CapacityEviction)
-            {
+            if let Some(mutation) = self.evict(victim, PrefixCacheMutationKind::CapacityEviction) {
                 mutations.push(mutation);
             }
         }
         mutations
     }
 
-    fn victim(&self) -> Option<u32> {
+    /// Retain a prompt's snapshots at its prefill end
+    /// ([`CheckpointRelease::AtPrefillEnd`]). The context KV that makes them
+    /// resumable is recorded but stays uncharged, and the entry serves no hit,
+    /// until [`Self::complete_context`]. `prompt_tokens` is fresh plus declared
+    /// prefix, as for [`Self::insert`]; `physical_limit` is the slack the hard
+    /// tier leaves.
+    pub(crate) fn insert_checkpoints(
+        &mut self,
+        session_id: u32,
+        prompt_tokens: u64,
+        physical_limit: u64,
+    ) -> PrefixCacheInsertResult {
+        debug_assert_eq!(self.release, CheckpointRelease::AtPrefillEnd);
+        let mut mutations = Vec::new();
+        if let Some(mutation) =
+            self.remove_with_receipt(session_id, PrefixCacheMutationKind::SameSessionReplacement)
+        {
+            mutations.push(mutation);
+        }
+        // Which boundaries the prompt leaves does not depend on the slack now:
+        // the engine wrote them; whether they survive is the LRU's business.
+        let retained = self.retained_span(prompt_tokens, self.max_retained_tokens);
+        let checkpoint_charge = retained.checkpoints * self.charge_per_checkpoint;
+        let effective_capacity = self.max_retained_tokens.min(physical_limit);
+        if retained.checkpoints == 0 || checkpoint_charge > effective_capacity {
+            return PrefixCacheInsertResult {
+                mutations,
+                retained_tokens: 0,
+            };
+        }
+        while self.used_charge().saturating_add(checkpoint_charge) > effective_capacity {
+            let Some(victim) = self.victim() else {
+                break;
+            };
+            if let Some(mutation) =
+                self.evict(victim, PrefixCacheMutationKind::ReplacementPolicyEviction)
+            {
+                mutations.push(mutation);
+            }
+        }
+        let sequence = self.take_sequence();
+        self.entries.insert(
+            session_id,
+            PrefixEntry {
+                tokens: retained.tokens,
+                checkpoints: retained.checkpoints,
+                replay_boundaries: retained.replay_boundaries,
+                insertion_sequence: sequence,
+                last_access_sequence: sequence,
+                frequency: 0,
+                context_pending: true,
+                checkpoint_sequence: sequence,
+            },
+        );
+        self.used_checkpoints += retained.checkpoints;
+        let cache_used = self.used_tokens;
+        mutations.push(PrefixCacheMutation {
+            kind: PrefixCacheMutationKind::Retain,
+            session_id,
+            entry_tokens_before: 0,
+            entry_tokens_after: 0,
+            cache_used_before: cache_used,
+            cache_used_after: cache_used,
+        });
+        PrefixCacheInsertResult {
+            mutations,
+            retained_tokens: 0,
+        }
+    }
+
+    /// The request whose snapshots [`Self::insert_checkpoints`] retained has
+    /// finished: its context KV joins the tier as the entry's newer segment and
+    /// the entry can serve a hit. If the snapshots were evicted meanwhile, the
+    /// context KV still enters the queue, as an orphan. Freed blocks never
+    /// evict anything in the engine, so this only evicts when the hard tier
+    /// keeps the freed context for itself (`physical_limit`).
+    pub(crate) fn complete_context(
+        &mut self,
+        session_id: u32,
+        prompt_tokens: u64,
+        physical_limit: u64,
+    ) -> PrefixCacheInsertResult {
+        debug_assert_eq!(self.release, CheckpointRelease::AtPrefillEnd);
+        let mut mutations = Vec::new();
+        let effective_capacity = self.max_retained_tokens.min(physical_limit);
+        let live = self
+            .entries
+            .get(&session_id)
+            .is_some_and(|entry| entry.context_pending);
+        let tokens = match self.entries.get(&session_id) {
+            Some(entry) if live => entry.tokens,
+            _ => {
+                self.retained_span(prompt_tokens, self.max_retained_tokens)
+                    .tokens
+            }
+        };
+        while self.used_charge().saturating_add(tokens) > effective_capacity {
+            let Some(victim) = self.victim() else {
+                break;
+            };
+            if let Some(mutation) =
+                self.evict(victim, PrefixCacheMutationKind::ReplacementPolicyEviction)
+            {
+                mutations.push(mutation);
+            }
+        }
+        let fits = self.used_charge().saturating_add(tokens) <= effective_capacity;
+        let sequence = self.take_sequence();
+        let still_live = self
+            .entries
+            .get(&session_id)
+            .is_some_and(|entry| entry.context_pending);
+        if !fits {
+            if still_live {
+                // The snapshots alone resume nothing.
+                if let Some(mutation) = self.evict(
+                    Victim::Entry(session_id),
+                    PrefixCacheMutationKind::CapacityEviction,
+                ) {
+                    mutations.push(mutation);
+                }
+            }
+            return PrefixCacheInsertResult {
+                mutations,
+                retained_tokens: 0,
+            };
+        }
+        if !still_live {
+            if tokens > 0 {
+                self.orphans.insert(sequence, tokens);
+                self.orphan_tokens += tokens;
+            }
+            return PrefixCacheInsertResult {
+                mutations,
+                retained_tokens: 0,
+            };
+        }
+        let cache_used_before = self.used_tokens;
+        let entry = self
+            .entries
+            .get_mut(&session_id)
+            .expect("a live pending entry");
+        entry.context_pending = false;
+        entry.last_access_sequence = sequence;
+        self.used_tokens += tokens;
+        mutations.push(PrefixCacheMutation {
+            kind: PrefixCacheMutationKind::Retain,
+            session_id,
+            entry_tokens_before: 0,
+            entry_tokens_after: tokens,
+            cache_used_before,
+            cache_used_after: self.used_tokens,
+        });
+        PrefixCacheInsertResult {
+            mutations,
+            retained_tokens: tokens,
+        }
+    }
+
+    /// Give up one victim. Under [`CheckpointRelease::AtPrefillEnd`] evicting
+    /// an entry means its snapshot segment, the older one: the entry dies and
+    /// its charged context KV stays queued at its own position as an orphan.
+    fn evict(
+        &mut self,
+        victim: Victim,
+        kind: PrefixCacheMutationKind,
+    ) -> Option<PrefixCacheMutation> {
+        match victim {
+            Victim::Entry(session_id) => {
+                let cache_used_before = self.used_tokens;
+                let entry = self.remove(session_id)?;
+                if self.release == CheckpointRelease::AtPrefillEnd && !entry.context_pending {
+                    self.orphans
+                        .insert(entry.last_access_sequence, entry.tokens);
+                    self.orphan_tokens += entry.tokens;
+                }
+                Some(PrefixCacheMutation {
+                    kind,
+                    session_id,
+                    entry_tokens_before: entry.tokens,
+                    entry_tokens_after: 0,
+                    cache_used_before,
+                    cache_used_after: self.used_tokens,
+                })
+            }
+            Victim::Orphan(sequence) => {
+                let tokens = self
+                    .orphans
+                    .remove(&sequence)
+                    .expect("an orphan victim is queued");
+                self.orphan_tokens -= tokens;
+                None
+            }
+        }
+    }
+
+    fn victim(&self) -> Option<Victim> {
+        if self.release == CheckpointRelease::AtPrefillEnd {
+            // One LRU over segments: an entry's oldest is its snapshot segment.
+            let entry = self
+                .entries
+                .iter()
+                .map(|(session_id, entry)| (entry.checkpoint_sequence, *session_id))
+                .min();
+            let orphan = self.orphans.keys().next().copied();
+            return match (entry, orphan) {
+                (Some((entry_sequence, session_id)), Some(orphan_sequence)) => {
+                    Some(if orphan_sequence < entry_sequence {
+                        Victim::Orphan(orphan_sequence)
+                    } else {
+                        Victim::Entry(session_id)
+                    })
+                }
+                (Some((_, session_id)), None) => Some(Victim::Entry(session_id)),
+                (None, Some(orphan_sequence)) => Some(Victim::Orphan(orphan_sequence)),
+                (None, None) => None,
+            };
+        }
+        self.policy_victim().map(Victim::Entry)
+    }
+
+    fn policy_victim(&self) -> Option<u32> {
         match self.policy {
             PrefixCachePolicy::Lru => self
                 .entries
@@ -571,7 +856,9 @@ impl PrefixCache {
 
     fn remove(&mut self, session_id: u32) -> Option<PrefixEntry> {
         let entry = self.entries.remove(&session_id)?;
-        self.used_tokens = self.used_tokens.saturating_sub(entry.tokens);
+        if !entry.context_pending {
+            self.used_tokens = self.used_tokens.saturating_sub(entry.tokens);
+        }
         self.used_checkpoints = self.used_checkpoints.saturating_sub(entry.checkpoints);
         Some(entry)
     }
@@ -927,5 +1214,95 @@ mod tests {
         assert_eq!(take.entry_tokens, 60);
         assert_eq!(take.cache_used_before, 60);
         assert_eq!(take.cache_used_after, 0);
+    }
+
+    /// P = 40 at a 16-token quantum leaves one replay boundary, 16, kept with
+    /// 32 attention tokens; each boundary state is charged 10.
+    fn prefill_end_cache(capacity: u64) -> PrefixCache {
+        PrefixCache::new(capacity, PrefixCachePolicy::Lru, 16, 10)
+            .with_checkpoint_retention(CheckpointRetention::EagleReplayBoundaries)
+            .with_checkpoint_release(CheckpointRelease::AtPrefillEnd)
+    }
+
+    #[test]
+    fn prefill_end_snapshots_serve_no_hit_until_the_context_returns() {
+        let mut cache = prefill_end_cache(1_000);
+        cache.insert_checkpoints(7, 40, 1_000);
+        assert_eq!(
+            cache.used_charge(),
+            10,
+            "only the boundary state is charged"
+        );
+        assert_eq!(
+            cache.peek(7, 39),
+            0,
+            "the running request still owns the context"
+        );
+        let completed = cache.complete_context(7, 40, 1_000);
+        assert_eq!(completed.retained_tokens, 32);
+        assert_eq!(cache.used_charge(), 42);
+        assert_eq!(cache.peek(7, 39), 16);
+    }
+
+    #[test]
+    fn a_long_decode_loses_its_snapshots_before_a_younger_entry() {
+        // Session 1 ends its prefill first but decodes longest: its snapshots
+        // are the oldest segment although its context returned last.
+        let mut cache = prefill_end_cache(1_000);
+        cache.insert_checkpoints(1, 40, 1_000);
+        cache.insert_checkpoints(2, 40, 1_000);
+        cache.complete_context(2, 40, 1_000);
+        cache.complete_context(1, 40, 1_000);
+        assert_eq!(cache.used_charge(), 84);
+        cache.shrink_to(80);
+        assert_eq!(cache.peek(1, 39), 0, "session 1's snapshots went first");
+        assert_eq!(cache.peek(2, 39), 16);
+        assert_eq!(
+            cache.used_charge(),
+            74,
+            "the dead entry's context stays queued as an orphan"
+        );
+        // Completion-time retention evicts the other way round.
+        let mut whole_entries = PrefixCache::new(1_000, PrefixCachePolicy::Lru, 16, 10)
+            .with_checkpoint_retention(CheckpointRetention::EagleReplayBoundaries);
+        whole_entries.insert(2, 40, 1_000, None);
+        whole_entries.insert(1, 40, 1_000, None);
+        whole_entries.shrink_to(80);
+        assert_eq!(whole_entries.peek(1, 39), 16);
+        assert_eq!(whole_entries.peek(2, 39), 0);
+    }
+
+    #[test]
+    fn an_orphaned_context_is_evicted_in_its_own_turn() {
+        let mut cache = prefill_end_cache(1_000);
+        cache.insert_checkpoints(1, 40, 1_000); // segment 0
+        cache.insert_checkpoints(2, 40, 1_000); // segment 1
+        cache.complete_context(2, 40, 1_000); // segment 2
+        cache.complete_context(1, 40, 1_000); // segment 3
+        cache.shrink_to(80); // session 1's snapshots; its context orphaned at 3
+                             // Session 2's snapshots (1) are older than the orphan (3): session 2
+                             // dies next, and its own context (2) is then reclaimed before the
+                             // orphan.
+        cache.shrink_to(60);
+        assert_eq!(cache.peek(2, 39), 0);
+        assert_eq!(
+            cache.used_charge(),
+            32,
+            "only session 1's orphaned context is left"
+        );
+        cache.shrink_to(0);
+        assert_eq!(cache.used_charge(), 0);
+    }
+
+    #[test]
+    fn a_context_returning_after_its_snapshots_died_is_queued_as_an_orphan() {
+        let mut cache = prefill_end_cache(1_000);
+        cache.insert_checkpoints(1, 40, 1_000);
+        cache.shrink_to(0);
+        assert_eq!(cache.used_charge(), 0);
+        let completed = cache.complete_context(1, 40, 1_000);
+        assert_eq!(completed.retained_tokens, 0);
+        assert_eq!(cache.peek(1, 39), 0);
+        assert_eq!(cache.used_charge(), 32);
     }
 }

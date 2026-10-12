@@ -15,6 +15,7 @@ use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{ChunkedPrefillAdmission, LoadBalance, PendingOrder};
+use crate::worker::config::KvAdmissionConfig;
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::kv::{HybridGdnKv, PrefixCacheConfig};
@@ -98,6 +99,12 @@ pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         essentials.sampler,
         prefix_cache_logger,
     );
+    // vLLM v1 block allocation; no drafter, so no lookahead slots.
+    let kv_store = if matches!(config.kv_admission, KvAdmissionConfig::Incremental) {
+        kv_store.with_incremental_allocation(0)
+    } else {
+        kv_store
+    };
     let balance = if num_partitions == 1 {
         LoadBalance::Single
     } else {
@@ -114,6 +121,10 @@ pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
     );
     let admission = match chunk_end_quantum {
         Some(quantum) => admission.with_chunk_end_quantum(quantum),
+        None => admission,
+    };
+    let admission = match config.max_running_requests {
+        Some(max_running) => admission.with_max_running_requests(max_running),
         None => admission,
     };
     IterBatchWorker::from_components(

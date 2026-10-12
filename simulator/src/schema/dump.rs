@@ -366,7 +366,7 @@ mod tests {
         assert_eq!(policy["default"], "full-footprint");
         assert_eq!(
             policy["choices"],
-            json!(["full-footprint", "bounded-future"])
+            json!(["full-footprint", "bounded-future", "incremental"])
         );
         for name in [
             "kv_page_size",

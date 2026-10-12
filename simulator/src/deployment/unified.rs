@@ -39,6 +39,7 @@ use crate::orchestrator::{
     UnifiedWorkerFactory,
 };
 use crate::timing::PerfApiBridge;
+use crate::worker::config::RecurrentCheckpointRelease;
 use crate::worker::{
     build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
     build_hybrid_chunked_prefill_worker, build_hybrid_speculative_worker,
@@ -192,6 +193,8 @@ impl Deployment for UnifiedDeployment {
             prefix_match_unit_tokens: prefix_match_unit_tokens(&g.worker)?,
             async_scheduling: async_scheduling(&g.worker),
             async_output_processing: async_output_processing(&g.worker)?,
+            max_running_requests: max_running_requests(&g.worker),
+            checkpoint_release_at_prefill_end: checkpoint_release_at_prefill_end(&g.worker),
             ..WorkerConfig::default()
         };
 
@@ -920,6 +923,32 @@ fn prefix_match_unit_tokens(worker: &IterWorkerSel) -> anyhow::Result<Option<u32
 }
 
 /// vLLM's async scheduling, carried by the `speculative` selector only.
+/// vLLM's `max_num_seqs`, from the two chunked selectors; None elsewhere.
+fn max_running_requests(worker: &IterWorkerSel) -> Option<u32> {
+    match worker {
+        IterWorkerSel::ChunkedPrefill {
+            max_running_requests,
+            ..
+        }
+        | IterWorkerSel::Speculative {
+            max_running_requests,
+            ..
+        } => *max_running_requests,
+        _ => None,
+    }
+}
+
+/// The speculative selector's `recurrent_checkpoint_release: prefill-end`.
+fn checkpoint_release_at_prefill_end(worker: &IterWorkerSel) -> bool {
+    matches!(
+        worker,
+        IterWorkerSel::Speculative {
+            recurrent_checkpoint_release: RecurrentCheckpointRelease::PrefillEnd,
+            ..
+        }
+    )
+}
+
 fn async_scheduling(worker: &IterWorkerSel) -> bool {
     match worker {
         IterWorkerSel::Speculative {
@@ -1202,6 +1231,7 @@ mod tests {
             kv_admission: crate::worker::config::KvAdmissionSpec::default(),
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
+            max_running_requests: None,
         }
     }
 
@@ -1407,6 +1437,8 @@ pools:
             async_scheduling: false,
             async_output_processing_ms: 0.0,
             what_if_kernel_time_scale: Vec::new(),
+            max_running_requests: None,
+            recurrent_checkpoint_release: Default::default(),
         }
     }
 

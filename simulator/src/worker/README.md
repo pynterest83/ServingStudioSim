@@ -235,7 +235,7 @@ and the client TTFT. A synchronous vLLM also picks requests up only between
 steps; that is a possible follow-up and is not applied with the option off.
 
 It is a framework limitation reproduced for a vLLM baseline, off by default,
-and requires `full-footprint` KV admission.
+and requires `full-footprint` or `incremental` KV admission.
 
 The lifecycle freezes `AdmissionCandidate` facts once at enqueue. Its
 `conversation_start_time` is a session's first trace-declared arrival, or the
@@ -390,3 +390,28 @@ by `chunked_prefill` and `speculative`:
 - `decode_retraction_policy` selects the victim. `length` (SGLang) takes the
   fewest emitted tokens and requeues behind waiting requests. `fcfs` (vLLM)
   takes the most recently admitted request and requeues it at the head.
+- `incremental` is vLLM v1's scheduler and `KVCacheManager` (hybrid stores
+  only, block = checkpoint interval). A waiting prompt is admitted when the
+  whole prompt fits the blocks no running request holds, retained KV counting
+  as free (`scheduler_reserve_full_isl`); nothing is reserved for its output
+  or for chunks earlier admissions still owe. Each decision allocates every
+  running decode's next step, then every started prompt's chunk, in whole
+  blocks plus the drafter's lookahead slots, evicting retained KV LRU-first
+  (`HybridGdnKv::allocate_incremental`). A step that cannot be allocated
+  preempts the most recently admitted running request (FCFS, recompute): a
+  decode returns its prompt to the retained tier and requeues at the head, an
+  unfinished prompt restarts; a decision that preempted admits nobody. It
+  composes with async scheduling.
+
+`max_running_requests` (vLLM's `max_num_seqs`, both chunked selectors) stops
+admission while that many requests run; unset is unlimited.
+
+`recurrent_checkpoint_release: prefill-end` (speculative selector, hybrid arch
+with `eagle_block_drop`) reproduces when vLLM's Mamba `align` mode frees a
+prompt's replay-boundary states into its LRU block pool: at the prefill end,
+while the attention blocks return only at completion. The retained tier then
+evicts by segment (`CheckpointRelease::AtPrefillEnd` in
+`kv/shared/prefix_cache.rs`): a long decode ages its successor's resumable
+state, a dead entry's context stays queued as an orphan until reached. Under
+load whose retained working set exceeds the pool this is what turns hits into
+an all-miss thrash (`logs/20261012_11_glm53_h200_thrash`).

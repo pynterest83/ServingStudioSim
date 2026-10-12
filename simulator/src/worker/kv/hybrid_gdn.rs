@@ -52,13 +52,16 @@
 //! <https://github.com/vllm-project/vllm/pull/43447> and Marconi
 //! (<https://arxiv.org/abs/2411.19379>).
 
+use std::collections::HashMap;
+
 use crate::common::{RequestId, SessionInput, Time};
 use crate::log::{
     KvSampler, KvSubmit, PrefixCacheActivation, PrefixCacheEvent, PrefixCacheEventKind,
     PrefixCacheEvictionReason, PrefixCacheLogger, PrefixCacheRetentionReason,
 };
 use crate::worker::kv::shared::prefix_cache::{
-    CheckpointRetention, PrefixCache, PrefixCacheMutation, PrefixCacheReturnMetadata,
+    CheckpointRelease, CheckpointRetention, PrefixCache, PrefixCacheMutation,
+    PrefixCacheReturnMetadata,
 };
 use crate::worker::kv::shared::prefix_cache_journal::PrefixCacheJournal;
 use crate::worker::kv::shared::request_ledger::RequestLedger;
@@ -102,6 +105,43 @@ pub struct HybridGdnKv {
     /// vLLM's EAGLE replay boundaries: retain from the prompt only, and cap a
     /// lookup at the prompt minus its last token.
     eagle_replay_boundaries: bool,
+    /// When a prompt's snapshots enter the retained tier (see
+    /// [`CheckpointRelease`]).
+    checkpoint_release: CheckpointRelease,
+    /// vLLM v1 block allocation instead of an up-front reservation (see
+    /// [`IncrementalBlocks`]). `None` keeps the reserved footprint.
+    incremental: Option<IncrementalBlocks>,
+}
+
+/// vLLM v1's `KVCacheManager.allocate_slots` ledger: a running request holds
+/// only the whole blocks its scheduled tokens reach, plus the speculative
+/// lookahead slots and its recurrent state, and nothing is reserved for the
+/// rest of its prompt or its output. Every allocation that the free blocks
+/// cannot cover evicts retained KV from the head of the LRU queue
+/// (`BlockPool.get_new_blocks`); one that the free and evictable blocks
+/// together cannot cover fails, and the lifecycle preempts.
+struct IncrementalBlocks {
+    /// The hash block size, in tokens: the attention allocation granularity.
+    block_tokens: u64,
+    /// Slots allocated past every scheduled position (`num_lookahead_tokens`).
+    lookahead_tokens: u64,
+    /// Attention tokens each running request holds, in whole blocks; its
+    /// recurrent state comes on top.
+    request_tokens: HashMap<RequestId, (PartitionId, u64)>,
+    /// Per partition: everything allocated, attention plus states.
+    partition_tokens: Vec<u64>,
+}
+
+impl IncrementalBlocks {
+    fn whole_blocks(&self, tokens: u64) -> u64 {
+        tokens.div_ceil(self.block_tokens) * self.block_tokens
+    }
+
+    fn free(&mut self, request: RequestId, state_tokens: u64) {
+        if let Some((partition, tokens)) = self.request_tokens.remove(&request) {
+            self.partition_tokens[partition as usize] -= tokens + state_tokens;
+        }
+    }
 }
 
 impl KvStore for HybridGdnKv {
@@ -144,8 +184,14 @@ impl KvStore for HybridGdnKv {
         footprint: Self::Footprint,
         now: Time,
     ) {
-        self.ledger
-            .promise(request, partition, footprint.reserved_charge());
+        // Incremental allocation reserves nothing up front: each scheduled
+        // step allocates what it reaches (`allocate_incremental`).
+        let promised = if self.incremental.is_some() {
+            0
+        } else {
+            footprint.reserved_charge()
+        };
+        self.ledger.promise(request, partition, promised);
         let evictions = self.trim_prefix_cache_to_physical_slack(partition);
         for eviction in evictions {
             self.journal.record_mutation(
@@ -197,6 +243,9 @@ impl KvStore for HybridGdnKv {
     }
 
     fn release(&mut self, request: RequestId, partition: PartitionId) {
+        if let Some(incremental) = self.incremental.as_mut() {
+            incremental.free(request, self.state_tokens_per_request);
+        }
         self.ledger.take_held(request);
         self.ledger.forget_promise(request);
         self.ledger.forget_chunked_prefill(request);
@@ -216,6 +265,20 @@ impl KvStore for HybridGdnKv {
         let live_checkpoints = self.clamped_live_checkpoint_charge(partition);
         let held = self.ledger.partition_held(partition);
         let partition_state = &self.partitions[partition as usize];
+        if let Some(incremental) = &self.incremental {
+            let allocated = incremental.partition_tokens[partition as usize] + held;
+            let submit = KvSubmit {
+                active_kv: allocated + retained_prefix_kv + live_checkpoints,
+                retained_prefix_kv,
+                projected_peak: allocated + retained_prefix_kv + live_checkpoints,
+                promised_kv: 0,
+            };
+            self.sampler
+                .as_mut()
+                .unwrap()
+                .submit(partition, submit, now);
+            return;
+        }
         let submit = KvSubmit {
             active_kv: partition_state.resident_tokens()
                 + held
@@ -265,6 +328,9 @@ impl IterWorkerKv for HybridGdnKv {
     }
 
     fn release_external(&mut self, request: RequestId, current_kv: u64) -> Option<PartitionId> {
+        if let Some(incremental) = self.incremental.as_mut() {
+            incremental.free(request, self.state_tokens_per_request);
+        }
         let Some(partition) = self.ledger.forget_placement(request) else {
             self.ledger.take_held(request);
             self.ledger.forget_chunked_prefill(request);
@@ -572,12 +638,13 @@ impl ChunkedPrefillKv for HybridGdnKv {
         request: RequestId,
         partition: PartitionId,
         remaining_output_tokens: u32,
+        now: Time,
     ) {
-        let context_tokens = self
+        let resolved_prefill = self
             .ledger
             .prefill_context(request)
-            .expect("chunked prefill context must exist")
-            .post_prefill_context_tokens();
+            .expect("chunked prefill context must exist");
+        let context_tokens = resolved_prefill.post_prefill_context_tokens();
         self.ledger.forget_chunked_prefill(request);
         self.commit_resident(
             request,
@@ -585,6 +652,91 @@ impl ChunkedPrefillKv for HybridGdnKv {
             u64::from(context_tokens),
             remaining_output_tokens,
         );
+        if self.checkpoint_release == CheckpointRelease::AtPrefillEnd {
+            if let Some(session_id) = resolved_prefill.session_id() {
+                self.retain_checkpoints(
+                    request,
+                    partition,
+                    session_id,
+                    u64::from(context_tokens),
+                    now,
+                );
+            }
+        }
+    }
+
+    fn incremental_prompt_fits(
+        &self,
+        partition: PartitionId,
+        prompt_tokens: u32,
+        first_chunk_end_tokens: u32,
+    ) -> bool {
+        let incremental = self
+            .incremental
+            .as_ref()
+            .expect("incremental admission needs `with_incremental_allocation`");
+        // `allocate_slots(full_sequence_must_fit=True)`: the whole prompt must
+        // fit in the free blocks, evictable cached ones included, without
+        // counting what earlier admissions will still allocate.
+        let attention =
+            incremental
+                .whole_blocks(u64::from(prompt_tokens))
+                .max(incremental.whole_blocks(
+                    u64::from(first_chunk_end_tokens) + incremental.lookahead_tokens,
+                ));
+        let partition_state = &self.partitions[partition as usize];
+        incremental.partition_tokens[partition as usize]
+            + self.ledger.partition_held(partition)
+            + attention
+            + self.state_tokens_per_request
+            <= partition_state.capacity_tokens()
+    }
+
+    fn allocate_incremental(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        context_tokens: u64,
+        now: Time,
+    ) -> bool {
+        let state_tokens = self.state_tokens_per_request;
+        let capacity = self.partitions[partition as usize].capacity_tokens();
+        let held = self.ledger.partition_held(partition);
+        let incremental = self
+            .incremental
+            .as_mut()
+            .expect("incremental admission needs `with_incremental_allocation`");
+        let target = incremental.whole_blocks(context_tokens + incremental.lookahead_tokens);
+        let (current, first) = match incremental.request_tokens.get(&request) {
+            Some(&(owner, tokens)) => {
+                debug_assert_eq!(owner, partition);
+                (tokens, false)
+            }
+            None => (0, true),
+        };
+        let added = target.saturating_sub(current) + if first { state_tokens } else { 0 };
+        if added == 0 {
+            return true;
+        }
+        if incremental.partition_tokens[partition as usize] + held + added > capacity {
+            return false;
+        }
+        incremental
+            .request_tokens
+            .insert(request, (partition, current.max(target)));
+        incremental.partition_tokens[partition as usize] += added;
+        let evictions = self.trim_prefix_cache_to_physical_slack(partition);
+        for eviction in evictions {
+            self.journal.record_mutation(
+                request,
+                partition,
+                now,
+                eviction,
+                PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::ActiveKvPressure),
+                0,
+            );
+        }
+        true
     }
 
     fn hold_trailing_decode_row(&mut self, request: RequestId, partition: PartitionId) {
@@ -640,7 +792,45 @@ impl HybridGdnKv {
             state_tokens_per_request,
             checkpoint_interval_tokens,
             eagle_replay_boundaries: false,
+            checkpoint_release: CheckpointRelease::OnCompletion,
+            incremental: None,
         }
+    }
+
+    /// Allocate as vLLM v1 does ([`IncrementalBlocks`]): attention in whole
+    /// checkpoint-interval blocks plus `lookahead_tokens` slots, the recurrent
+    /// state with the first allocation, nothing reserved ahead. Needs a
+    /// recurrent checkpoint interval, which is the block size.
+    pub(crate) fn with_incremental_allocation(mut self, lookahead_tokens: u32) -> Self {
+        assert!(
+            self.checkpoint_interval_tokens > 0,
+            "incremental allocation needs the checkpoint interval as its block size"
+        );
+        self.incremental = Some(IncrementalBlocks {
+            block_tokens: u64::from(self.checkpoint_interval_tokens),
+            lookahead_tokens: u64::from(lookahead_tokens),
+            request_tokens: HashMap::new(),
+            partition_tokens: vec![0; self.partitions.len()],
+        });
+        self
+    }
+
+    /// Retain a prompt's snapshots when its prefill ends and its context KV
+    /// when it completes, as two LRU segments ([`CheckpointRelease::AtPrefillEnd`]).
+    /// Needs [`Self::with_eagle_replay_boundaries`] first: only the replay
+    /// boundaries are freed into the pool at the prefill end.
+    pub(crate) fn with_checkpoint_release_at_prefill_end(mut self) -> Self {
+        assert!(
+            self.eagle_replay_boundaries,
+            "checkpoint release at the prefill end is modeled only under EAGLE replay boundaries"
+        );
+        self.prefix_caches = self
+            .prefix_caches
+            .into_iter()
+            .map(|cache| cache.with_checkpoint_release(CheckpointRelease::AtPrefillEnd))
+            .collect();
+        self.checkpoint_release = CheckpointRelease::AtPrefillEnd;
+        self
     }
 
     /// Retain and resume as vLLM does for a speculating hybrid with the EAGLE
@@ -697,6 +887,10 @@ impl HybridGdnKv {
     /// Hard-tier occupancy: whichever of the immediate and the projected total
     /// is larger, including everything reserved but not yet resident.
     fn non_cache_peak(&self, partition: PartitionId) -> u64 {
+        if let Some(incremental) = &self.incremental {
+            return incremental.partition_tokens[partition as usize]
+                + self.ledger.partition_held(partition);
+        }
         let reserved =
             self.ledger.partition_promised(partition) + self.ledger.partition_held(partition);
         let partition_state = &self.partitions[partition as usize];
@@ -763,12 +957,16 @@ impl HybridGdnKv {
         retain_reason: PrefixCacheRetentionReason,
     ) {
         let physical_limit = self.prefix_cache_physical_limit(partition);
-        let insert_result = self.prefix_caches[partition as usize].insert(
-            session_id,
-            tokens,
-            physical_limit,
-            cache_return_metadata,
-        );
+        let insert_result = match self.checkpoint_release {
+            CheckpointRelease::OnCompletion => self.prefix_caches[partition as usize].insert(
+                session_id,
+                tokens,
+                physical_limit,
+                cache_return_metadata,
+            ),
+            CheckpointRelease::AtPrefillEnd => self.prefix_caches[partition as usize]
+                .complete_context(session_id, tokens, physical_limit),
+        };
         for mutation in insert_result.mutations {
             let event_kind = PrefixCacheJournal::retain_event_kind(mutation.kind, retain_reason);
             self.journal
@@ -789,6 +987,40 @@ impl HybridGdnKv {
                 requested_tokens: tokens,
                 hit_tokens: 0,
             });
+        }
+    }
+}
+
+impl HybridGdnKv {
+    /// The prefill-end half of [`CheckpointRelease::AtPrefillEnd`]: the
+    /// prompt's replay-boundary snapshots enter the LRU now.
+    fn retain_checkpoints(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        session_id: u32,
+        prompt_tokens: u64,
+        now: Time,
+    ) {
+        let physical_limit = self.prefix_cache_physical_limit(partition);
+        let insert_result = self.prefix_caches[partition as usize].insert_checkpoints(
+            session_id,
+            prompt_tokens,
+            physical_limit,
+        );
+        for mutation in insert_result.mutations {
+            let event_kind = PrefixCacheJournal::retain_event_kind(
+                mutation.kind,
+                PrefixCacheRetentionReason::RequestComplete,
+            );
+            self.journal.record_mutation(
+                request,
+                partition,
+                now,
+                mutation,
+                event_kind,
+                prompt_tokens,
+            );
         }
     }
 }
@@ -906,7 +1138,7 @@ mod tests {
         }
         kv_store.schedule_prefill_chunk(RequestId(0), 0, 904);
         kv_store.complete_prefill_chunk(RequestId(0));
-        kv_store.finish_chunked_prefill(RequestId(0), 0, 20);
+        kv_store.finish_chunked_prefill(RequestId(0), 0, 20, Time::ZERO);
         assert_eq!(kv_store.ledger.partition_promised(0), 0);
         assert_eq!(
             kv_store.partitions[0].resident_tokens(),
@@ -1271,5 +1503,130 @@ mod tests {
         assert_eq!(kv_store.prefix_caches[0].peek(7, 137), 137);
         assert_eq!(kv_store.prefix_caches[0].used_charge(), 137);
         assert_eq!(kv_store.clamped_live_checkpoint_charge(0), 0);
+    }
+
+    // ── incremental allocation (vLLM v1) ─────────────────────────────────────
+
+    /// 400-token pool, 20 tokens of state per request, 16-token blocks, a
+    /// 10-token retained boundary state, EAGLE replay boundaries, 5
+    /// lookahead slots.
+    fn incremental_store(capacity: u64) -> HybridGdnKv {
+        HybridGdnKv::new(1, capacity, 20, 16, 10, uncapped(capacity), None, None)
+            .with_eagle_replay_boundaries()
+            .with_incremental_allocation(5)
+    }
+
+    /// Admit, prefill in one chunk and decode one request of session 7 with a
+    /// 40-token prompt through the incremental API, stopping before release.
+    fn incremental_round_to_decode(kv_store: &mut HybridGdnKv, request: u32) {
+        let resolved = kv_store.preview_prefill_context(0, 40, session(0));
+        let footprint = kv_store.footprint(RequestId(request), 40, 4);
+        kv_store.reserve_chunked_prefill_context(
+            RequestId(request),
+            0,
+            resolved,
+            footprint,
+            Time::ZERO,
+        );
+        assert!(kv_store.allocate_incremental(RequestId(request), 0, 40, Time::ZERO));
+        kv_store.schedule_prefill_chunk(RequestId(request), 0, 40);
+        kv_store.drain_ready();
+        kv_store.complete_prefill_chunk(RequestId(request));
+        kv_store.finish_chunked_prefill(RequestId(request), 0, 4, Time::from_ms(1.0));
+        kv_store.clear_prefill_admits(0);
+        kv_store.advance(AdvanceScope::WholePartition(0), 4);
+    }
+
+    #[test]
+    fn incremental_allocation_takes_whole_blocks_plus_lookahead_and_the_state_once() {
+        let mut kv_store = incremental_store(1_000);
+        let resolved = kv_store.preview_prefill_context(0, 100, SessionInput::Standalone);
+        let footprint = kv_store.footprint(RequestId(0), 100, 500);
+        kv_store.reserve_chunked_prefill_context(RequestId(0), 0, resolved, footprint, Time::ZERO);
+        assert_eq!(
+            kv_store.ledger.partition_promised(0),
+            0,
+            "nothing is reserved ahead"
+        );
+        assert!(kv_store.allocate_incremental(RequestId(0), 0, 20, Time::ZERO));
+        // 20 + 5 lookahead -> two 16-token blocks, plus the 20-token state.
+        assert_eq!(kv_store.non_cache_peak(0), 32 + 20);
+        assert!(kv_store.allocate_incremental(RequestId(0), 0, 30, Time::ZERO));
+        assert_eq!(kv_store.non_cache_peak(0), 48 + 20);
+        assert!(kv_store.allocate_incremental(RequestId(0), 0, 10, Time::ZERO));
+        assert_eq!(
+            kv_store.non_cache_peak(0),
+            48 + 20,
+            "allocations never shrink"
+        );
+        // A request that cannot fit allocates nothing.
+        assert!(!kv_store.allocate_incremental(RequestId(1), 0, 912, Time::ZERO));
+        assert_eq!(kv_store.non_cache_peak(0), 48 + 20);
+        kv_store.release(RequestId(0), 0);
+        assert_eq!(kv_store.non_cache_peak(0), 0);
+    }
+
+    #[test]
+    fn incremental_admission_checks_the_whole_prompt_against_unheld_blocks() {
+        let mut kv_store = incremental_store(1_000);
+        assert!(kv_store.allocate_incremental(RequestId(0), 0, 75, Time::ZERO)); // 80 + 20
+                                                                                 // 1_000 - 100 held: an 880-token prompt (880 + 20) fits, 881 does not,
+                                                                                 // whatever its first chunk.
+        assert!(kv_store.incremental_prompt_fits(0, 880, 16));
+        assert!(!kv_store.incremental_prompt_fits(0, 881, 16));
+        // The future decode of the running request is not reserved.
+        let mut decoding = incremental_store(1_000);
+        incremental_round_to_decode(&mut decoding, 0);
+        assert!(decoding.incremental_prompt_fits(0, 880, 16));
+    }
+
+    #[test]
+    fn an_incremental_step_evicts_retained_kv_and_fails_only_on_held_blocks() {
+        let mut kv_store = incremental_store(400);
+        incremental_round_to_decode(&mut kv_store, 0);
+        kv_store.release_retaining_prefix(RequestId(0), 0, Time::from_ms(2.0));
+        assert_eq!(kv_store.non_cache_peak(0), 0);
+        assert_eq!(kv_store.prefix_caches[0].used_charge(), 32 + 10);
+        assert_eq!(
+            kv_store
+                .preview_prefill_context(0, 10, session(40))
+                .resident_prefix_tokens(),
+            16
+        );
+        // Retained KV is free capacity: 368 + 20 of 400 fits by evicting it.
+        assert!(kv_store.allocate_incremental(RequestId(1), 0, 350, Time::from_ms(3.0)));
+        assert_eq!(kv_store.prefix_caches[0].used_charge(), 0);
+        assert_eq!(
+            kv_store
+                .preview_prefill_context(0, 10, session(40))
+                .resident_prefix_tokens(),
+            0
+        );
+        assert!(!kv_store.allocate_incremental(RequestId(2), 0, 1, Time::from_ms(3.0)));
+    }
+
+    #[test]
+    fn prefill_end_release_retains_the_snapshots_before_the_request_finishes() {
+        let mut kv_store = incremental_store(10_000).with_checkpoint_release_at_prefill_end();
+        incremental_round_to_decode(&mut kv_store, 0);
+        assert_eq!(
+            kv_store.prefix_caches[0].used_charge(),
+            10,
+            "the boundary state entered the pool at the prefill end"
+        );
+        assert_eq!(
+            kv_store
+                .preview_prefill_context(0, 10, session(40))
+                .resident_prefix_tokens(),
+            0
+        );
+        kv_store.release_retaining_prefix(RequestId(0), 0, Time::from_ms(2.0));
+        assert_eq!(kv_store.prefix_caches[0].used_charge(), 32 + 10);
+        assert_eq!(
+            kv_store
+                .preview_prefill_context(0, 10, session(40))
+                .resident_prefix_tokens(),
+            16
+        );
     }
 }

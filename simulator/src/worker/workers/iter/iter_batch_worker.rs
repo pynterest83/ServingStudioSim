@@ -1150,7 +1150,7 @@ mod tests {
             new_token_ratio_decay_steps: 2,
             ..match config.kv_admission {
                 KvAdmissionConfig::BoundedFuture(config) => config,
-                KvAdmissionConfig::FullFootprint => unreachable!(),
+                KvAdmissionConfig::FullFootprint | KvAdmissionConfig::Incremental => unreachable!(),
             }
         });
         let mut worker = build_chunked_prefill_worker(
