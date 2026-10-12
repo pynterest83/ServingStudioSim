@@ -225,6 +225,10 @@ impl<M: SpeculativeUnifiedModel> SpeculativeUnifiedModel for WhatIfKernelTimeSca
     fn recurrent_checkpoint_interval_tokens(&self) -> u32 {
         self.inner.recurrent_checkpoint_interval_tokens()
     }
+
+    fn recurrent_checkpoint_bytes(&self) -> u64 {
+        self.inner.recurrent_checkpoint_bytes()
+    }
 }
 
 #[cfg(test)]

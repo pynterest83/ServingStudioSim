@@ -108,6 +108,10 @@ const ALIGN_STATE_PAGES: u32 = 2;
 const ALIGN_RESIDENT_STATE_PAGES: u32 = 1;
 /// The kpool tail group's one block per request.
 const KPOOL_TAIL_PAGES: u32 = 1;
+/// State blocks one retained prefix-cache boundary keeps per KDA group: in
+/// `align` mode a Mamba hit needs exactly the single state block ending on the
+/// boundary (`MambaManager.reachable_block_mask`).
+const CHECKPOINT_STATE_PAGES_PER_GROUP: u32 = 1;
 /// vLLM runs the shared expert on an aux stream at or below this batch size.
 const SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: u32 = 256;
 /// `Parallel{overlap}` of the main-stream shared expert against the
@@ -481,6 +485,14 @@ pub fn state_pages_per_request(model: &Glm53FlashModelCfg, draft_tokens: u32) ->
 /// charged.
 pub fn resident_state_pages_per_request(model: &Glm53FlashModelCfg, draft_tokens: u32) -> u32 {
     kda_groups(model) * (ALIGN_RESIDENT_STATE_PAGES + draft_tokens) + KPOOL_TAIL_PAGES
+}
+
+/// Pages one retained prefix-cache checkpoint occupies: one state block per
+/// KDA group. The kpool tail group is not prefix-cacheable
+/// (`KpoolTailSpec.prefix_cacheable = False`), and the attention KV of the
+/// prefix itself is per-token, already counted as retained context.
+pub fn checkpoint_state_pages(model: &Glm53FlashModelCfg) -> u32 {
+    kda_groups(model) * CHECKPOINT_STATE_PAGES_PER_GROUP
 }
 
 fn kda_groups(model: &Glm53FlashModelCfg) -> u32 {
@@ -943,6 +955,7 @@ pub struct Glm53FlashSpecModel {
     mtp_recurrent: Option<MtpPass>,
     total_kv_bytes_per_token: u64,
     recurrent_state_bytes_per_request: u64,
+    recurrent_checkpoint_bytes: u64,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -1027,6 +1040,8 @@ pub fn build(
     let recurrent_state_bytes_per_request = tp
         * u64::from(resident_state_pages_per_request(model_cfg, draft_tokens))
         * page_bytes_per_gpu;
+    let recurrent_checkpoint_bytes =
+        tp * u64::from(checkpoint_state_pages(model_cfg)) * page_bytes_per_gpu;
     let mtp_step0 = MtpPass::build(
         &format!("{n}.mtp.step_0"),
         &resolved,
@@ -1104,6 +1119,7 @@ pub fn build(
         graph_dispatch: GraphDispatch::new(&cfg.parallel.cudagraph_capture_sizes, draft_tokens + 1),
         total_kv_bytes_per_token,
         recurrent_state_bytes_per_request,
+        recurrent_checkpoint_bytes,
         cost_flat: Vec::new(),
         n_slots: 0,
         name,
@@ -1323,7 +1339,7 @@ impl SpeculativeUnifiedModel for Glm53FlashSpecModel {
         self.tp_size
     }
 
-    /// The 22 pinned state pages (all ranks): KDA groups x (2 + K) + tail.
+    /// The 19 resident state pages (all ranks): KDA groups x (1 + K) + tail.
     fn recurrent_state_bytes_per_request(&self) -> u64 {
         self.recurrent_state_bytes_per_request
     }
@@ -1331,6 +1347,12 @@ impl SpeculativeUnifiedModel for Glm53FlashSpecModel {
     /// The hybrid page: KDA checkpoint interval and prefix-reuse quantum.
     fn recurrent_checkpoint_interval_tokens(&self) -> u32 {
         HYBRID_BLOCK_SIZE
+    }
+
+    /// The 3 pages one retained boundary keeps (one per KDA group), not the 19
+    /// a decoding request pins.
+    fn recurrent_checkpoint_bytes(&self) -> u64 {
+        self.recurrent_checkpoint_bytes
     }
 }
 
@@ -1567,6 +1589,9 @@ mod tests {
         // 3144 pages with 19 state pages per running request and would
         // overflow the pool with 20.
         assert_eq!(resident_state_pages_per_request(&model, 5), 19);
+        // A retained prefix-cache boundary keeps one state block per KDA
+        // group (34 KDA layers in groups of 12): 3 pages, whatever K is.
+        assert_eq!(checkpoint_state_pages(&model), 3);
         let page = u64::from(HYBRID_BLOCK_SIZE) * kv_bytes_per_token_per_gpu(&model);
         // The logs print the pool rounded to 0.01 GiB, so round the page count.
         let pages = |gib: f64| (gib * f64::from(1u32 << 30) / page as f64).round() as u64;

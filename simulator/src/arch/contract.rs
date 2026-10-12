@@ -453,6 +453,19 @@ pub trait SpeculativeUnifiedModel: Send + Sync + 'static {
     fn recurrent_checkpoint_interval_tokens(&self) -> u32 {
         0
     }
+
+    /// **Total** bytes (whole model, all ranks) one *retained* prefix-cache
+    /// checkpoint occupies: the recurrent state a later request resumes from
+    /// at one checkpoint boundary. Same unit as
+    /// [`Self::recurrent_state_bytes_per_request`], which is its default.
+    ///
+    /// The two differ when the engine caches less state per boundary than a
+    /// running request pins: vLLM's Mamba `align` mode keeps one state block
+    /// per cacheable recurrent group at a boundary, while a decoding request
+    /// also holds the speculative scratch and non-cacheable groups.
+    fn recurrent_checkpoint_bytes(&self) -> u64 {
+        self.recurrent_state_bytes_per_request()
+    }
 }
 
 #[cfg(test)]
