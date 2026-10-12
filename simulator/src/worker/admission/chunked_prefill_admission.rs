@@ -73,6 +73,10 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     /// because full attention prunes the last matching block. A framework
     /// constraint, enabled only to reproduce a vLLM baseline.
     eagle_block_drop: bool,
+    /// vLLM's `--prefix-match-unit` when finer than `chunk_end_quantum`: the
+    /// prompt also stops a chunk at its partial-tail hash boundary, where the
+    /// engine writes the finer resumable state.
+    partial_tail_unit: Option<u32>,
     prefill_episodes: HashMap<RequestId, bool>,
     /// Order in which each running request was last admitted from the waiting
     /// queue; FCFS retraction evicts the most recent one.
@@ -171,6 +175,7 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             started_prefills: Vec::new(),
             chunk_end_quantum: None,
             eagle_block_drop: false,
+            partial_tail_unit: None,
             prefill_episodes: HashMap::new(),
             admission_order: HashMap::new(),
             next_admission: 0,
@@ -201,6 +206,23 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             "eagle block drop needs a chunk-end quantum"
         );
         self.eagle_block_drop = true;
+        self
+    }
+
+    /// Also stop a prompt's chunk at its partial-tail boundary for a prefix
+    /// match unit `unit` finer than the chunk-end quantum, as vLLM's
+    /// `_mamba_block_aligned_split` does (`tail_boundary`). A unit equal to the
+    /// quantum adds nothing. Only meaningful together with
+    /// [`Self::with_chunk_end_quantum`].
+    pub(crate) fn with_prefix_match_unit(mut self, unit: u32) -> Self {
+        let quantum = self
+            .chunk_end_quantum
+            .expect("a prefix match unit needs a chunk-end quantum");
+        assert!(
+            unit > 0 && quantum.is_multiple_of(unit),
+            "prefix match unit {unit} must divide the chunk-end quantum {quantum}"
+        );
+        self.partial_tail_unit = (unit < quantum).then_some(unit);
         self
     }
 
@@ -546,6 +568,7 @@ where
         let drafting_slots = self.drafting_slots;
         let chunk_end_quantum = self.chunk_end_quantum;
         let eagle_block_drop = self.eagle_block_drop;
+        let partial_tail_unit = self.partial_tail_unit;
         let max_batch_tokens = self.max_batch_tokens;
         let decode_budget = query_width + drafting_slots;
         // One short prompt can create a whole verify window next iteration.
@@ -594,6 +617,7 @@ where
                     remaining_budgets[partition_index].saturating_sub(drafting_slots),
                     chunk_end_quantum,
                     eagle_block_drop,
+                    partial_tail_unit,
                     max_batch_tokens,
                 );
                 if chunk_tokens == 0 {
@@ -644,6 +668,7 @@ where
                     remaining_budgets[partition_index] - drafting_slots,
                     chunk_end_quantum,
                     eagle_block_drop,
+                    partial_tail_unit,
                     max_batch_tokens,
                 );
                 if chunk_tokens == 0 {
@@ -956,6 +981,7 @@ fn next_chunk_tokens(
     budget: u32,
     chunk_end_quantum: Option<u32>,
     eagle_block_drop: bool,
+    partial_tail_unit: Option<u32>,
     max_chunk_tokens: u32,
 ) -> u32 {
     let remaining = resolved_prefill.remaining_prefill_tokens();
@@ -964,15 +990,56 @@ fn next_chunk_tokens(
         None => chunk_tokens,
         Some(quantum) => {
             let start = resolved_prefill.active_chunk().0;
-            checkpoint_aligned_chunk_tokens(
+            let chunk_tokens = checkpoint_aligned_chunk_tokens(
                 start,
                 start + remaining,
                 chunk_tokens,
                 quantum,
                 eagle_block_drop,
                 max_chunk_tokens,
-            )
+            );
+            match partial_tail_unit {
+                None => chunk_tokens,
+                Some(unit) => partial_tail_chunk_tokens(
+                    start,
+                    start + remaining,
+                    chunk_tokens,
+                    quantum,
+                    unit,
+                    eagle_block_drop,
+                ),
+            }
         }
+    }
+}
+
+/// The partial-tail stop of vLLM's `_mamba_block_aligned_split` for a prefix
+/// match `unit` finer than `quantum` (`mamba_partial_cache_hit`): a chunk
+/// starting at `start` and already clipped to `chunk_tokens` also stops at the
+/// prompt's last whole unit, one unit lower under `eagle_block_drop`, when that
+/// position lies past the prompt's last cacheable block boundary. Its state is
+/// the finer resumable checkpoint `PrefixCache::with_match_unit` retains.
+/// Every stop is a `min` over positions inside the chunk, so applying this one
+/// after [`checkpoint_aligned_chunk_tokens`] is the engine's single `min`.
+fn partial_tail_chunk_tokens(
+    start: u32,
+    prefill_end: u32,
+    chunk_tokens: u32,
+    quantum: u32,
+    unit: u32,
+    eagle_block_drop: bool,
+) -> u32 {
+    let mut last_boundary = prefill_end / quantum * quantum;
+    let mut tail = prefill_end / unit * unit;
+    if eagle_block_drop {
+        last_boundary = last_boundary.saturating_sub(quantum);
+        tail = tail.saturating_sub(unit);
+    }
+    let end = start + chunk_tokens;
+    if last_boundary < tail && tail < prefill_end && start < tail && tail < end {
+        tail - start
+    } else {
+        chunk_tokens
     }
 }
 
@@ -989,8 +1056,9 @@ fn next_chunk_tokens(
 ///   before the unaligned tail. Under `eagle_block_drop` that boundary backs
 ///   off one quantum (`last_cache_position - block_size`).
 ///
-/// The fork's partial-tail hash stop, shared-prefix junction stop, and in-chunk
-/// prefill checkpoints are not modeled.
+/// The fork's partial-tail hash stop is [`partial_tail_chunk_tokens`]; its
+/// shared-prefix junction stop and in-chunk prefill checkpoints are not
+/// modeled.
 fn checkpoint_aligned_chunk_tokens(
     start: u32,
     prefill_end: u32,
@@ -1029,7 +1097,7 @@ fn checkpoint_aligned_chunk_tokens(
 
 #[cfg(test)]
 mod tests {
-    use super::checkpoint_aligned_chunk_tokens;
+    use super::{checkpoint_aligned_chunk_tokens, partial_tail_chunk_tokens};
 
     const BLOCK: u32 = 2_176;
 
@@ -1120,6 +1188,35 @@ mod tests {
         assert_eq!(
             checkpoint_aligned_chunk_tokens(0, 2_048, 2_048, 1_152, true, 8_192),
             2_048
+        );
+    }
+
+    #[test]
+    fn a_finer_prefix_match_unit_stops_at_the_partial_tail_boundary() {
+        // --prefix-match-unit 64, EAGLE block drop: a 4096-token prompt stops
+        // at 2304 as before, then at floor(4096 / 64) * 64 - 64 = 4032.
+        let chunk = |start: u32, chunk_tokens: u32| {
+            let aligned =
+                checkpoint_aligned_chunk_tokens(start, 4_096, chunk_tokens, 1_152, true, 8_192);
+            partial_tail_chunk_tokens(start, 4_096, aligned, 1_152, 64, true)
+        };
+        assert_eq!(chunk(0, 4_096), 2_304);
+        assert_eq!(chunk(2_304, 1_792), 1_728);
+        assert_eq!(chunk(4_032, 64), 64);
+        // A turn resumed mid-block at 19904 of a 21200-token prompt: the
+        // block stop, then the tail stop at 21120, then the last 80 tokens.
+        let chunk = |start: u32, chunk_tokens: u32| {
+            let aligned =
+                checkpoint_aligned_chunk_tokens(start, 21_200, chunk_tokens, 1_152, true, 8_192);
+            partial_tail_chunk_tokens(start, 21_200, aligned, 1_152, 64, true)
+        };
+        assert_eq!(chunk(19_904, 1_296), 832);
+        assert_eq!(chunk(20_736, 464), 384);
+        assert_eq!(chunk(21_120, 80), 80);
+        // Without the drop, a tail on the last block boundary adds no stop.
+        assert_eq!(
+            partial_tail_chunk_tokens(0, 2_310, 2_310, 1_152, 64, false),
+            2_310
         );
     }
 }
