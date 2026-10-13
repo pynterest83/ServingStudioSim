@@ -229,14 +229,28 @@ cases:
       v0.31.0 fork 6364508b6a, TP4, BF16 KV, MTP 5, FA3 sparse MLA, gpu_memory_utilization 0.92, max_model_len 262144)
       on 2026-10-12'
     evidence: logs/20261012_4_glm53_h200_gpu1/runs/A1_prod/server.log
-  # One chain per round from its output_len.
+  # The chain of every round speculative_acceptance_per_round does not list. Replaces the fixed-length code-corpus
+  # vector [0.9063, 0.8562, 0.8181, 0.8095, 0.7846] (4.23 tokens/verify, output-token-weighted over 8k/32k/96k/192k
+  # strata; logs/20261012_4_glm53_h200_gpu1/acceptance_pack_vector.json): the agentic passes themselves accept
+  # 4.644 tokens/verify, so that vector undercounted acceptance on this workload by about 10%.
   speculative_acceptance: &agentic_acceptance
-    value: [0.9063, 0.8562, 0.8181, 0.8095, 0.7846]
+    value: [0.9167, 0.8940, 0.8803, 0.8762, 0.8768]
     status: measured
-    derived_from: conditional per-position acceptance measured on the code corpus with the production server on
-      2026-10-12, output-token-weighted over 4 context strata (8k/32k/96k/192k) by this sample's output-token shares
-      (0.055/0.119/0.414/0.412); mean accepted length 4.23 (acceptance_pack_vector.json)
-    evidence: logs/20261012_4_glm53_h200_gpu1/acceptance_result.json
+    derived_from: conditional per-position acceptance pooled over every verify row (decode_request_progress, 894,392
+      rows) of the production server's two agentic passes of this trace at rate 0.11, P1_r011 and P2_r011
+      (logs/20261012_7_glm53_h200_tock1/runs/), on 2026-10-12; 4.644 tokens/verify (tools/acceptance_bands.py over
+      both passes; the per-pass vectors are in the evidence)
+    evidence: logs/20261012_11_glm53_h200_thrash/acceptance_bands.txt
+  # Each round's own chain as measured on P2_r011, every round of this trace.
+  speculative_acceptance_per_round: &agentic_per_round
+    file: acceptance/p2_r011_per_round_accept.csv
+    sha256: 180bcf1c7c22066ccd1046a85eec0407dec401a720779dc5576200ea858d8b8c
+    provenance: per-request conditional chains from P2_r011's decode_request_progress
+      (logs/20261012_7_glm53_h200_tock1/runs/P2_r011, 448,169 verify rows), copied from
+      logs/20261012_11_glm53_h200_thrash/diag/trace_speculative_p2_per_request_accept.csv; the session trace's rows plus
+      accept_rate, all 2,099 rounds. 1,968 rounds with >= 20 verify rows carry their own chain (a measured 0 floored to
+      0.01); the 131 with fewer carry P2's pooled [0.9158, 0.8933, 0.8791, 0.8752, 0.8757]. Held out, these P2 chains
+      reproduce P1_r011's verify rounds (61,214 simulated vs 61,351 measured).
   provenance: &agentic_provenance
     trace: logs/20261012_0_glm53_h200_agentic_p0/trace (tracegen coding-session --policy trace-reported --session-order
       shuffle --arrival-rate 1.0 --arrival-pattern poisson --seed 0 over s20_seed223_cap30.rounds.csv;
@@ -273,6 +287,7 @@ cases:
     evidence: logs/20261012_4_glm53_h200_gpu1/runs/A1_prod/server.log
   # Measured with the production variant; MTP acceptance does not depend on the capture size or the MoE config.
   speculative_acceptance: *agentic_acceptance
+  speculative_acceptance_per_round: *agentic_per_round
   provenance: *agentic_provenance
 - index: 22
   name: agentic_s20_seed223_cap30_pmu64
@@ -297,4 +312,5 @@ cases:
       (production plus --prefix-match-unit 64, max_model_len 262144) on 2026-10-12, equal to case 20''s'
     evidence: logs/20261012_4_glm53_h200_gpu1/runs/A2_unit64/server.log
   speculative_acceptance: *agentic_acceptance
+  speculative_acceptance_per_round: *agentic_per_round
   provenance: *agentic_provenance
