@@ -451,6 +451,11 @@ impl PrefixCache {
         let cache_used_before = self.used_tokens;
         let hit_tokens = self.peek(session_id, requested_tokens);
         let removed_entry = self.remove(session_id);
+        if self.release.at_prefill_end() {
+            if let Some(entry) = removed_entry.filter(|entry| !entry.context_pending) {
+                self.queue_untouched_remainder(entry, hit_tokens);
+            }
+        }
         let entry_tokens = removed_entry.map(|entry| entry.tokens).unwrap_or(0);
         let return_metadata = removed_entry.map(|entry| PrefixCacheReturnMetadata {
             insertion_sequence: entry.insertion_sequence,
@@ -462,6 +467,40 @@ impl PrefixCache {
             cache_used_before,
             cache_used_after: self.used_tokens,
             return_metadata,
+        }
+    }
+
+    /// What a lookup leaves behind under [`CheckpointRelease::AtPrefillEnd`]:
+    /// vLLM touches only the attention blocks wholly below the resume point
+    /// and the one state at it (`find_longest_cache_hit`, then `touch`). The
+    /// rest of the entry stays cached at its own LRU position as an orphan:
+    /// the attention block(s) above the boundary, which the EAGLE drop leaves
+    /// unmatched and the request recomputes into fresh blocks, and the states
+    /// of the other replay boundaries. The touched state is freed again,
+    /// still cached, once the request computes past it
+    /// (`MambaManager.remove_skipped_blocks`), so it re-enters at the tail. A
+    /// miss touches nothing and leaves the whole entry queued.
+    fn queue_untouched_remainder(&mut self, entry: PrefixEntry, hit_tokens: u32) {
+        let touched = self.floor_to_quantum(u64::from(hit_tokens));
+        self.queue_orphan(
+            entry.last_access_sequence,
+            entry.tokens.saturating_sub(touched),
+        );
+        let resumed_states = u64::from(hit_tokens > 0).min(entry.checkpoints);
+        self.queue_orphan(
+            entry.checkpoint_sequence,
+            (entry.checkpoints - resumed_states) * self.charge_per_checkpoint,
+        );
+        if resumed_states > 0 {
+            let sequence = self.take_sequence();
+            self.queue_orphan(sequence, self.charge_per_checkpoint);
+        }
+    }
+
+    fn queue_orphan(&mut self, sequence: u64, tokens: u64) {
+        if tokens > 0 {
+            *self.orphans.entry(sequence).or_insert(0) += tokens;
+            self.orphan_tokens += tokens;
         }
     }
 
@@ -1441,5 +1480,38 @@ mod tests {
         assert_eq!(cache.used_charge(), 64);
         cache.shrink_to(63);
         assert_eq!(cache.used_charge(), 32);
+    }
+
+    #[test]
+    fn a_hit_leaves_the_untouched_remainder_of_the_entry_queued() {
+        let mut cache = prefill_end_cache(1_000);
+        cache.insert_checkpoints(7, 40, 1_000);
+        cache.complete_context(7, 40, 1_000);
+        assert_eq!(cache.used_charge(), 32 + 10);
+        // Resume at 16: the block below is touched; the block above it stays
+        // cached in place, and the resumed state comes back at the tail.
+        let taken = cache.take(7, 39);
+        assert_eq!(taken.hit_tokens, 16);
+        assert_eq!(cache.used_charge(), 16 + 10);
+        assert_eq!(cache.peek(7, 39), 0, "the remainder serves no further hit");
+        // The remainder (older) goes before the re-freed state (newest).
+        cache.shrink_to(10);
+        assert_eq!(cache.used_charge(), 10);
+    }
+
+    #[test]
+    fn a_miss_leaves_the_whole_entry_queued() {
+        let mut cache = prefill_end_cache(1_000);
+        cache.insert_checkpoints(7, 40, 1_000);
+        cache.complete_context(7, 40, 1_000);
+        let taken = cache.take(7, 10);
+        assert_eq!(taken.hit_tokens, 0);
+        assert_eq!(cache.used_charge(), 32 + 10);
+        // Completion-time retention still hands the whole entry over.
+        let mut whole_entries = PrefixCache::new(1_000, PrefixCachePolicy::Lru, 16, 10)
+            .with_checkpoint_retention(CheckpointRetention::EagleReplayBoundaries);
+        whole_entries.insert(7, 40, 1_000, None);
+        whole_entries.take(7, 39);
+        assert_eq!(whole_entries.used_charge(), 0);
     }
 }
