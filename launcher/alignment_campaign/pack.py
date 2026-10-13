@@ -33,7 +33,9 @@ re-rendering on a different machine cannot silently reuse a stale KV budget.
 
 from __future__ import annotations
 
+import csv
 import hashlib
+import io
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -145,6 +147,23 @@ class SessionTraceSpec:
 
 
 @dataclass(frozen=True)
+class PerRoundAcceptanceSpec:
+    """Measured acceptance for individual rounds of a session trace.
+
+    `file` is a pack-relative CSV keyed by `request_id`, with an `accept_rate`
+    column holding one JSON conditional chain per row (as long as
+    `speculative_acceptance`); any other columns are ignored, so a measured
+    `trace_speculative.csv` serves as is. `sha256` pins its bytes. Rendering
+    gives a round listed in the file that chain and every other round the case
+    chain. `provenance` is free-form and kept out of rendering.
+    """
+
+    file: str
+    sha256: str
+    provenance: Any = None
+
+
+@dataclass(frozen=True)
 class TextCorpusSpec:
     """The replay text corpus a case's measured passes sample prompts from.
 
@@ -252,6 +271,9 @@ class Case:
     #: (req-frontend's session frontend) and the simulation. Exclusive with
     #: `workload_trace` and `kernel_trace`.
     session_trace: SessionTraceSpec | None = None
+    #: Per-round measured chains for a `session_trace` case, overriding the case
+    #: chain round by round (`PerRoundAcceptanceSpec`).
+    speculative_acceptance_per_round: PerRoundAcceptanceSpec | None = None
     #: Replay corpus override for the measured passes.
     text_corpus: TextCorpusSpec | None = None
 
@@ -490,6 +512,21 @@ def _session_trace_spec(raw: Any, where: str) -> SessionTraceSpec:
     return spec
 
 
+def _per_round_acceptance_spec(raw: Any, where: str) -> PerRoundAcceptanceSpec:
+    if not isinstance(raw, dict):
+        raise PackError(f"{where}: must be a mapping with 'file' and 'sha256'")
+    body = dict(raw)
+    spec = PerRoundAcceptanceSpec(
+        file=_typed(_require(body, "file", where), str, f"{where}.file"),
+        sha256=_typed(_require(body, "sha256", where), str, f"{where}.sha256"),
+        provenance=body.pop("provenance", None),
+    )
+    _reject_extra(body, where)
+    if not _is_sha256(spec.sha256):
+        raise PackError(f"{where}.sha256 must be 64 lowercase hex digits")
+    return spec
+
+
 def _text_corpus_spec(raw: Any, where: str) -> TextCorpusSpec:
     if not isinstance(raw, dict):
         raise PackError(f"{where}: must be a mapping")
@@ -595,6 +632,7 @@ def _case(raw: Any, index_hint: int) -> Case:
     acceptance_raw = body.pop("speculative_acceptance", None)
     by_position_raw = body.pop("speculative_acceptance_by_output_position", None)
     per_request_raw = body.pop("speculative_acceptance_per_request", None)
+    per_round_raw = body.pop("speculative_acceptance_per_round", None)
     rate_raw = body.pop("rate", None)
     kernel_raw = body.pop("kernel_trace", None)
     workload_raw = body.pop("workload_trace", None)
@@ -688,6 +726,13 @@ def _case(raw: Any, index_hint: int) -> Case:
             if session_raw is None
             else _session_trace_spec(session_raw, f"{where}.session_trace")
         ),
+        speculative_acceptance_per_round=(
+            None
+            if per_round_raw is None
+            else _per_round_acceptance_spec(
+                per_round_raw, f"{where}.speculative_acceptance_per_round"
+            )
+        ),
         text_corpus=(
             None if corpus_raw is None else _text_corpus_spec(corpus_raw, f"{where}.text_corpus")
         ),
@@ -735,6 +780,17 @@ def _case(raw: Any, index_hint: int) -> Case:
             raise PackError(
                 f"{where}.speculative_acceptance_per_request.value must name a JSON file "
                 "under the pack root"
+            )
+    if case.speculative_acceptance_per_round is not None:
+        if case.speculative_acceptance is None:
+            raise PackError(
+                f"{where}: speculative_acceptance_per_round refines speculative_acceptance "
+                "(the chain of every round the file does not list) and needs it"
+            )
+        if case.session_trace is None:
+            raise PackError(
+                f"{where}: speculative_acceptance_per_round is keyed by a session trace's "
+                "request_id; an independent shape trace uses speculative_acceptance_per_request"
             )
 
     # The two arrival vocabularies are separate spellings of one decision, and a
@@ -792,6 +848,57 @@ def load_per_request_chains(
         (entry["input_len"], entry["output_len"], tuple(float(x) for x in entry["chain"]))
         for entry in chains
     )
+
+
+def load_per_round_acceptance(
+    root: Path, case: Case, request_ids: Any
+) -> dict[str, tuple[float, ...]]:
+    """`request_id -> chain` from the CSV a case's
+    `speculative_acceptance_per_round` names, validated against its sha256,
+    the case chain's length, [0, 1], and `request_ids` (the session trace's):
+    a listed id the trace does not hold is an error, not a silently unused row."""
+    spec = case.speculative_acceptance_per_round
+    assert spec is not None and case.speculative_acceptance is not None
+    where = f"cases[{case.slug}].speculative_acceptance_per_round"
+    path = Path(root) / spec.file
+    if not path.is_file():
+        raise PackError(f"{where}.file: missing {spec.file}")
+    data = path.read_bytes()
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != spec.sha256:
+        raise PackError(
+            f"{where}.sha256: {spec.file} hashes to {actual}, the pack records {spec.sha256}"
+        )
+    reader = csv.DictReader(io.StringIO(data.decode("utf-8")))
+    if not {"request_id", "accept_rate"} <= set(reader.fieldnames or ()):
+        raise PackError(f"{where}.file: {spec.file} needs 'request_id' and 'accept_rate' columns")
+    depth = len(case.speculative_acceptance.value)
+    chains: dict[str, tuple[float, ...]] = {}
+    for line, row in enumerate(reader, start=2):
+        request_id = row["request_id"]
+        try:
+            chain = json.loads(row["accept_rate"] or "")
+        except json.JSONDecodeError:
+            chain = None
+        if (
+            not isinstance(chain, list)
+            or len(chain) != depth
+            or any(type(x) not in (int, float) or not 0 <= x <= 1 for x in chain)
+        ):
+            raise PackError(
+                f"{where}: {spec.file} line {line} ({request_id}) accept_rate must be a JSON "
+                f"list of {depth} probabilities in [0, 1] (the case chain's draft_tokens)"
+            )
+        if request_id in chains:
+            raise PackError(f"{where}: {spec.file} lists {request_id} twice")
+        chains[request_id] = tuple(float(x) for x in chain)
+    unknown = sorted(set(chains) - set(request_ids))
+    if unknown:
+        raise PackError(
+            f"{where}: {spec.file} lists {len(unknown)} request_id(s) the session trace does "
+            f"not hold, e.g. {unknown[0]}"
+        )
+    return chains
 
 
 #: Manifest keys under which a `tracegen` manifest may record the sha256 of the

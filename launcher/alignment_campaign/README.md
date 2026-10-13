@@ -194,7 +194,22 @@ it as `text-generation-session-execution-v2`. A speculative case gets
 `trace_speculative.csv`, the same rows plus the `speculative` tag's
 `accept_rate`, one chain per round from `speculative_acceptance` (and its
 output-position buckets); per-request measured chains are keyed by independent
-shapes and are refused. Arrival keeps the case fields' meaning: `saturated`
+shapes and are refused. A session case may instead replay measured per-round
+chains:
+
+```yaml
+speculative_acceptance_per_round:
+  file: acceptance/<name>.csv   # pack-relative; columns request_id + accept_rate (JSON chain)
+  sha256: <sha256 of the CSV>
+  provenance: ...              # free-form, not rendered
+```
+
+A round listed in the file gets its chain; any other round gets the case chain
+above. `check` requires the file, its sha256, chains as long as
+`speculative_acceptance` (which rendering ties to `draft_tokens`) with values
+in [0, 1], unique request ids, and only request ids the session trace holds.
+Unlike the output-position buckets, this conditions on a measured run, so
+it suits replaying that run's trace, not predicting another. Arrival keeps the case fields' meaning: `saturated`
 with `max_concurrency` (sessions), or `trace-timed` with `rate` as req-frontend's
 target sessions per second; the simulation's `request_rate` is `rate` divided
 by the trace's own session start rate, so both sides replay the same timeline.

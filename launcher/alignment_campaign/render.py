@@ -39,7 +39,8 @@ req-frontend's session frontend on the measured side and read with
 A speculative case adds `trace_speculative.csv`: the same rows plus the
 `accept_rate` column of the `speculative` tag, which req-frontend's session
 loader accepts and the simulator turns into each round's decoding strategy,
-one chain per round from `acceptance_chain` (its `output_len`).
+one chain per round from `acceptance_chain` (its `output_len`), except that a
+round listed in `speculative_acceptance_per_round` gets its measured chain.
 
 `rate` keeps req-frontend's meaning, a target top-level arrival rate (sessions
 per second here). req-frontend rescales the trace by `trace_rate / rate`, the
@@ -92,6 +93,7 @@ from .pack import (
     TraceSpec,
     Variant,
     load_per_request_chains,
+    load_per_round_acceptance,
     read_session_trace,
 )
 
@@ -304,18 +306,27 @@ def session_arrival_rate(text: str) -> float:
     return (len(arrivals) - 1) / span_seconds
 
 
-def session_trace_with_acceptance(case: Case, text: str) -> str:
-    """The session trace plus the `speculative` tag's `accept_rate` column,
-    one chain per round from its `output_len`. Every other field keeps the
-    file's own spelling."""
+def session_trace_with_acceptance(
+    case: Case, text: str, per_round: dict[str, tuple[float, ...]] | None = None
+) -> str:
+    """The session trace plus the `speculative` tag's `accept_rate` column:
+    a round's chain from `per_round` (keyed by request_id) when it is listed
+    there, else from its `output_len`. Every other field keeps the file's own
+    spelling."""
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\n")
     reader = csv.reader(io.StringIO(text))
     header = next(reader)
     writer.writerow([*header, "accept_rate"])
+    id_column = header.index("request_id")
     output_column = header.index("output_len")
     for row in reader:
-        chain = acceptance_chain(case, int(row[output_column]))
+        measured = (per_round or {}).get(row[id_column])
+        chain = (
+            list(measured)
+            if measured is not None
+            else acceptance_chain(case, int(row[output_column]))
+        )
         writer.writerow([*row, json.dumps(chain, separators=(",", ":"))])
     return buffer.getvalue()
 
@@ -724,7 +735,12 @@ def case_traces(pack: Pack, case: Case) -> dict[str, str]:
         _check_session_lengths(case, text)
         traces = {WORKLOAD_TRACE_NAME: text}
         if case.speculative_acceptance is not None:
-            traces[SPECULATIVE_TRACE_NAME] = session_trace_with_acceptance(case, text)
+            per_round = None
+            if case.speculative_acceptance_per_round is not None:
+                per_round = load_per_round_acceptance(
+                    pack.root, case, [row[0] for row in session_rows(text)]
+                )
+            traces[SPECULATIVE_TRACE_NAME] = session_trace_with_acceptance(case, text, per_round)
         return traces
     traces = {WORKLOAD_TRACE_NAME: trace_text(case, case.workload_trace)}
     if case.speculative_acceptance is not None:

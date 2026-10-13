@@ -49,7 +49,15 @@ from ..alignment_config import (
     load_timing_predict_config,
 )
 from ..corpus import ROUTING_FILES
-from .pack import Case, Finding, HostProfile, Pack, PackError, read_session_trace
+from .pack import (
+    Case,
+    Finding,
+    HostProfile,
+    Pack,
+    PackError,
+    load_per_round_acceptance,
+    read_session_trace,
+)
 from .render import (
     ANALYSIS_E2E_PHASE,
     ANALYSIS_KERNEL_PHASE,
@@ -62,6 +70,7 @@ from .render import (
     _check_session_lengths,
     case_documents,
     case_traces,
+    session_rows,
     trace_text,
 )
 
@@ -283,6 +292,22 @@ def _check_traces(pack: Pack) -> list[Finding]:
                 _check_session_lengths(case, text)
             except PackError as exc:
                 findings.append(Finding("error", f"cases[{case.slug}].session_trace", str(exc)))
+            else:
+                if case.speculative_acceptance_per_round is not None:
+                    # Pinned bytes, chains as long as the case chain (which
+                    # rendering ties to draft_tokens), ids the trace holds.
+                    try:
+                        load_per_round_acceptance(
+                            pack.root, case, [row[0] for row in session_rows(text)]
+                        )
+                    except PackError as exc:
+                        findings.append(
+                            Finding(
+                                "error",
+                                f"cases[{case.slug}].speculative_acceptance_per_round",
+                                str(exc),
+                            )
+                        )
         for role, spec in (("workload_trace", case.workload_trace),
                            ("kernel_trace", case.kernel_trace)):
             if spec is None:

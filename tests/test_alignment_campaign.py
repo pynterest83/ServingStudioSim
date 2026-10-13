@@ -476,6 +476,8 @@ def test_speculative_case_keeps_replay_trace_and_calibrates_simulation(pack, tmp
         original_case, chunk_size=4096,
         speculative_acceptance=dataclasses.replace(original_case.attn_gpu_memory_gb, value=rates),
         speculative_acceptance_by_output_position=None,
+        # The case chain under test, not a pack's measured per-round chains.
+        speculative_acceptance_per_round=None,
     )
     variant = dataclasses.replace(
         original_variant,
@@ -539,6 +541,7 @@ def test_acceptance_by_output_position_gives_each_request_its_own_chain(pack, tm
         speculative_acceptance_by_output_position=dataclasses.replace(
             calibrated, value=[{"from": 1, "p": early}, {"from": 8, "p": late}]
         ),
+        speculative_acceptance_per_round=None,
     )
     # Entirely inside the first bucket: that bucket's distribution as a chain.
     assert render_module.acceptance_chain(case, 8) == pytest.approx([0.5, 0.5])
@@ -1610,6 +1613,148 @@ def test_session_trace_check_applies_the_context_limit_to_prefix_plus_round(tmp_
 def test_session_trace_case_rejects_conflicting_declarations(tmp_path, overrides, message):
     root = _write_session_pack(tmp_path / "pack", case_overrides=overrides)
     with pytest.raises(PackError, match=message):
+        load_pack(root)
+
+
+def _write_per_round(root: Path, rows) -> dict:
+    """A per-round acceptance CSV under the pack root and its case declaration."""
+    (root / "acceptance").mkdir(exist_ok=True)
+    text = "request_id,output_len,accept_rate\n" + "".join(
+        f'{request_id},1,"{chain}"\n' for request_id, chain in rows
+    )
+    (root / "acceptance" / "rounds.csv").write_text(text)
+    return {
+        "file": "acceptance/rounds.csv",
+        "sha256": hashlib.sha256(text.encode()).hexdigest(),
+        "provenance": "test",
+    }
+
+
+def test_per_round_acceptance_fills_listed_rounds_and_falls_back_for_the_rest(tmp_path):
+    """A listed round replays its measured chain; an unlisted one keeps the
+    case chain from its output length, and trace.csv stays the committed bytes."""
+    root = _write_session_pack(tmp_path / "pack")
+    spec = _write_per_round(
+        root,
+        [
+            ("session_b_round_000000", "[0.5,0.4,0.3,0.2,0.1]"),
+            ("session_a_round_000001", "[1,0,0,0,0]"),
+        ],
+    )
+    campaign = yaml.safe_load((root / "campaign.yaml").read_text())
+    campaign["cases"][0]["speculative_acceptance_per_round"] = spec
+    (root / "campaign.yaml").write_text(yaml.safe_dump(campaign, sort_keys=False))
+    session_pack = load_pack(root)
+    case = session_pack.cases[0]
+    traces = case_traces(session_pack, case)
+    assert traces["trace.csv"] == (root / "session_traces" / "s.csv").read_text()
+    chains = {
+        row["request_id"]: json.loads(row["accept_rate"])
+        for row in csv.DictReader(io.StringIO(traces["trace_speculative.csv"]))
+    }
+    assert chains["session_b_round_000000"] == [0.5, 0.4, 0.3, 0.2, 0.1]
+    assert chains["session_a_round_000001"] == [1.0, 0.0, 0.0, 0.0, 0.0]
+    assert chains["session_a_round_000000"] == pytest.approx(
+        render_module.acceptance_chain(case, 40)
+    )
+    assert chains["session_c_round_000000"] == pytest.approx(
+        render_module.acceptance_chain(case, 2)
+    )
+    findings = check_module.check_pack(
+        session_pack, metric_names=metric_names(_schemas(session_pack))
+    )
+    assert not [item for item in findings if item.level == "error"], findings
+
+
+@pytest.mark.parametrize(
+    ("rows", "mutate", "message"),
+    [
+        (
+            [("session_a_round_000000", "[0.5,0.5,0.5,0.5,0.5]")],
+            lambda root: (root / "acceptance/rounds.csv").write_text("request_id,accept_rate\n"),
+            "hashes to",
+        ),
+        (
+            [("session_a_round_000000", "[0.5,0.5,0.5,0.5,0.5]")],
+            lambda root: (root / "acceptance/rounds.csv").unlink(),
+            "missing",
+        ),
+        ([("session_z_round_000000", "[0.5,0.5,0.5,0.5,0.5]")], None, "does not hold"),
+        ([("session_a_round_000000", "[0.5,0.5,0.5,0.5]")], None, "list of 5 probabilities"),
+        ([("session_a_round_000000", "[0.5,0.5,0.5,0.5,1.5]")], None, "in [0, 1]"),
+        (
+            [
+                ("session_a_round_000000", "[0.5,0.5,0.5,0.5,0.5]"),
+                ("session_a_round_000000", "[0.5,0.5,0.5,0.5,0.5]"),
+            ],
+            None,
+            "twice",
+        ),
+    ],
+)
+def test_per_round_acceptance_check_refuses_a_file_it_cannot_tie_to_the_trace(
+    tmp_path, rows, mutate, message
+):
+    root = _write_session_pack(tmp_path / "pack")
+    spec = _write_per_round(root, rows)
+    campaign = yaml.safe_load((root / "campaign.yaml").read_text())
+    campaign["cases"][0]["speculative_acceptance_per_round"] = spec
+    (root / "campaign.yaml").write_text(yaml.safe_dump(campaign, sort_keys=False))
+    if mutate is not None:
+        mutate(root)
+    findings = check_module.check_pack(load_pack(root))
+    errors = [
+        str(item)
+        for item in findings
+        if item.level == "error" and item.where.endswith("speculative_acceptance_per_round")
+    ]
+    assert any(message in error for error in errors), findings
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"speculative_acceptance_per_round": {"file": "a.csv", "sha256": "abc"}}, "64 lowercase"),
+        (
+            {
+                "speculative_acceptance_per_round": {
+                    "file": "a.csv",
+                    "sha256": "0" * 64,
+                    "status": "measured",
+                }
+            },
+            "status",
+        ),
+        ({"speculative_acceptance_per_round": "a.csv"}, "must be a mapping"),
+        (
+            {
+                "speculative_acceptance": None,
+                "speculative_acceptance_per_round": {"file": "a.csv", "sha256": "0" * 64},
+            },
+            "needs it",
+        ),
+    ],
+)
+def test_per_round_acceptance_rejects_malformed_declarations(tmp_path, overrides, message):
+    root = _write_session_pack(tmp_path / "pack")
+    campaign = yaml.safe_load((root / "campaign.yaml").read_text())
+    campaign["cases"][0].update(overrides)
+    if campaign["cases"][0]["speculative_acceptance"] is None:
+        del campaign["cases"][0]["speculative_acceptance"]
+    (root / "campaign.yaml").write_text(yaml.safe_dump(campaign, sort_keys=False))
+    with pytest.raises(PackError, match=message):
+        load_pack(root)
+
+
+def test_per_round_acceptance_belongs_to_a_session_trace_case(tmp_path):
+    root = _write_session_pack(tmp_path / "pack")
+    campaign = yaml.safe_load((root / "campaign.yaml").read_text())
+    case = campaign["cases"][0]
+    del case["session_trace"]
+    case["workload_trace"] = {"file": "traces/x.csv", "shapes": [[16, 16]]}
+    case["speculative_acceptance_per_round"] = {"file": "a.csv", "sha256": "0" * 64}
+    (root / "campaign.yaml").write_text(yaml.safe_dump(campaign, sort_keys=False))
+    with pytest.raises(PackError, match="session trace"):
         load_pack(root)
 
 
