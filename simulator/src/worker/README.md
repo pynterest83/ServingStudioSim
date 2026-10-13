@@ -419,3 +419,18 @@ an all-miss thrash (`logs/20261012_11_glm53_h200_thrash`).
 (`CheckpointRelease::AtPrefillEndRefreshedAtCompletion`): the states are freed
 at the prefill end the same way, but if still cached at completion they move to
 the completion position with the attention segment; evicted ones stay lost.
+
+`kv_offload_cpu_gb_total` (speculative selector, hybrid arch with
+`eagle_block_drop`) adds vLLM's native CPU offload (`--kv-offloading-size`,
+`SimpleCPUOffloadConnector`): `HybridGdnKv::with_host_offload` gives each
+partition a `HostKvTier` (`kv/shared/host_offload.rs`) of
+`floor(bytes / ranks / page)` pages per rank, an LRU over attention blocks and
+boundary states keyed by session. Prompts store their blocks and replay states
+when their prefill ends and finished requests their output blocks, as FIFO D2H
+copies at `kv_offload_d2h_gbps` plus `kv_offload_transfer_latency_us` that
+serve hits once done; nothing waits for them. An admission whose GPU hit the
+host beats is admitted to wait for a FIFO H2D copy at `kv_offload_h2d_gbps`
+(`ChunkedPrefillAdmission`'s loading prompts, vLLM's `WAITING_FOR_REMOTE_KVS`):
+not running, spending no budget, and scheduled ahead of fresh prompts by the
+first decision that sees the copy done, so at least one step later. Hits are
+attributed per tier in `raw/kv_offload_event/`.
