@@ -71,6 +71,10 @@ variants:
       draft_tokens: 5
       routing: corpus
       token_corpus_file: ../../../logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32/profile_corpus/token_corpus/manifest.json
+      # Profile the routed MoE at every verify-width multiple up to 144 tokens (6 x 1..24) rather than 6 x 1..8:
+      # decode at 11-17 running requests presents 66-102 rows, and the default axis's next points after 48 are 64
+      # and 128, straddling the Triton config's BLOCK_SIZE_M 16 -> 64 switch above M = 64. Campaign 2 only.
+      moe_demand_axis_max_tokens: 144
       # The capture sizes the production run logged (MTP 5 adds 6 and 12).
       cudagraph_capture_sizes: [1, 2, 4, 6, 8, 12, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120,
         128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304,
@@ -121,6 +125,7 @@ variants:
       draft_tokens: 5
       routing: corpus
       token_corpus_file: ../../../logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32/profile_corpus/token_corpus/manifest.json
+      moe_demand_axis_max_tokens: 144
       cudagraph_capture_sizes: [1, 2, 4, 6, 8, 12, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120,
         128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304,
         320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512]
@@ -170,6 +175,7 @@ variants:
       draft_tokens: 5
       routing: corpus
       token_corpus_file: ../../../logs/20261007_0_glm53_flash_h200_campaign/03_balanced_anchor_c32/profile_corpus/token_corpus/manifest.json
+      moe_demand_axis_max_tokens: 144
       # vLLM's capture sizes at --max-cudagraph-capture-size 1024 (server log of the Tock 1 trial; MTP 5 adds 6 and 12).
       cudagraph_capture_sizes: [1, 2, 4, 6, 8, 12, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120,
         128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304,
