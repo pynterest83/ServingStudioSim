@@ -58,6 +58,7 @@ from profiling.kernels import (
     mhc_pre_rms_norm,  # noqa: F401
     mhc_terminal_head,  # noqa: F401
     mla_cache_append,  # noqa: F401
+    mla_cache_gather,  # noqa: F401
     mla_rope_quantize_fp8,  # noqa: F401
     moe_align_block_size,  # noqa: F401
     moe_alltoall,  # noqa: F401
