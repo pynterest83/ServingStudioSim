@@ -19,7 +19,8 @@
 //!   single-token rows on SM90, where DeepGEMM has no `next_n = 6`),
 //!   dense-MHA prefill or sparse MQA through `FLASH_ATTN_MLA_SPARSE` (or,
 //!   with `sparse_mla_backend: flashinfer_mla_sparse_sm90`, vLLM's
-//!   `FLASHINFER_MLA_SPARSE_SM90`), BF16 latent cache;
+//!   `FLASHINFER_MLA_SPARSE_SM90`), BF16 latent cache (FP8 with
+//!   `mla_kv_cache_dtype: fp8`, below);
 //! - every TP all-reduce is FlashInfer's up to its sm90 fusion workspace and
 //!   a plain all-reduce above it (vLLM's FLASHINFER > CUSTOM > SYMM_MEM >
 //!   PYNCCL dispatch; custom and symm_mem have no L1 backend yet).
@@ -47,14 +48,22 @@
 //! state page ([`hybrid_block_size`]): 1152 tokens for the production BF16
 //! latent and FP32 recurrent state.
 //!
-//! `mla_kv_cache_dtype: fp8` and `kda_state_dtype: bf16` are capacity
-//! what-ifs: they change the latent bytes per token, the KDA state page, and
-//! through them the hybrid block, the page bytes, and every quantity the
-//! worker derives from the block (state and checkpoint charges, the prefix
-//! reuse and chunk-end quantum). Kernel costs keep the BF16-cache and
-//! FP32-state rows: the FP8 sparse-MLA attention, the FP8 latent append, and
-//! the BF16 KDA state traffic are not profiled on H200, so attention time is a
-//! conservative upper bound.
+//! `mla_kv_cache_dtype: fp8` and `kda_state_dtype: bf16` change the latent
+//! bytes per token, the KDA state page, and through them the hybrid block, the
+//! page bytes, and every quantity the worker derives from the block (state and
+//! checkpoint charges, the prefix reuse and chunk-end quantum).
+//!
+//! `mla_kv_cache_dtype: fp8` is vLLM's `--kv-cache-dtype fp8`, which on H200
+//! only `FLASHINFER_MLA_SPARSE_SM90` serves (`sparse_mla_backend:
+//! flashinfer_mla_sparse_sm90` is required). Its DSA layers are costed on the
+//! FP8 rows: the e4m3 latent append, the FP8-cache FlashInfer call
+//! (`vllm_flashinfer_sparse_sm90_fp8`) for every MQA row, and the dense
+//! path's one-byte context gather. `mla_fp8_prefill_bf16_workspace: true`
+//! adds the vLLM fork's `VLLM_FP8_KV_PREFILL_BF16_WORKSPACE=1`: prefill rows
+//! of a sparse-MQA step run on a BF16 plan over a per-layer dequantized
+//! workspace (`glm53_dsa_spec_attn_local`); it does nothing with a BF16 cache,
+//! as in vLLM. The KDA kernels keep the FP32-state rows: the BF16 KDA state
+//! traffic is not profiled on H200.
 
 use anyhow::Result;
 
@@ -99,7 +108,6 @@ use crate::worklet::{
 
 pub const ARCH_KIND: &str = "glm53_flash_vllm_fp8_kda_dsa_moe_speculative";
 const ACTIVATION_DTYPE: DType = DType::Bf16;
-const KV_CACHE_DTYPE: DType = DType::Bf16;
 /// Sparse page-table width: `round_up(index_topk + index_kpool - 1, 128)`.
 const SELECTED_K: u32 = 2176;
 /// FLASH_ATTN_MLA_SPARSE kernel block size ("Setting kv cache block size to
@@ -169,6 +177,14 @@ const TOPK_BACKENDS: &[&str] = &["vllm_auto"];
 const MQA_LOGITS_PREFILL_BACKENDS: &[&str] = &["deepgemm_fp8"];
 const TOPK_PREFILL_BACKENDS: &[&str] = &["vllm_cuda"];
 const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
+/// `gather_and_maybe_dequant_cache` of the FP8-cache prefill workspace.
+const MLA_GATHER_BACKENDS: &[&str] = &["vllm_cuda"];
+/// The H200 deployment's `max_num_batched_tokens` (chunk_size 8192): one
+/// scheduler step's new prefill tokens.
+const MAX_NUM_BATCHED_TOKENS: u32 = 8192;
+/// The vLLM fork's `_PREFILL_WS_MAX_CONTEXT`: the default prefill workspace
+/// holds one context up to this long plus a step of new tokens.
+const PREFILL_WS_MAX_CONTEXT: u32 = 262_144;
 /// vLLM's `FlashAttnPrefillBackend` FA3 varlen calls of dense-MHA prefill.
 const DENSE_PREFILL_ATTENTION_BACKENDS: &[&str] = &["vllm_fa3"];
 const MOE_ALIGN_BACKENDS: &[&str] = &["vllm_cuda"];
@@ -192,8 +208,12 @@ pub struct Glm53FlashSpecParallel {
     /// default configs unless a tuned config folder's backend is selected.
     pub moe_backend: FusedMoeBackend,
     /// MLA latent cache element type: sizes the attention page and the hybrid
-    /// block, not the kernel rows.
+    /// block, and selects the DSA layers' latent-cache kernel rows.
     pub mla_kv_cache_dtype: MlaKvCacheDtype,
+    /// The vLLM fork's `VLLM_FP8_KV_PREFILL_BF16_WORKSPACE`: with an FP8
+    /// latent, sparse-MQA prefill rows run on a BF16 plan over a dequantized
+    /// workspace. No effect with a BF16 latent.
+    pub mla_fp8_prefill_bf16_workspace: bool,
     /// KDA recurrent state element type: sizes the state page and the hybrid
     /// block, not the kernel rows.
     pub kda_state_dtype: KdaStateDtype,
@@ -217,6 +237,14 @@ impl MlaKvCacheDtype {
         match self {
             Self::Bf16 => 2,
             Self::Fp8 => 1,
+        }
+    }
+
+    /// The latent's kernel element type.
+    pub fn dtype(self) -> DType {
+        match self {
+            Self::Bf16 => DType::Bf16,
+            Self::Fp8 => DType::Fp8E4m3,
         }
     }
 }
@@ -314,6 +342,27 @@ pub fn build_configs(
             parallel.gpu_name
         )));
     }
+    let kv_cache_dtype = parallel.mla_kv_cache_dtype.dtype();
+    if parallel
+        .sparse_mla_backend
+        .l1_backend(kv_cache_dtype)
+        .is_none()
+    {
+        return Err(fit_failed(format!(
+            "sparse_mla_backend {:?} does not serve mla_kv_cache_dtype {}: vLLM's \
+             FLASH_ATTN_MLA_SPARSE takes only BF16/FP16 caches; set \
+             sparse_mla_backend: flashinfer_mla_sparse_sm90",
+            parallel.sparse_mla_backend,
+            kv_cache_dtype.as_str()
+        )));
+    }
+    // vLLM `prefill_workspace_tokens`: 0 (off) without an FP8 cache.
+    let prefill_workspace_tokens =
+        if parallel.mla_fp8_prefill_bf16_workspace && kv_cache_dtype == DType::Fp8E4m3 {
+            parallel.max_model_len.min(PREFILL_WS_MAX_CONTEXT) + MAX_NUM_BATCHED_TOKENS
+        } else {
+            0
+        };
     if model.index_topk + model.index_kpool - 1 > SELECTED_K {
         return Err(fit_failed(
             "pooled indexer window exceeds the 2176-wide page table",
@@ -388,7 +437,8 @@ pub fn build_configs(
             cache_block_size: CACHE_BLOCK_SIZE,
             rms_eps: model.rms_norm_eps,
             verify_width: parallel.draft_tokens + 1,
-            kv_cache_dtype: KV_CACHE_DTYPE,
+            kv_cache_dtype,
+            prefill_workspace_tokens,
             gpu_name: gpu.clone(),
             bf16_gemm_backends: BF16_GEMM_BACKENDS.to_vec(),
             fp32_gemm_backends: FP32_GEMM_BACKENDS.to_vec(),
@@ -400,6 +450,7 @@ pub fn build_configs(
             mqa_logits_prefill_backends: MQA_LOGITS_PREFILL_BACKENDS.to_vec(),
             topk_prefill_backends: TOPK_PREFILL_BACKENDS.to_vec(),
             mla_cache_append_backends: MLA_APPEND_BACKENDS.to_vec(),
+            mla_cache_gather_backends: MLA_GATHER_BACKENDS.to_vec(),
             sparse_mla_backend: parallel.sparse_mla_backend,
             dense_prefill_attention_backends: DENSE_PREFILL_ATTENTION_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
@@ -1686,6 +1737,15 @@ mod tests {
         configs_with_moe(FusedMoeBackend::default())
     }
 
+    fn uniform_demand() -> Glm53FlashSpecDemand {
+        let uniform = ExpertDemand::popularity(&RoutingDistribution::uniform(288), 43);
+        Glm53FlashSpecDemand {
+            body: uniform.clone(),
+            mtp_step0: uniform.clone(),
+            mtp_recurrent: uniform,
+        }
+    }
+
     fn configs_with_moe(moe_backend: FusedMoeBackend) -> Glm53FlashSpecConfigs {
         let uniform = ExpertDemand::popularity(&RoutingDistribution::uniform(288), 43);
         build_configs(
@@ -1699,6 +1759,7 @@ mod tests {
                 sparse_mla_backend: SparseMlaBackend::default(),
                 moe_backend,
                 mla_kv_cache_dtype: MlaKvCacheDtype::default(),
+                mla_fp8_prefill_bf16_workspace: false,
                 kda_state_dtype: KdaStateDtype::default(),
             },
             &Glm53FlashSpecDemand {
@@ -1827,9 +1888,12 @@ mod tests {
             (MlaKvCacheDtype::Fp8, KdaStateDtype::Fp32, 2304, 6_540),
             (MlaKvCacheDtype::Fp8, KdaStateDtype::Bf16, 1280, 6_540),
         ] {
-            let mut c = configs();
-            c.parallel.mla_kv_cache_dtype = mla;
-            c.parallel.kda_state_dtype = state;
+            let mut parallel = configs().parallel;
+            parallel.mla_kv_cache_dtype = mla;
+            parallel.kda_state_dtype = state;
+            // vLLM serves an FP8 latent only through FLASHINFER_MLA_SPARSE_SM90.
+            parallel.sparse_mla_backend = SparseMlaBackend::FlashinferMlaSparseSm90;
+            let c = build_configs(&model_cfg(), &parallel, &uniform_demand()).unwrap();
             let model = build("unified".into(), resolve_configs(&c), &bridge).unwrap();
             let total = 4 * per_gpu_token;
             assert_eq!(model.total_kv_bytes_per_token(), total);
@@ -1951,6 +2015,77 @@ mod tests {
             parse(&[("mla_kv_cache_dtype", "fp8"), ("kda_state_dtype", "bf16")]),
             (MlaKvCacheDtype::Fp8, KdaStateDtype::Bf16)
         );
+    }
+
+    /// Catches an FP8 latent priced on the BF16 rows (the pre-FP8 behavior),
+    /// the FA3 backend accepted for a cache vLLM refuses it, or the workspace
+    /// option changing a BF16 deployment. The workspace capacity is vLLM's
+    /// default `min(max_model_len, 262144) + max_num_batched_tokens`.
+    #[test]
+    fn the_latent_dtype_selects_the_dsa_rows_and_the_workspace_option_needs_fp8() {
+        let with = |mla, backend, workspace: bool, max_model_len: u32| {
+            let mut parallel = configs().parallel;
+            parallel.mla_kv_cache_dtype = mla;
+            parallel.sparse_mla_backend = backend;
+            parallel.mla_fp8_prefill_bf16_workspace = workspace;
+            parallel.max_model_len = max_model_len;
+            build_configs(&model_cfg(), &parallel, &uniform_demand())
+        };
+        let fi = SparseMlaBackend::FlashinferMlaSparseSm90;
+        let fa3 = SparseMlaBackend::FlashAttnMlaSparse;
+        let bf16 = with(MlaKvCacheDtype::Bf16, fi, false, 8192).unwrap();
+        assert_eq!(bf16.dsa.kv_cache_dtype, DType::Bf16);
+        // vLLM's env flag is a no-op on a BF16 cache.
+        let bf16_ws = with(MlaKvCacheDtype::Bf16, fi, true, 8192).unwrap();
+        assert_eq!(bf16_ws.dsa.prefill_workspace_tokens, 0);
+        let fp8 = with(MlaKvCacheDtype::Fp8, fi, false, 262_144).unwrap();
+        assert_eq!(fp8.dsa.kv_cache_dtype, DType::Fp8E4m3);
+        assert_eq!(fp8.dsa.prefill_workspace_tokens, 0);
+        let r = resolve_configs(&fp8);
+        assert_eq!(
+            r.dsa.sparse_attention.backends,
+            ["vllm_flashinfer_sparse_sm90_fp8"]
+        );
+        assert_eq!(r.dsa.mla_cache_append.kv_dtype, DType::Fp8E4m3);
+        let ws = with(MlaKvCacheDtype::Fp8, fi, true, 262_144).unwrap();
+        assert_eq!(ws.dsa.prefill_workspace_tokens, 262_144 + 8192);
+        assert_eq!(
+            with(MlaKvCacheDtype::Fp8, fi, true, 8192)
+                .unwrap()
+                .dsa
+                .prefill_workspace_tokens,
+            8192 + 8192
+        );
+        assert!(resolve_configs(&ws).dsa.prefill_workspace.is_some());
+        assert!(with(MlaKvCacheDtype::Fp8, fa3, false, 8192).is_err());
+    }
+
+    /// Existing presets omit the workspace option and keep it off.
+    #[test]
+    fn the_prefill_workspace_option_parses_and_defaults_off() {
+        use crate::arch::config::IterArchSel;
+        let parse = |extra: serde_json::Value| {
+            let mut arch = serde_json::json!({
+                "type": ARCH_KIND,
+                "model_config": "model/config/glm53_flash.json",
+                "fp8": true,
+            });
+            arch.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            match serde_json::from_value::<IterArchSel>(arch).unwrap() {
+                IterArchSel::Glm53FlashVllmFp8KdaDsaMoeSpeculative {
+                    mla_fp8_prefill_bf16_workspace,
+                    ..
+                } => mla_fp8_prefill_bf16_workspace,
+                _ => unreachable!(),
+            }
+        };
+        assert!(!parse(serde_json::json!({})));
+        assert!(parse(serde_json::json!({
+            "mla_kv_cache_dtype": "fp8",
+            "mla_fp8_prefill_bf16_workspace": true,
+        })));
     }
 
     /// The case-03 capture sizes: MTP 5 adds 6 and 12 to vLLM's default list.

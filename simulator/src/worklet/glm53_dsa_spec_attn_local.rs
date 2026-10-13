@@ -52,6 +52,22 @@
 //! The BF16 latent is appended with `concat_and_cache_mla<bf16, bf16>`; there is
 //! no query FP8 quant and no query concat (both FP8-cache artifacts on B200).
 //!
+//! With `kv_cache_dtype: Fp8E4m3` (`--kv-cache-dtype fp8`, which only
+//! `FLASHINFER_MLA_SPARSE_SM90` admits on H200) the latent is appended as e4m3
+//! (`concat_and_cache_mla<bf16, uint8>`), the sparse call is the FP8 backend
+//! `vllm_flashinfer_sparse_sm90_fp8` over `token_major_mqa_fp8_latent` rows, and
+//! the dense path's context gather reads one byte per latent element.
+//!
+//! `prefill_workspace_tokens > 0` models the vLLM fork's opt-in
+//! `VLLM_FP8_KV_PREFILL_BF16_WORKSPACE` (branch exp/fp8-prefill-ws). When a
+//! step's prefill rows take the sparse-MQA path (some prefill context exceeds
+//! `index_topk`) and the prefilling requests' contexts fit the workspace, each
+//! layer gathers and dequantizes those whole contexts into a BF16 workspace
+//! (`gather_and_maybe_dequant_cache`, L1 `mla_cache_gather`), packs and runs
+//! the decode rows on the FP8 plan, then packs and runs the prefill rows on a
+//! second, BF16 plan (`vllm_flashinfer_sparse_sm90_bf16`). Otherwise every
+//! MQA row stays on the one FP8 call.
+//!
 //! Both dense FA3 calls are priced on the `vllm_fa3` backend of
 //! `flashinfer_attn_prefill` / `flashinfer_attn_rect`, which measure ONE
 //! request. A varlen batch maps to the single request of equal work: the
@@ -94,9 +110,11 @@ use crate::timing::kernels::{
     FlashinferAttnPrefillKernelConfig, FlashinferAttnPrefillKernelInput, FlashinferAttnRectKernel,
     FlashinferAttnRectKernelConfig, FlashinferAttnRectKernelInput, GemmFp32OutputKernel,
     GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput, MlaCacheAppendKernel,
-    MlaCacheAppendKernelConfig, MlaCacheAppendKernelInput, QKvRmsNormKernel,
+    MlaCacheAppendKernelConfig, MlaCacheAppendKernelInput, MlaCacheGatherKernel,
+    MlaCacheGatherKernelConfig, MlaCacheGatherKernelInput, QKvRmsNormKernel,
     QKvRmsNormKernelConfig, QKvRmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
     SingleGemmKernelInput, ValidCountsPattern, FA3_SPARSE_BACKEND, FLASHINFER_SM90_SPARSE_BACKEND,
+    FLASHINFER_SM90_SPARSE_FP8_BACKEND,
 };
 use crate::timing::{
     AttnPrefillLog, BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge,
@@ -144,11 +162,19 @@ pub enum SparseMlaBackend {
 }
 
 impl SparseMlaBackend {
-    /// The `dsa_sparse_mla_attention` L1 backend that prices the call.
-    pub fn l1_backend(self) -> &'static str {
-        match self {
-            Self::FlashAttnMlaSparse => FA3_SPARSE_BACKEND,
-            Self::FlashinferMlaSparseSm90 => FLASHINFER_SM90_SPARSE_BACKEND,
+    /// The `dsa_sparse_mla_attention` L1 backend that prices the call over a
+    /// `kv_cache_dtype` latent cache, or `None` where vLLM's backend refuses
+    /// that cache: `FlashAttnMLASparseBackend.supports_combination` admits only
+    /// FP16/BF16 caches, while `FlashInferMLASparseSM90Backend` also takes
+    /// `fp8` / `fp8_e4m3`.
+    pub fn l1_backend(self, kv_cache_dtype: DType) -> Option<&'static str> {
+        match (self, kv_cache_dtype) {
+            (Self::FlashAttnMlaSparse, DType::Bf16) => Some(FA3_SPARSE_BACKEND),
+            (Self::FlashinferMlaSparseSm90, DType::Bf16) => Some(FLASHINFER_SM90_SPARSE_BACKEND),
+            (Self::FlashinferMlaSparseSm90, DType::Fp8E4m3) => {
+                Some(FLASHINFER_SM90_SPARSE_FP8_BACKEND)
+            }
+            _ => None,
         }
     }
 
@@ -164,6 +190,15 @@ impl SparseMlaBackend {
 /// The synthetic index pattern the pooled sparse-attention rows were measured
 /// with (as the B200 pooled decode).
 const SPARSE_INDEX_DISTRIBUTION: &str = "unique_scattered_pages";
+
+/// The profiled layout of the rope-free latent rows the sparse call reads.
+fn sparse_cache_layout(kv_cache_dtype: DType) -> &'static str {
+    match kv_cache_dtype {
+        DType::Bf16 => "token_major_mqa_bf16_latent",
+        DType::Fp8E4m3 => "token_major_mqa_fp8_latent",
+        other => panic!("the GLM-5.3-Flash H200 latent cache is bf16 or fp8_e4m3, got {other:?}"),
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Glm53DsaSpecAttnLocalWorkletConfig {
@@ -185,7 +220,12 @@ pub struct Glm53DsaSpecAttnLocalWorkletConfig {
     pub rms_eps: f64,
     /// Rows each verifying request brings to the decode indexer (`K + 1`).
     pub verify_width: u32,
+    /// Latent cache element type: BF16 (`auto`) or FP8 e4m3 (`fp8`).
     pub kv_cache_dtype: DType,
+    /// Rows of the FP8-cache prefill BF16 workspace
+    /// (`VLLM_FP8_KV_PREFILL_BF16_WORKSPACE`); 0 runs every MQA row on the one
+    /// call. Nonzero only with an FP8 cache on `FlashinferMlaSparseSm90`.
+    pub prefill_workspace_tokens: u32,
     pub gpu_name: String,
     pub bf16_gemm_backends: Vec<&'static str>,
     pub fp32_gemm_backends: Vec<&'static str>,
@@ -197,6 +237,8 @@ pub struct Glm53DsaSpecAttnLocalWorkletConfig {
     pub mqa_logits_prefill_backends: Vec<&'static str>,
     pub topk_prefill_backends: Vec<&'static str>,
     pub mla_cache_append_backends: Vec<&'static str>,
+    /// `gather_and_maybe_dequant_cache` of the prefill workspace.
+    pub mla_cache_gather_backends: Vec<&'static str>,
     pub sparse_mla_backend: SparseMlaBackend,
     /// Dense-MHA prefill FA3 calls (`flashinfer_attn_prefill` / `_rect`).
     pub dense_prefill_attention_backends: Vec<&'static str>,
@@ -240,11 +282,34 @@ pub struct Glm53DsaSpecAttnLocalWorkletResolved {
     /// FA3's query zero fill or FlashInfer's index pack (`SparseMlaBackend`).
     pub sparse_prep: ElementwiseKernelConfig,
     pub sparse_attention: DsaSparseMlaAttentionKernelConfig,
+    /// The FP8-cache prefill workspace path, when enabled.
+    pub prefill_workspace: Option<PrefillWorkspaceResolved>,
     pub v_up: BatchedGemmKernelConfig,
     pub o_proj: SingleGemmKernelConfig,
     pub glue: ElementwiseKernelConfig,
     pub indexer_glue: ElementwiseKernelConfig,
     pub prefill_glue: ElementwiseKernelConfig,
+}
+
+/// The three launches the FP8-cache prefill workspace adds per layer.
+#[derive(Clone, Debug)]
+pub struct PrefillWorkspaceResolved {
+    /// Workspace capacity in rows; a step whose prefill contexts exceed it
+    /// keeps every row on the FP8 call.
+    pub capacity_tokens: u32,
+    /// `gather_and_maybe_dequant_cache` of every prefilling request's context.
+    pub gather: MlaCacheGatherKernelConfig,
+    /// The prefill rows' own `_pack_topk_indices`.
+    pub pack: ElementwiseKernelConfig,
+    /// The prefill rows on the BF16 plan over the workspace.
+    pub attention: DsaSparseMlaAttentionKernelConfig,
+}
+
+/// The built prefill workspace leaves.
+pub struct PrefillWorkspaceOps {
+    pub gather: Op<MlaCacheGatherKernel>,
+    pub pack: Op<ElementwiseKernel>,
+    pub attention: Op<DsaSparseMlaAttentionKernel>,
 }
 
 /// One forward's DSA work on this rank.
@@ -298,6 +363,7 @@ pub struct Glm53DsaSpecAttnLocalWorklet {
     pub index_remap: Op<ElementwiseKernel>,
     pub sparse_prep: Op<ElementwiseKernel>,
     pub sparse_attention: Op<DsaSparseMlaAttentionKernel>,
+    pub prefill_workspace: Option<PrefillWorkspaceOps>,
     pub v_up: Op<BatchedGemmKernel>,
     pub o_proj: Op<SingleGemmKernel>,
     pub glue: Op<ElementwiseKernel>,
@@ -355,6 +421,59 @@ impl Glm53DsaSpecAttnLocalWorklet {
         } else {
             cfg.verify_width
         };
+        let sparse_backend = cfg
+            .sparse_mla_backend
+            .l1_backend(cfg.kv_cache_dtype)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{:?} does not take a {} latent cache",
+                    cfg.sparse_mla_backend,
+                    cfg.kv_cache_dtype.as_str()
+                )
+            });
+        let prefill_workspace = (cfg.prefill_workspace_tokens > 0).then(|| {
+            assert!(
+                cfg.kv_cache_dtype == DType::Fp8E4m3
+                    && cfg.sparse_mla_backend == SparseMlaBackend::FlashinferMlaSparseSm90,
+                "the prefill BF16 workspace is FLASHINFER_MLA_SPARSE_SM90's FP8-cache path"
+            );
+            PrefillWorkspaceResolved {
+                capacity_tokens: cfg.prefill_workspace_tokens,
+                gather: MlaCacheGatherKernelConfig {
+                    backends: cfg.mla_cache_gather_backends.clone(),
+                    gpu_name: cfg.gpu_name.clone(),
+                    kv_lora_rank: cfg.kv_lora_rank.clone(),
+                    rope_dim: Dim::param("qk_rope_head_dim", 0),
+                    block_size: cfg.cache_block_size,
+                    cache_dtype: cfg.kv_cache_dtype,
+                    output_dtype: bf16,
+                    cache_format: "plain".into(),
+                },
+                // Placeholder, as the decode rows' pack.
+                pack: ew(4 * cfg.selected_k, 4 * cfg.selected_k),
+                attention: DsaSparseMlaAttentionKernelConfig {
+                    backends: vec![FLASHINFER_SM90_SPARSE_BACKEND],
+                    gpu_name: cfg.gpu_name.clone(),
+                    num_heads: cfg.num_heads.clone(),
+                    num_kv_heads: Dim::param("num_kv_heads", 1),
+                    selected_k: cfg.selected_k,
+                    latent_dim: cfg.kv_lora_rank.clone(),
+                    rope_dim: Dim::param("qk_rope_head_dim", 0),
+                    value_dim: cfg.kv_lora_rank.clone(),
+                    softmax_scale_denominator: integer_sqrt(nope),
+                    q_dtype: bf16,
+                    cache_dtype: bf16,
+                    index_dtype: "int32".into(),
+                    output_dtype: bf16,
+                    valid_counts_pattern: ValidCountsPattern::PooledUniformFull {
+                        index_topk: cfg.index_topk,
+                        index_kpool: kpool,
+                    },
+                    index_distribution: SPARSE_INDEX_DISTRIBUTION.into(),
+                    cache_layout: sparse_cache_layout(bf16).into(),
+                },
+            }
+        });
         Glm53DsaSpecAttnLocalWorkletResolved {
             fused_qkv_a: gemm(cfg.q_lora_rank.get() + latent, cfg.hidden.clone()),
             q_kv_norm: QKvRmsNormKernelConfig {
@@ -471,9 +590,13 @@ impl Glm53DsaSpecAttnLocalWorklet {
                 kv_dtype: bf16,
                 o_dtype: bf16,
             },
-            // `gather_and_maybe_dequant_cache`: one BF16 latent row per context
-            // token, read from the paged cache and written to the workspace.
-            context_gather: ew(latent * bf16.size_bytes(), latent * bf16.size_bytes()),
+            // `gather_and_maybe_dequant_cache`: one latent row per context
+            // token, read from the paged cache (1 byte per element for FP8) and
+            // written to the BF16 workspace.
+            context_gather: ew(
+                latent * cfg.kv_cache_dtype.size_bytes(),
+                latent * bf16.size_bytes(),
+            ),
             context_kv_b_proj: gemm(heads * (nope + v_dim), cfg.kv_lora_rank.clone()),
             context_attention: FlashinferAttnRectKernelConfig {
                 backends: cfg.dense_prefill_attention_backends.clone(),
@@ -510,7 +633,7 @@ impl Glm53DsaSpecAttnLocalWorklet {
                 }
             },
             sparse_attention: DsaSparseMlaAttentionKernelConfig {
-                backends: vec![cfg.sparse_mla_backend.l1_backend()],
+                backends: vec![sparse_backend],
                 gpu_name: cfg.gpu_name.clone(),
                 num_heads: cfg.num_heads.clone(),
                 num_kv_heads: Dim::param("num_kv_heads", 1),
@@ -528,8 +651,9 @@ impl Glm53DsaSpecAttnLocalWorklet {
                     index_kpool: kpool,
                 },
                 index_distribution: SPARSE_INDEX_DISTRIBUTION.into(),
-                cache_layout: "token_major_mqa_bf16_latent".into(),
+                cache_layout: sparse_cache_layout(cfg.kv_cache_dtype).into(),
             },
+            prefill_workspace,
             v_up: bmm(
                 &cfg.mla_bmm_v_up_backends,
                 cfg.v_head_dim.clone(),
@@ -645,6 +769,26 @@ impl Glm53DsaSpecAttnLocalWorklet {
                 DsaSparseMlaAttentionKernel::build,
                 bridge,
             )?,
+            prefill_workspace: match r.prefill_workspace {
+                None => None,
+                Some(ws) => Some(PrefillWorkspaceOps {
+                    gather: atomic(
+                        n,
+                        "sparse_mla.prefill_workspace_gather",
+                        ws.gather,
+                        MlaCacheGatherKernel::build,
+                        bridge,
+                    )?,
+                    pack: ew("sparse_mla.prefill_pack_indices", ws.pack)?,
+                    attention: atomic(
+                        n,
+                        "sparse_mla.prefill_attention",
+                        ws.attention,
+                        DsaSparseMlaAttentionKernel::build,
+                        bridge,
+                    )?,
+                }),
+            },
             v_up: atomic(n, "v_up", r.v_up, BatchedGemmKernel::build, bridge)?,
             o_proj: gemm("o_proj", r.o_proj)?,
             glue: ew("glue", r.glue)?,
@@ -660,58 +804,79 @@ impl Glm53DsaSpecAttnLocalWorklet {
         CostNode::Labeled {
             label: format!(
                 "{} (Glm53DsaSpecAttnLocalWorklet) [TP rank; H={}, index heads={} replicated, \
-                 kpool top-{} x {}, verify next_n={}, {} KV]",
+                 kpool top-{} x {}, verify next_n={}, {} KV{}]",
                 self.name,
                 cfg.num_heads,
                 cfg.index_num_heads,
                 cfg.index_topk,
                 cfg.index_kpool,
                 cfg.verify_width,
-                cfg.kv_cache_dtype.as_str()
+                cfg.kv_cache_dtype.as_str(),
+                if self.prefill_workspace.is_some() {
+                    ", prefill BF16 workspace"
+                } else {
+                    ""
+                }
             ),
-            child: Box::new(CostNode::Sum(vec![
-                self.fused_qkv_a.compile(builder),
-                self.q_kv_norm.compile(builder),
-                self.q_b.compile(builder),
-                self.index_wq_b.compile(builder),
-                self.index_wk_weights.compile(builder),
-                self.index_head_weights.compile(builder),
-                self.index_k_norm.compile(builder),
-                self.index_q_fwht_quant.compile(builder),
-                self.index_weight_scale.compile(builder),
-                self.kpool_gate_score.compile(builder),
-                repeated(&self.prefill_gather, PREFILL_GATHER_LAUNCHES, builder),
-                self.kpool_decode_update.compile(builder),
-                self.kpool_prefill_write.compile(builder),
-                self.kpool_tail_seed.compile(builder),
-                self.mqa_logits_decode.compile(builder),
-                self.topk_decode.compile(builder),
-                repeated(
-                    &self.decode_causal_fill,
-                    DECODE_CAUSAL_FILL_LAUNCHES,
-                    builder,
-                ),
-                self.mqa_logits_prefill.compile(builder),
-                self.topk_prefill.compile(builder),
-                self.expand_pools.compile(builder),
-                self.mla_cache_append.compile(builder),
-                self.kv_b_proj.compile(builder),
-                self.dense_prefill_attention.compile(builder),
-                self.context_gather.compile(builder),
-                self.context_kv_b_proj.compile(builder),
-                self.context_attention.compile(builder),
-                self.merge_attn_states.compile(builder),
-                self.q_absorb.compile(builder),
-                self.index_remap.compile(builder),
-                self.sparse_prep.compile(builder),
-                self.sparse_attention.compile(builder),
-                self.v_up.compile(builder),
-                self.o_proj.compile(builder),
-                repeated(&self.glue, GLUE_LAUNCHES, builder),
-                repeated(&self.indexer_glue, INDEXER_GLUE_LAUNCHES, builder),
-                repeated(&self.prefill_glue, PREFILL_GLUE_LAUNCHES, builder),
-            ])),
+            child: Box::new(CostNode::Sum(self.compile_leaves(builder))),
         }
+    }
+
+    fn compile_leaves(&self, builder: &mut CostTreeBuilder) -> Vec<CostNode> {
+        let mut leaves = vec![
+            self.fused_qkv_a.compile(builder),
+            self.q_kv_norm.compile(builder),
+            self.q_b.compile(builder),
+            self.index_wq_b.compile(builder),
+            self.index_wk_weights.compile(builder),
+            self.index_head_weights.compile(builder),
+            self.index_k_norm.compile(builder),
+            self.index_q_fwht_quant.compile(builder),
+            self.index_weight_scale.compile(builder),
+            self.kpool_gate_score.compile(builder),
+            repeated(&self.prefill_gather, PREFILL_GATHER_LAUNCHES, builder),
+            self.kpool_decode_update.compile(builder),
+            self.kpool_prefill_write.compile(builder),
+            self.kpool_tail_seed.compile(builder),
+            self.mqa_logits_decode.compile(builder),
+            self.topk_decode.compile(builder),
+            repeated(
+                &self.decode_causal_fill,
+                DECODE_CAUSAL_FILL_LAUNCHES,
+                builder,
+            ),
+            self.mqa_logits_prefill.compile(builder),
+            self.topk_prefill.compile(builder),
+            self.expand_pools.compile(builder),
+            self.mla_cache_append.compile(builder),
+            self.kv_b_proj.compile(builder),
+            self.dense_prefill_attention.compile(builder),
+            self.context_gather.compile(builder),
+            self.context_kv_b_proj.compile(builder),
+            self.context_attention.compile(builder),
+            self.merge_attn_states.compile(builder),
+            self.q_absorb.compile(builder),
+            self.index_remap.compile(builder),
+            self.sparse_prep.compile(builder),
+            self.sparse_attention.compile(builder),
+        ];
+        // The workspace leaves exist only when the option is on, so a model
+        // without it compiles the same tree as before.
+        if let Some(ws) = &self.prefill_workspace {
+            leaves.extend([
+                ws.gather.compile(builder),
+                ws.pack.compile(builder),
+                ws.attention.compile(builder),
+            ]);
+        }
+        leaves.extend([
+            self.v_up.compile(builder),
+            self.o_proj.compile(builder),
+            repeated(&self.glue, GLUE_LAUNCHES, builder),
+            repeated(&self.indexer_glue, INDEXER_GLUE_LAUNCHES, builder),
+            repeated(&self.prefill_glue, PREFILL_GLUE_LAUNCHES, builder),
+        ]);
+        leaves
     }
 
     pub fn eval(&self, input: &Glm53DsaSpecAttnLocalWorkletInput, ev: &mut Evaluator) {
@@ -886,16 +1051,45 @@ impl Glm53DsaSpecAttnLocalWorklet {
             ev,
         );
         push_or_zero(&self.index_remap, tokens(mqa), mqa == 0, ev);
-        push_or_zero(&self.sparse_prep, tokens(mqa), mqa == 0, ev);
+        // On the workspace path the main (FP8) call covers only the decode
+        // rows; the prefill rows run on the workspace leaves below.
+        let (main_rows, main_context) = match &w.workspace {
+            Some(split) => (split.decode_rows, split.decode_cache_tokens),
+            None => (mqa, w.sparse_cache_tokens),
+        };
+        push_or_zero(&self.sparse_prep, tokens(main_rows), main_rows == 0, ev);
         push_or_zero(
             &self.sparse_attention,
             DsaSparseMlaAttentionKernelInput {
-                num_queries: mqa,
-                num_cache_tokens: w.sparse_cache_tokens,
+                num_queries: main_rows,
+                num_cache_tokens: main_context,
             },
-            mqa == 0,
+            main_rows == 0,
             ev,
         );
+        if let Some(ws) = &self.prefill_workspace {
+            let split = w.workspace.clone().unwrap_or_default();
+            let off = w.workspace.is_none();
+            push_or_zero(
+                &ws.gather,
+                MlaCacheGatherKernelInput {
+                    num_requests: split.requests,
+                    num_tokens: split.tokens,
+                },
+                off,
+                ev,
+            );
+            push_or_zero(&ws.pack, tokens(split.prefill_rows), off, ev);
+            push_or_zero(
+                &ws.attention,
+                DsaSparseMlaAttentionKernelInput {
+                    num_queries: split.prefill_rows,
+                    num_cache_tokens: split.prefill_cache_tokens,
+                },
+                off,
+                ev,
+            );
+        }
         push_or_zero(&self.v_up, BatchedGemmKernelInput { m: mqa }, mqa == 0, ev);
         push_or_zero(&self.o_proj, rows, false, ev);
         push_or_zero(&self.glue, all.clone(), false, ev);
@@ -937,6 +1131,24 @@ struct Work {
     /// The pooled-uniform context the one FA3 call over `mqa_rows` is priced
     /// at (`sparse_attention_input`); 0 without MQA rows.
     sparse_cache_tokens: u32,
+    /// How the MQA rows split when the prefill workspace takes this step's
+    /// prefill rows; `None` keeps them all on one call.
+    workspace: Option<WorkspaceSplit>,
+}
+
+/// One step on the FP8-cache prefill workspace path.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct WorkspaceSplit {
+    /// Prefilling requests and their summed contexts (`seq_lens`, this
+    /// step's tokens included): what the gather copies.
+    requests: u32,
+    tokens: u32,
+    /// Decode rows on the FP8 call and their pooled-uniform context.
+    decode_rows: u32,
+    decode_cache_tokens: u32,
+    /// Prefill rows on the BF16 call and theirs.
+    prefill_rows: u32,
+    prefill_cache_tokens: u32,
 }
 
 fn derive_work(
@@ -1023,19 +1235,41 @@ fn derive_work(
     // sees `kv_len - (width - 1 - i)` tokens; a long batch's prefill rows walk
     // their causal spans.
     let width = input.decode_width;
-    let decode_contexts = input.decode_kv_lens.iter().flat_map(|&kv_len| {
-        (0..width).map(move |row| kv_len.saturating_sub(width - 1 - row).max(1))
-    });
-    let prefill_contexts = input
-        .prefill_chunk_pairs
-        .iter()
-        .filter(|_| long_prefill)
-        .flat_map(|&(prefix, append)| prefix + 1..=prefix + append);
+    let decode_contexts = || {
+        input.decode_kv_lens.iter().flat_map(move |&kv_len| {
+            (0..width).map(move |row| kv_len.saturating_sub(width - 1 - row).max(1))
+        })
+    };
+    let prefill_contexts = || {
+        input
+            .prefill_chunk_pairs
+            .iter()
+            .filter(|_| long_prefill)
+            .flat_map(|&(prefix, append)| prefix + 1..=prefix + append)
+    };
     let sparse_cache_tokens = sparse_attention_context(
-        decode_contexts.chain(prefill_contexts),
+        decode_contexts().chain(prefill_contexts()),
         index_topk,
         index_kpool,
     );
+    // `_build_prefill_ws`: only when the prefill rows reach forward_mqa (no
+    // dense MHA) and `plan_prefill_workspace` fits their summed `seq_lens`.
+    let workspace_tokens: u64 = input
+        .prefill_chunk_pairs
+        .iter()
+        .map(|&(prefix, append)| u64::from(prefix) + u64::from(append))
+        .sum();
+    let workspace = (cfg.prefill_workspace_tokens > 0
+        && long_prefill
+        && workspace_tokens <= u64::from(cfg.prefill_workspace_tokens))
+    .then(|| WorkspaceSplit {
+        requests: input.prefill_chunk_pairs.len() as u32,
+        tokens: workspace_tokens as u32,
+        decode_rows,
+        decode_cache_tokens: sparse_attention_context(decode_contexts(), index_topk, index_kpool),
+        prefill_rows: prefill_tokens,
+        prefill_cache_tokens: sparse_attention_context(prefill_contexts(), index_topk, index_kpool),
+    });
     Ok(Work {
         total_tokens,
         prefill_tokens,
@@ -1053,6 +1287,7 @@ fn derive_work(
         short_decode_indexer,
         mqa_rows: total_tokens - dense_prefill_rows,
         sparse_cache_tokens,
+        workspace,
     })
 }
 
@@ -1133,6 +1368,7 @@ mod tests {
             rms_eps: 1e-5,
             verify_width: 6,
             kv_cache_dtype: DType::Bf16,
+            prefill_workspace_tokens: 0,
             gpu_name: "NVIDIA H200".into(),
             bf16_gemm_backends: vec!["torch_linear_vllm"],
             fp32_gemm_backends: vec!["torch_cublas"],
@@ -1144,6 +1380,7 @@ mod tests {
             mqa_logits_prefill_backends: vec!["deepgemm_fp8"],
             topk_prefill_backends: vec!["vllm_cuda"],
             mla_cache_append_backends: vec!["vllm_cuda"],
+            mla_cache_gather_backends: vec!["vllm_cuda"],
             sparse_mla_backend: SparseMlaBackend::default(),
             dense_prefill_attention_backends: vec!["vllm_fa3"],
             elementwise_backends: vec!["triton"],
@@ -1308,6 +1545,133 @@ mod tests {
         assert_eq!(
             SparseMlaBackend::default().prep_slot(),
             "sparse_mla.q_rope_zero_fill"
+        );
+    }
+
+    fn fp8_cfg(prefill_workspace_tokens: u32) -> Glm53DsaSpecAttnLocalWorkletConfig {
+        Glm53DsaSpecAttnLocalWorkletConfig {
+            kv_cache_dtype: DType::Fp8E4m3,
+            sparse_mla_backend: SparseMlaBackend::FlashinferMlaSparseSm90,
+            prefill_workspace_tokens,
+            ..cfg()
+        }
+    }
+
+    /// Catches an FP8 cache priced on BF16 rows anywhere it changes the
+    /// launch: the sparse call (backend and latent layout), the latent append,
+    /// and the dense path's context gather, which reads one byte per element.
+    /// Without the workspace option nothing else is added.
+    #[test]
+    fn an_fp8_cache_prices_the_fp8_flashinfer_call_append_and_gather() {
+        let bf16 =
+            Glm53DsaSpecAttnLocalWorklet::resolve_config(&Glm53DsaSpecAttnLocalWorkletConfig {
+                sparse_mla_backend: SparseMlaBackend::FlashinferMlaSparseSm90,
+                ..cfg()
+            });
+        let fp8 = Glm53DsaSpecAttnLocalWorklet::resolve_config(&fp8_cfg(0));
+        assert_eq!(
+            fp8.sparse_attention.backends,
+            vec!["vllm_flashinfer_sparse_sm90_fp8"]
+        );
+        assert_eq!(fp8.sparse_attention.cache_dtype, DType::Fp8E4m3);
+        assert_eq!(
+            fp8.sparse_attention.cache_layout,
+            "token_major_mqa_fp8_latent"
+        );
+        let mut same = fp8.sparse_attention.clone();
+        same.backends = bf16.sparse_attention.backends.clone();
+        same.cache_dtype = DType::Bf16;
+        same.cache_layout = bf16.sparse_attention.cache_layout.clone();
+        assert_eq!(same, bf16.sparse_attention);
+        assert_eq!(fp8.mla_cache_append.kv_dtype, DType::Fp8E4m3);
+        assert_eq!(fp8.context_gather.input_bytes_per_token.get(), 512);
+        assert_eq!(fp8.context_gather.output_bytes_per_token.get(), 1024);
+        assert_eq!(bf16.context_gather.input_bytes_per_token.get(), 1024);
+        assert!(fp8.prefill_workspace.is_none() && bf16.prefill_workspace.is_none());
+        assert_eq!(
+            SparseMlaBackend::FlashAttnMlaSparse.l1_backend(DType::Fp8E4m3),
+            None
+        );
+    }
+
+    /// Catches the workspace path pricing the wrong rows: the gather must copy
+    /// every prefilling request's whole context (this step's tokens included),
+    /// prefill rows must run on the BF16 rows at their own context and decode
+    /// rows on the FP8 call at theirs, and a step with dense-MHA prefill, no
+    /// prefill, or contexts past the capacity must keep the one FP8 call.
+    #[test]
+    fn the_prefill_workspace_splits_mqa_rows_by_cache_dtype() {
+        let ws = Glm53DsaSpecAttnLocalWorklet::resolve_config(&fp8_cfg(270_336))
+            .prefill_workspace
+            .unwrap();
+        assert_eq!(ws.capacity_tokens, 270_336);
+        assert_eq!(
+            ws.attention.backends,
+            vec!["vllm_flashinfer_sparse_sm90_bf16"]
+        );
+        assert_eq!(
+            (ws.attention.cache_dtype, ws.attention.cache_layout.as_str()),
+            (DType::Bf16, "token_major_mqa_bf16_latent")
+        );
+        assert_eq!(
+            (
+                ws.gather.cache_dtype,
+                ws.gather.output_dtype,
+                ws.gather.block_size
+            ),
+            (DType::Fp8E4m3, DType::Bf16, 64)
+        );
+        assert_eq!(ws.gather.kv_lora_rank.get() + ws.gather.rope_dim.get(), 512);
+
+        let input = |prefill_chunk_pairs: Vec<(u32, u32)>, decode_kv_lens: Vec<u32>| {
+            Glm53DsaSpecAttnLocalWorkletInput {
+                prefill_chunk_pairs,
+                decode_kv_lens,
+                decode_width: 6,
+                skip_indexer: false,
+                full_cuda_graph: false,
+            }
+        };
+        let cfg = fp8_cfg(270_336);
+        let w = derive_work(
+            &input(vec![(100_000, 4096), (3000, 1000)], vec![1006, 300]),
+            &cfg,
+        )
+        .unwrap();
+        let split = w.workspace.clone().unwrap();
+        assert_eq!((split.requests, split.tokens), (2, 108_096));
+        assert_eq!((split.decode_rows, split.prefill_rows), (12, 5096));
+        assert_eq!(w.mqa_rows, split.decode_rows + split.prefill_rows);
+        let decode_only = derive_work(&input(Vec::new(), vec![1006, 300]), &cfg).unwrap();
+        assert_eq!(split.decode_cache_tokens, decode_only.sparse_cache_tokens);
+        let prefill_only = derive_work(
+            &input(vec![(100_000, 4096), (3000, 1000)], Vec::new()),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(split.prefill_cache_tokens, prefill_only.sparse_cache_tokens);
+        assert_eq!(prefill_only.workspace.unwrap().decode_rows, 0);
+
+        // Dense-MHA prefill, pure decode, or contexts past capacity: one call.
+        assert!(derive_work(&input(vec![(0, 2048)], vec![300]), &cfg)
+            .unwrap()
+            .workspace
+            .is_none());
+        assert!(derive_work(&input(Vec::new(), vec![300]), &cfg)
+            .unwrap()
+            .workspace
+            .is_none());
+        assert!(
+            derive_work(&input(vec![(262_000, 8192), (100, 2000)], Vec::new()), &cfg)
+                .unwrap()
+                .workspace
+                .is_none()
+        );
+        assert!(
+            derive_work(&input(vec![(100_000, 4096)], Vec::new()), &fp8_cfg(0))
+                .unwrap()
+                .workspace
+                .is_none()
         );
     }
 

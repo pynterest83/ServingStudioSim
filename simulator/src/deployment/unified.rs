@@ -308,6 +308,7 @@ impl Deployment for UnifiedDeployment {
                 sparse_mla_backend,
                 moe_backend,
                 mla_kv_cache_dtype,
+                mla_fp8_prefill_bf16_workspace,
                 kda_state_dtype,
                 moe_demand_axis_max_tokens,
                 ..
@@ -326,6 +327,7 @@ impl Deployment for UnifiedDeployment {
                     *sparse_mla_backend,
                     *moe_backend,
                     *mla_kv_cache_dtype,
+                    *mla_fp8_prefill_bf16_workspace,
                     *kda_state_dtype,
                     *moe_demand_axis_max_tokens,
                     &gpu_name,

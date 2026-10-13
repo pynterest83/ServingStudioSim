@@ -654,13 +654,24 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(string, default = "vllm_triton", choices = FUSED_MOE_BACKENDS, cache_key)]
         moe_backend: FusedMoeBackend,
-        /// What-if MLA latent cache dtype. `bf16` is production; `fp8`
-        /// halves the latent bytes per token and, through vLLM's hybrid block
-        /// derivation, doubles the block (1152 -> 2304 tokens). Kernel costs
-        /// keep the BF16-cache rows.
+        /// MLA latent cache dtype (vLLM `--kv-cache-dtype`). `bf16` is
+        /// production; `fp8` halves the latent bytes per token and, through
+        /// vLLM's hybrid block derivation, doubles the block (1152 -> 2304
+        /// tokens). The DSA layers then take the FP8 rows (e4m3 append,
+        /// FP8-cache FlashInfer sparse call), which needs `sparse_mla_backend:
+        /// flashinfer_mla_sparse_sm90`.
         #[serde(default)]
         #[param(string, default = "bf16", choices = MLA_KV_CACHE_DTYPES, cache_key)]
         mla_kv_cache_dtype: MlaKvCacheDtype,
+        /// The vLLM fork's `VLLM_FP8_KV_PREFILL_BF16_WORKSPACE=1` (branch
+        /// exp/fp8-prefill-ws): with an FP8 latent, each DSA layer of a step
+        /// whose prefill rows take sparse MQA dequantizes the prefilling
+        /// requests' contexts into a BF16 workspace and runs those rows on the
+        /// BF16 FlashInfer plan; decode rows stay FP8. No effect on a BF16
+        /// latent.
+        #[serde(default)]
+        #[param(default = false, cache_key)]
+        mla_fp8_prefill_bf16_workspace: bool,
         /// What-if KDA recurrent state dtype. `fp32` is production; `bf16`
         /// halves the recurrent state page and so the hybrid block (with an
         /// FP8 latent, 2304 -> 1280 tokens). Kernel costs keep the FP32 rows.
