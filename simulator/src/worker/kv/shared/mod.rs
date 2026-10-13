@@ -16,11 +16,14 @@
 //! - [`prefix_cache`] — the evictable retained-session tier and its four
 //!   replacement policies.
 //! - [`prefix_cache_journal`] — turning cache mutations into logged events.
+//! - [`host_offload`] — a host (CPU) KV tier behind the GPU prefix cache:
+//!   vLLM's native CPU offload, with its own LRU and copy queues.
 //!
 //! The store-specific knobs each piece takes are constructor parameters, so a
 //! full-attention store passes the identity values (no fixed charge, quantum of
 //! one token) and gets exactly its pre-split behavior back.
 
+pub(crate) mod host_offload;
 pub(crate) mod prefix_cache;
 pub(crate) mod prefix_cache_journal;
 pub(crate) mod request_ledger;

@@ -213,6 +213,31 @@ pub fn prefix_cache_event_schema() -> Arc<Schema> {
     ]))
 }
 
+/// `kv_offload_event` — one row per host (CPU) KV tier operation of a worker
+/// with `kv_offload_cpu_gb_total` set: `activate` (an admitted session
+/// request's GPU / host hit split and its H2D load), `store` (a D2H copy) and
+/// `evict` (blocks the host LRU gave up). Tokens are token equivalents of one
+/// rank's pages; bytes are per rank.
+pub fn kv_offload_event_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("pool_tag", DataType::Utf8, false),
+        Field::new("worker_id", DataType::UInt16, false),
+        Field::new("partition_id", DataType::UInt16, false),
+        Field::new("sequence", DataType::UInt64, false),
+        Field::new("time_ms", DataType::Float64, false),
+        Field::new("operation", DataType::Utf8, false),
+        Field::new("request_id", DataType::UInt32, false),
+        Field::new("session_id", DataType::UInt32, false),
+        Field::new("gpu_hit_tokens", DataType::UInt64, false),
+        Field::new("host_hit_tokens", DataType::UInt64, false),
+        Field::new("tokens", DataType::UInt64, false),
+        Field::new("bytes", DataType::UInt64, false),
+        Field::new("transfer_start_ms", DataType::Float64, false),
+        Field::new("transfer_done_ms", DataType::Float64, false),
+        Field::new("host_used_tokens", DataType::UInt64, false),
+    ]))
+}
+
 /// `network_event` (§5) — one row per cross-worker pull/push (disagg only).
 pub fn network_event_schema() -> Arc<Schema> {
     let request_ids_item = Arc::new(Field::new("item", DataType::UInt32, false));
@@ -408,6 +433,7 @@ pub fn request_slo_schema() -> Arc<Schema> {
 pub const ALL_STREAMS: &[&str] = &[
     "cost_log",
     "gpu_cluster",
+    "kv_offload_event",
     "kv_snapshot",
     "network_event",
     "prefix_cache_event",

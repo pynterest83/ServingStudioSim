@@ -12,6 +12,7 @@
 //! still has a schema but no writer is wired yet.
 
 pub mod cost_logger;
+pub mod kv_offload_logger;
 pub mod kv_sampler;
 pub mod network_logger;
 pub mod parquet_writer;
@@ -22,6 +23,7 @@ pub mod schemas;
 pub mod session;
 
 pub use cost_logger::CostLogger;
+pub use kv_offload_logger::{KvOffloadEvent, KvOffloadLogger, KvOffloadOperation};
 pub use kv_sampler::{KvSampler, KvSubmit};
 pub use network_logger::NetworkLogger;
 pub use parquet_writer::StreamingParquetWriter;
@@ -35,8 +37,8 @@ pub use rows::{
 };
 pub use run_meta::write_run_meta;
 pub use schemas::{
-    cost_log_envelope_schema, cost_log_schema, gpu_cluster_schema, kv_snapshot_schema,
-    network_event_schema, prefix_cache_event_schema, request_slo_schema, request_state_schema,
-    ALL_STREAMS,
+    cost_log_envelope_schema, cost_log_schema, gpu_cluster_schema, kv_offload_event_schema,
+    kv_snapshot_schema, network_event_schema, prefix_cache_event_schema, request_slo_schema,
+    request_state_schema, ALL_STREAMS,
 };
 pub use session::LoggerSession;
