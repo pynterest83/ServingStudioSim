@@ -307,6 +307,8 @@ impl Deployment for UnifiedDeployment {
                 cudagraph_capture_sizes,
                 sparse_mla_backend,
                 moe_backend,
+                mla_kv_cache_dtype,
+                kda_state_dtype,
                 ..
             } => {
                 ensure_speculative(&g.worker, *draft_tokens)?;
@@ -322,6 +324,8 @@ impl Deployment for UnifiedDeployment {
                     *draft_tokens,
                     *sparse_mla_backend,
                     *moe_backend,
+                    *mla_kv_cache_dtype,
+                    *kda_state_dtype,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,

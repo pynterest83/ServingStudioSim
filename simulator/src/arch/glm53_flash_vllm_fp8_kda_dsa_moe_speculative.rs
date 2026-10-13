@@ -39,10 +39,22 @@
 //! ```
 //!
 //! KV accounting follows vLLM's hybrid allocator (`kv_cache_utils.py`): one
-//! page holds 1152 attention tokens of the 12 MLA layers (11 + MTP), and
-//! each request pins `kda_groups x (2 + K) + 1` pages of recurrent state
-//! (Mamba `align` mode: two state pages plus one per speculative token per
-//! KDA group, plus the kpool tail block).
+//! page holds one hybrid block of attention tokens of the 12 MLA layers
+//! (11 + MTP), and each request pins `kda_groups x (2 + K) + 1` pages of
+//! recurrent state (Mamba `align` mode: two state pages plus one per
+//! speculative token per KDA group, plus the kpool tail block). The block is
+//! the smallest multiple of 128 tokens whose MLA latent page holds one KDA
+//! state page ([`hybrid_block_size`]): 1152 tokens for the production BF16
+//! latent and FP32 recurrent state.
+//!
+//! `mla_kv_cache_dtype: fp8` and `kda_state_dtype: bf16` are capacity
+//! what-ifs: they change the latent bytes per token, the KDA state page, and
+//! through them the hybrid block, the page bytes, and every quantity the
+//! worker derives from the block (state and checkpoint charges, the prefix
+//! reuse and chunk-end quantum). Kernel costs keep the BF16-cache and
+//! FP32-state rows: the FP8 sparse-MLA attention, the FP8 latent append, and
+//! the BF16 KDA state traffic are not profiled on H200, so attention time is a
+//! conservative upper bound.
 
 use anyhow::Result;
 
@@ -93,10 +105,12 @@ const SELECTED_K: u32 = 2176;
 /// FLASH_ATTN_MLA_SPARSE kernel block size ("Setting kv cache block size to
 /// 64" in the H200 server log).
 const CACHE_BLOCK_SIZE: u32 = 64;
-/// vLLM's hybrid page for this deployment ("attention block size 1152
-/// tokens" in the H200 server log): the attention tokens one page holds, the
-/// KDA checkpoint interval, and the prefix-cache reuse quantum.
-pub const HYBRID_BLOCK_SIZE: u32 = 1152;
+/// Hybrid MLA + Mamba block alignment (`Platform._align_hybrid_block_size`):
+/// TRTLLM/FlashInfer MLA decode kernels need the block a multiple of 128.
+const MLA_HYBRID_BLOCK_ALIGNMENT: u32 = 128;
+/// The smallest DeepGEMM paged-MQA pool page (`PAGED_MQA_PAGE_SIZES`): the
+/// kpool indexer needs the block a multiple of `index_kpool` of them on SM90.
+const PAGED_MQA_MIN_POOL_PAGE: u32 = 32;
 /// Mamba `align` cache mode sizes the pool for two state pages per KDA group
 /// per request, plus one per speculative token
 /// (`MambaSpec.max_memory_usage_bytes`): the running state, the prefill
@@ -177,6 +191,55 @@ pub struct Glm53FlashSpecParallel {
     /// Which `vllm_fused_moe` rows price the Triton MoE launches: vLLM's
     /// default configs unless a tuned config folder's backend is selected.
     pub moe_backend: FusedMoeBackend,
+    /// MLA latent cache element type: sizes the attention page and the hybrid
+    /// block, not the kernel rows.
+    pub mla_kv_cache_dtype: MlaKvCacheDtype,
+    /// KDA recurrent state element type: sizes the state page and the hybrid
+    /// block, not the kernel rows.
+    pub kda_state_dtype: KdaStateDtype,
+}
+
+/// vLLM `--kv-cache-dtype` for the MLA latent. `fp8` (e4m3, one per-tensor
+/// scale) is what `FLASHINFER_MLA_SPARSE_SM90` accepts on H200; the rope-free
+/// latent then takes one byte per element. The indexer key cache is FP8
+/// either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MlaKvCacheDtype {
+    /// The production `auto` cache: the model's BF16.
+    #[default]
+    Bf16,
+    Fp8,
+}
+
+impl MlaKvCacheDtype {
+    pub fn size_bytes(self) -> u64 {
+        match self {
+            Self::Bf16 => 2,
+            Self::Fp8 => 1,
+        }
+    }
+}
+
+/// vLLM `--mamba-ssm-cache-dtype` for the KDA recurrent state (the conv state
+/// stays in the activation dtype). `bf16` halves the recurrent state; the
+/// served KDA kernels need a fork change to run on it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KdaStateDtype {
+    /// The production `auto` state: FP32.
+    #[default]
+    Fp32,
+    Bf16,
+}
+
+impl KdaStateDtype {
+    pub fn size_bytes(self) -> u64 {
+        match self {
+            Self::Fp32 => 4,
+            Self::Bf16 => 2,
+        }
+    }
 }
 
 /// The routing demand of each MoE forward kind: the body and the MTP step 0
@@ -461,15 +524,67 @@ pub fn resolve_configs(cfgs: &Glm53FlashSpecConfigs) -> Glm53FlashSpecResolved {
     }
 }
 
-/// Per-GPU bytes one cached token occupies in an attention page: the BF16
-/// MLA latent (no rope part) plus the kpool index cache (one 128-byte FP8
-/// key and a 4-byte scale per 4-token pool), over the 11 DSA layers and the
-/// MTP layer. The latent is replicated on every TP rank.
-pub fn kv_bytes_per_token_per_gpu(model: &Glm53FlashModelCfg) -> u64 {
+/// Per-GPU bytes one cached token occupies in an attention page: the MLA
+/// latent (no rope part) plus the kpool index cache (one 128-byte FP8 key and
+/// a 4-byte scale per 4-token pool), over the 11 DSA layers and the MTP
+/// layer. The latent is replicated on every TP rank.
+pub fn kv_bytes_per_token_per_gpu(model: &Glm53FlashModelCfg, mla: MlaKvCacheDtype) -> u64 {
     let mla_layers = u64::from(model.num_dsa_layers()) + 1;
-    let latent = u64::from(model.kv_lora_rank) * KV_CACHE_DTYPE.size_bytes() as u64;
     let index = u64::from(model.index_head_dim + 4) / u64::from(model.index_kpool);
-    mla_layers * (latent + index)
+    mla_layers * (mla_latent_bytes_per_token(model, mla) + index)
+}
+
+/// One MLA layer's latent bytes per token: the attention page vLLM sizes the
+/// hybrid block against (`MLAAttentionSpec(block_size=1).page_size_bytes`).
+fn mla_latent_bytes_per_token(model: &Glm53FlashModelCfg, mla: MlaKvCacheDtype) -> u64 {
+    u64::from(model.kv_lora_rank) * mla.size_bytes()
+}
+
+/// One KDA layer's state page on one rank (`MambaSpec.page_size_bytes`): the
+/// `heads/TP x head_dim x head_dim` recurrent state plus the activation-dtype
+/// conv state over q, k and v (`kda_state_shape`, which keeps
+/// `conv_kernel - 1 + draft_tokens` rows under speculation).
+pub fn kda_state_page_bytes_per_gpu(
+    model: &Glm53FlashModelCfg,
+    tp_size: u16,
+    draft_tokens: u32,
+    state: KdaStateDtype,
+) -> u64 {
+    let heads = u64::from(model.kda_num_heads / u32::from(tp_size.max(1)));
+    let head_dim = u64::from(model.kda_head_dim);
+    let recurrent = heads * head_dim * head_dim * state.size_bytes();
+    let conv_rows = u64::from(model.short_conv_kernel_size - 1 + draft_tokens);
+    let conv = 3 * heads * head_dim * conv_rows * ACTIVATION_DTYPE.size_bytes() as u64;
+    recurrent + conv
+}
+
+/// vLLM's hybrid block (`Platform._align_hybrid_block_size`, no `all`-mode
+/// chunk alignment): the fewest 128-token units whose one-layer latent page
+/// holds a KDA state page, rounded up to the kpool indexer's pool pages. The
+/// state page is then padded to the attention page, so a state page costs one
+/// attention page. This is the attention tokens one page holds, the KDA
+/// checkpoint interval, and the prefix-cache reuse quantum: 1152 for the
+/// production BF16 latent and FP32 state ("attention block size 1152 tokens"
+/// in the H200 server log).
+pub fn hybrid_block_size(
+    model: &Glm53FlashModelCfg,
+    tp_size: u16,
+    draft_tokens: u32,
+    mla: MlaKvCacheDtype,
+    state: KdaStateDtype,
+) -> u32 {
+    let mamba_page = kda_state_page_bytes_per_gpu(model, tp_size, draft_tokens, state);
+    let align = u64::from(MLA_HYBRID_BLOCK_ALIGNMENT);
+    let block = align * mamba_page.div_ceil(align * mla_latent_bytes_per_token(model, mla));
+    let indexer_align = u64::from(model.index_kpool * PAGED_MQA_MIN_POOL_PAGE);
+    let block = indexer_align * block.div_ceil(indexer_align);
+    u32::try_from(block).expect("hybrid block fits u32")
+}
+
+/// Whole hybrid pages a per-GPU pool of `pool_bytes_per_gpu` holds (vLLM's
+/// `num_blocks`, before the reserved null block).
+pub fn pool_pages(pool_bytes_per_gpu: u64, block: u32, per_gpu_token_bytes: u64) -> u64 {
+    pool_bytes_per_gpu / (u64::from(block) * per_gpu_token_bytes)
 }
 
 /// Pages of recurrent state vLLM's startup sizer reserves per request: KDA
@@ -956,6 +1071,8 @@ pub struct Glm53FlashSpecModel {
     /// Draft steps 1..K, folded: same launch graph, one row per request.
     mtp_recurrent: Option<MtpPass>,
     total_kv_bytes_per_token: u64,
+    /// [`hybrid_block_size`] for the configured cache dtypes.
+    hybrid_block_size: u32,
     recurrent_state_bytes_per_request: u64,
     recurrent_checkpoint_bytes: u64,
     cost_flat: Vec<FlatCostNode>,
@@ -1036,8 +1153,16 @@ pub fn build(
     let model_cfg = &cfg.model;
     let tp = u64::from(cfg.parallel.tp_size);
     let draft_tokens = cfg.parallel.draft_tokens;
-    let per_gpu_token = kv_bytes_per_token_per_gpu(model_cfg);
-    let page_bytes_per_gpu = u64::from(HYBRID_BLOCK_SIZE) * per_gpu_token;
+    let mla_kv_cache_dtype = cfg.parallel.mla_kv_cache_dtype;
+    let per_gpu_token = kv_bytes_per_token_per_gpu(model_cfg, mla_kv_cache_dtype);
+    let hybrid_block_size = hybrid_block_size(
+        model_cfg,
+        cfg.parallel.tp_size,
+        draft_tokens,
+        mla_kv_cache_dtype,
+        cfg.parallel.kda_state_dtype,
+    );
+    let page_bytes_per_gpu = u64::from(hybrid_block_size) * per_gpu_token;
     let total_kv_bytes_per_token = tp * per_gpu_token;
     let recurrent_state_bytes_per_request = tp
         * u64::from(resident_state_pages_per_request(model_cfg, draft_tokens))
@@ -1120,6 +1245,7 @@ pub fn build(
         },
         graph_dispatch: GraphDispatch::new(&cfg.parallel.cudagraph_capture_sizes, draft_tokens + 1),
         total_kv_bytes_per_token,
+        hybrid_block_size,
         recurrent_state_bytes_per_request,
         recurrent_checkpoint_bytes,
         cost_flat: Vec::new(),
@@ -1346,9 +1472,9 @@ impl SpeculativeUnifiedModel for Glm53FlashSpecModel {
         self.recurrent_state_bytes_per_request
     }
 
-    /// The hybrid page: KDA checkpoint interval and prefix-reuse quantum.
+    /// The hybrid block: KDA checkpoint interval and prefix-reuse quantum.
     fn recurrent_checkpoint_interval_tokens(&self) -> u32 {
-        HYBRID_BLOCK_SIZE
+        self.hybrid_block_size
     }
 
     /// The 3 pages one retained boundary keeps (one per KDA group), not the 19
@@ -1572,6 +1698,8 @@ mod tests {
                 draft_tokens: 5,
                 sparse_mla_backend: SparseMlaBackend::default(),
                 moe_backend,
+                mla_kv_cache_dtype: MlaKvCacheDtype::default(),
+                kda_state_dtype: KdaStateDtype::default(),
             },
             &Glm53FlashSpecDemand {
                 body: uniform.clone(),
@@ -1589,7 +1717,10 @@ mod tests {
     #[test]
     fn kv_and_state_pages_reproduce_the_vllm_capacity_lines() {
         let model = model_cfg();
-        assert_eq!(kv_bytes_per_token_per_gpu(&model), 12 * (1024 + 33));
+        let block = hybrid_block_size(&model, 4, 5, MlaKvCacheDtype::Bf16, KdaStateDtype::Fp32);
+        assert_eq!(block, 1152);
+        let per_gpu_token = kv_bytes_per_token_per_gpu(&model, MlaKvCacheDtype::Bf16);
+        assert_eq!(per_gpu_token, 12 * (1024 + 33));
         assert_eq!(state_pages_per_request(&model, 5), 22);
         assert_eq!(state_pages_per_request(&model, 0), 7);
         // Case 10 (saturated at 256 clients, no preemption) peaks at 3142 of
@@ -1599,19 +1730,119 @@ mod tests {
         // A retained prefix-cache boundary keeps one state block per KDA
         // group (34 KDA layers in groups of 12): 3 pages, whatever K is.
         assert_eq!(checkpoint_state_pages(&model), 3);
-        let page = u64::from(HYBRID_BLOCK_SIZE) * kv_bytes_per_token_per_gpu(&model);
+        let page = u64::from(block) * per_gpu_token;
         // The logs print the pool rounded to 0.01 GiB, so round the page count.
         let pages = |gib: f64| (gib * f64::from(1u32 << 30) / page as f64).round() as u64;
         assert_eq!(pages(42.79), 3144);
         assert_eq!(pages(37.34), 2744);
-        let concurrency = |pages: u64, max_len: u32| {
-            pages as f64 / f64::from(max_len.div_ceil(HYBRID_BLOCK_SIZE) + 22)
-        };
+        let concurrency =
+            |pages: u64, max_len: u32| pages as f64 / f64::from(max_len.div_ceil(block) + 22);
         assert_eq!((concurrency(3144, 8192) * 8192.0) as u64, 858_521);
         assert_eq!(
             (concurrency(2744, 1 << 20) * f64::from(1u32 << 20)) as u64,
             3_083_914
         );
+    }
+
+    /// The KDA state page per layer per rank at TP4 and MTP 5: 16 heads of
+    /// 128x128 recurrent state plus the BF16 conv state over 3 x 2048 channels
+    /// and 3 + 5 rows.
+    #[test]
+    fn the_kda_state_page_follows_the_vllm_mamba_spec() {
+        let model = model_cfg();
+        assert_eq!(
+            kda_state_page_bytes_per_gpu(&model, 4, 5, KdaStateDtype::Fp32),
+            1_146_880
+        );
+        assert_eq!(
+            kda_state_page_bytes_per_gpu(&model, 4, 5, KdaStateDtype::Bf16),
+            622_592
+        );
+    }
+
+    /// `128 x ceil(state page / (128 x latent bytes))`: halving the latent
+    /// doubles the block; halving the recurrent state as well brings it back
+    /// to 1280.
+    #[test]
+    fn the_hybrid_block_derives_from_the_cache_dtypes() {
+        let model = model_cfg();
+        let block = |mla, state| hybrid_block_size(&model, 4, 5, mla, state);
+        assert_eq!(block(MlaKvCacheDtype::Bf16, KdaStateDtype::Fp32), 1152);
+        assert_eq!(block(MlaKvCacheDtype::Fp8, KdaStateDtype::Fp32), 2304);
+        assert_eq!(block(MlaKvCacheDtype::Fp8, KdaStateDtype::Bf16), 1280);
+        assert_eq!(block(MlaKvCacheDtype::Bf16, KdaStateDtype::Bf16), 640);
+        // The state page always fits the padded attention page.
+        for mla in [MlaKvCacheDtype::Bf16, MlaKvCacheDtype::Fp8] {
+            for state in [KdaStateDtype::Fp32, KdaStateDtype::Bf16] {
+                assert!(
+                    u64::from(block(mla, state)) * mla_latent_bytes_per_token(&model, mla)
+                        >= kda_state_page_bytes_per_gpu(&model, 4, 5, state)
+                );
+            }
+        }
+    }
+
+    /// The 45.13 GB per-GPU pool of the agentic passes: 3088 pages (3087
+    /// past vLLM's null block) of 1152 BF16 tokens; an FP8 latent nearly
+    /// halves the per-token bytes but doubles the page, so the pool holds
+    /// 2995 pages of 2304 tokens, and 5391 of 1280 with a BF16 KDA state.
+    #[test]
+    fn the_pool_pages_follow_the_derived_block() {
+        let model = model_cfg();
+        let pool = (45.13e9_f64) as u64;
+        let pages = |mla, state| {
+            let block = hybrid_block_size(&model, 4, 5, mla, state);
+            let per_gpu_token = kv_bytes_per_token_per_gpu(&model, mla);
+            (block, per_gpu_token, pool_pages(pool, block, per_gpu_token))
+        };
+        assert_eq!(
+            pages(MlaKvCacheDtype::Bf16, KdaStateDtype::Fp32),
+            (1152, 12_684, 3088)
+        );
+        assert_eq!(
+            pages(MlaKvCacheDtype::Fp8, KdaStateDtype::Fp32),
+            (2304, 6_540, 2995)
+        );
+        assert_eq!(
+            pages(MlaKvCacheDtype::Fp8, KdaStateDtype::Bf16),
+            (1280, 6_540, 5391)
+        );
+    }
+
+    /// What the worker reads from the built model: the per-token bytes, the
+    /// checkpoint interval (prefix reuse, chunk end, EAGLE drop quantum), and
+    /// the 19 resident / 3 checkpoint state pages, which in the worker's token
+    /// space are 19 and 3 blocks whatever the dtypes.
+    #[test]
+    fn the_built_model_exposes_the_derived_block_to_the_worker() {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        for (mla, state, block, per_gpu_token) in [
+            (
+                MlaKvCacheDtype::Bf16,
+                KdaStateDtype::Fp32,
+                1152u64,
+                12_684u64,
+            ),
+            (MlaKvCacheDtype::Fp8, KdaStateDtype::Fp32, 2304, 6_540),
+            (MlaKvCacheDtype::Fp8, KdaStateDtype::Bf16, 1280, 6_540),
+        ] {
+            let mut c = configs();
+            c.parallel.mla_kv_cache_dtype = mla;
+            c.parallel.kda_state_dtype = state;
+            let model = build("unified".into(), resolve_configs(&c), &bridge).unwrap();
+            let total = 4 * per_gpu_token;
+            assert_eq!(model.total_kv_bytes_per_token(), total);
+            assert_eq!(
+                u64::from(model.recurrent_checkpoint_interval_tokens()),
+                block
+            );
+            assert_eq!(
+                model.recurrent_state_bytes_per_request(),
+                19 * block * total
+            );
+            assert_eq!(model.recurrent_checkpoint_bytes(), 3 * block * total);
+        }
     }
 
     #[test]
@@ -1689,6 +1920,36 @@ mod tests {
         assert_eq!(
             parse(&[("moe_backend", "vllm_triton_tuned_212d200c")]).l1_backend(),
             "vllm_triton_tuned_212d200c"
+        );
+    }
+
+    /// Existing presets omit the cache dtypes and keep the production BF16
+    /// latent and FP32 state.
+    #[test]
+    fn the_cache_dtypes_parse_from_a_preset_and_default_to_production() {
+        use crate::arch::config::IterArchSel;
+        let parse = |extra: &[(&str, &str)]| {
+            let mut arch = serde_json::json!({
+                "type": ARCH_KIND,
+                "model_config": "model/config/glm53_flash.json",
+                "fp8": true,
+            });
+            for (key, value) in extra {
+                arch[*key] = serde_json::Value::from(*value);
+            }
+            match serde_json::from_value::<IterArchSel>(arch).unwrap() {
+                IterArchSel::Glm53FlashVllmFp8KdaDsaMoeSpeculative {
+                    mla_kv_cache_dtype,
+                    kda_state_dtype,
+                    ..
+                } => (mla_kv_cache_dtype, kda_state_dtype),
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(parse(&[]), (MlaKvCacheDtype::Bf16, KdaStateDtype::Fp32));
+        assert_eq!(
+            parse(&[("mla_kv_cache_dtype", "fp8"), ("kda_state_dtype", "bf16")]),
+            (MlaKvCacheDtype::Fp8, KdaStateDtype::Bf16)
         );
     }
 

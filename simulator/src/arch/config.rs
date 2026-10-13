@@ -31,6 +31,9 @@ use serde::Deserialize;
 use schema_derive::{ParamStruct, ProviderSchema};
 
 use super::glm52_model_cfg::Glm52MtpMode;
+pub use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe_speculative::{
+    KdaStateDtype, MlaKvCacheDtype,
+};
 pub use crate::worklet::{FusedMoeBackend, SparseMlaBackend};
 
 /// Model identity + layer controls. Flattened into every arch tag (§4), so it
@@ -104,6 +107,14 @@ const SPARSE_MLA_BACKENDS: [&str; 2] = ["flash_attn_mla_sparse", "flashinfer_mla
 /// `vllm_fused_moe` row sets of the H200 GLM-5.3-Flash speculative selector.
 /// This mirrors [`FusedMoeBackend`]'s serde representation.
 const FUSED_MOE_BACKENDS: [&str; 2] = ["vllm_triton", "vllm_triton_tuned_212d200c"];
+
+/// MLA latent cache dtypes of the H200 GLM-5.3-Flash speculative selector.
+/// This mirrors [`MlaKvCacheDtype`]'s serde representation.
+const MLA_KV_CACHE_DTYPES: [&str; 2] = ["bf16", "fp8"];
+
+/// KDA recurrent state dtypes of the H200 GLM-5.3-Flash speculative selector.
+/// This mirrors [`KdaStateDtype`]'s serde representation.
+const KDA_STATE_DTYPES: [&str; 2] = ["fp32", "bf16"];
 
 const fn default_glm52_parallel_size() -> u16 {
     8
@@ -643,6 +654,19 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(string, default = "vllm_triton", choices = FUSED_MOE_BACKENDS, cache_key)]
         moe_backend: FusedMoeBackend,
+        /// What-if MLA latent cache dtype. `bf16` is production; `fp8`
+        /// halves the latent bytes per token and, through vLLM's hybrid block
+        /// derivation, doubles the block (1152 -> 2304 tokens). Kernel costs
+        /// keep the BF16-cache rows.
+        #[serde(default)]
+        #[param(string, default = "bf16", choices = MLA_KV_CACHE_DTYPES, cache_key)]
+        mla_kv_cache_dtype: MlaKvCacheDtype,
+        /// What-if KDA recurrent state dtype. `fp32` is production; `bf16`
+        /// halves the recurrent state page and so the hybrid block (with an
+        /// FP8 latent, 2304 -> 1280 tokens). Kernel costs keep the FP32 rows.
+        #[serde(default)]
+        #[param(string, default = "fp32", choices = KDA_STATE_DTYPES, cache_key)]
+        kda_state_dtype: KdaStateDtype,
     },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by

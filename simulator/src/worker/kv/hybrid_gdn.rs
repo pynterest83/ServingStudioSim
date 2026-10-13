@@ -1601,12 +1601,18 @@ mod tests {
     const GLM_CHECKPOINT_TOKENS: u64 = 3 * GLM_BLOCK as u64;
 
     fn glm_store(eagle: bool) -> HybridGdnKv {
+        glm_store_with_block(GLM_BLOCK, eagle)
+    }
+
+    /// The GLM store at another hybrid block: the state charges stay 19 and 3
+    /// blocks, as the arch derives them for any cache dtype.
+    fn glm_store_with_block(block: u32, eagle: bool) -> HybridGdnKv {
         let kv_store = HybridGdnKv::new(
             1,
             10_000_000,
-            GLM_STATE_TOKENS,
-            GLM_BLOCK,
-            GLM_CHECKPOINT_TOKENS,
+            19 * u64::from(block),
+            block,
+            3 * u64::from(block),
             uncapped(10_000_000),
             None,
             None,
@@ -1672,6 +1678,25 @@ mod tests {
         run_round(&mut kv_store, 0, 20_000, 0, 500);
         let next = kv_store.preview_prefill_context(0, 376, session(20_500));
         assert_eq!(next.resident_prefix_tokens(), 17 * 1_152);
+    }
+
+    /// An FP8 MLA latent doubles the hybrid block to 2304 tokens: the same
+    /// 20,000-token prompt retains 8 blocks instead of 17, and the next turn
+    /// resumes one block lower, at 7 x 2304, recomputing 4748 tokens instead
+    /// of 2444.
+    #[test]
+    fn eagle_replay_quantizes_to_the_fp8_hybrid_block() {
+        const FP8_BLOCK: u32 = 2_304;
+        let mut kv_store = glm_store_with_block(FP8_BLOCK, true);
+        run_round(&mut kv_store, 0, 20_000, 0, 500);
+        assert_eq!(kv_store.prefix_caches[0].used_tokens(), 8 * 2_304);
+        assert_eq!(
+            kv_store.prefix_caches[0].used_charge(),
+            8 * 2_304 + 3 * 2_304
+        );
+        let next = kv_store.preview_prefill_context(0, 376, session(20_500));
+        assert_eq!(next.resident_prefix_tokens(), 7 * 2_304);
+        assert_eq!(next.prefill_tokens_to_compute(), 20_876 - 7 * 2_304);
     }
 
     #[test]
