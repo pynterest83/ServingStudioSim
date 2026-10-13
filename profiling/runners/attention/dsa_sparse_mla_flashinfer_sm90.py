@@ -25,6 +25,16 @@ Parity contract. The runner drives the production objects, not a rewrite:
   and the shared index remap are separate launches outside this kind, as the
   FA3 backend's query zero fill is.
 
+FP8 cache (``--kv-cache-dtype fp8``, backend
+``vllm_flashinfer_sparse_sm90_fp8``). The builder plans ``float8_e4m3fn``
+(``_planned_kv_data_type``), ``forward_mqa`` views the uint8 cache as
+``float8_e4m3fn`` and passes ``ckv_scale=layer._k_scale_float or 1.0`` and
+``kpe_scale=1.0``; GLM-5.3-Flash's checkpoint carries no KV scales, so both are
+1.0. FlashInfer instantiates the same Hopper kernel with an e4m3 ``DTypeKV``
+(``USE_KV_REPACK``, ``mla_hopper.cuh``): KV tiles land in shared memory as FP8
+and are dequantized to BF16 there, so the math is the BF16 kernel's on the
+dequantized cache, which the reference reads.
+
 GLM-5.3-Flash's pooled indexer fixes the row law the plan reproduces: a row at
 context ``n`` keeps ``min(n, index_topk + n mod index_kpool)`` slots. The kind's
 ``valid_counts`` give the counts; each row becomes a one-query request at a
@@ -60,6 +70,16 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "dsa_sparse_mla_attention:vllm_flashinfer_sparse_sm90_bf16"
+_FP8_BACKEND = "dsa_sparse_mla_attention:vllm_flashinfer_sparse_sm90_fp8"
+# Messages shared by both cache dtypes name the vLLM backend.
+_LABEL = "FLASHINFER_MLA_SPARSE_SM90"
+# The same rope-free 512-wide latent rows, one byte per element: vLLM's FP8
+# cache is a contiguous [num_blocks, block_size, 512] uint8 tensor viewed as
+# float8_e4m3fn, with one per-tensor scale.
+_FP8_CACHE_LAYOUT = "token_major_mqa_fp8_latent"
+# forward_mqa's FP8 scales: `layer._k_scale_float or 1.0` and a fixed kpe
+# scale. GLM-5.3-Flash ships no KV scales, so k_scale stays at its 1.0 default.
+_FP8_SCALE_KWARGS = {"ckv_scale": 1.0, "kpe_scale": 1.0}
 _PRODUCTION_MODULE = "vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm90"
 # The one launch of `BatchMLAPagedAttentionWrapper.run` on the SM90 FA3 path
 # (flashinfer/data/csrc/batch_mla_sm90_run.cu); the H200 case-10 capture shows
@@ -80,12 +100,42 @@ _MAX_PLAN_WORKS = 16384
 
 
 @dataclass(frozen=True)
+class _CacheVariant:
+    """What the cache dtype changes about the planned call."""
+
+    backend: str  # error-message label
+    cache_dtype: DType
+    cache_layout: str
+    cache_bytes: int  # bytes per cached element in the logical traffic
+    fp8: bool  # e4m3 cache: planned as float8_e4m3fn, run with ckv/kpe scales
+
+
+_BF16_VARIANT = _CacheVariant(
+    backend=_BACKEND,
+    cache_dtype=DType.BF16,
+    cache_layout=_FA3_CACHE_LAYOUT,
+    cache_bytes=2,
+    fp8=False,
+)
+_FP8_VARIANT = _CacheVariant(
+    backend=_FP8_BACKEND,
+    cache_dtype=DType.FP8_E4M3,
+    cache_layout=_FP8_CACHE_LAYOUT,
+    cache_bytes=1,
+    fp8=True,
+)
+
+
+@dataclass(frozen=True)
 class _Sm90Operands:
     q: Any  # [Q, H, 512] q_nope (contiguous token-major, as mla_attention writes it)
     q_pe: Any  # [Q, H, 0] the rope-free model's zero-width rope query
-    cache: Any  # [N, 1, 512] latent rows (the flattened paged cache)
+    cache: Any  # [N, 1, 512] latent rows (the flattened paged cache), BF16 or e4m3
     selected_indices: Any  # [Q, 1, K] global rows, -1 after each valid prefix
     contexts: tuple[int, ...]  # per-row context with the row's valid count
+    # The BF16 values the kernel computes on: the cache itself for BF16, its
+    # exact e4m3 -> BF16 dequantization (scale 1.0) for FP8.
+    reference_cache: Any
 
 
 def _max_valid(selected_k: int) -> int:
@@ -107,7 +157,7 @@ def _row_contexts(valid_counts: Sequence[int], *, selected_k: int) -> tuple[int,
     for count in valid_counts:
         if count > limit:
             raise ProfilerNotImplemented(
-                f"{_BACKEND} rows keep at most min(index_topk + index_kpool - 1, "
+                f"{_LABEL} rows keep at most min(index_topk + index_kpool - 1, "
                 f"selected_k) = {limit} slots, got {count}"
             )
         contexts.append(count if count <= _INDEX_TOPK else count + _INDEX_KPOOL)
@@ -133,11 +183,11 @@ def _load_sm90_state_cls() -> Any:
         module = importlib.import_module(_PRODUCTION_MODULE)
     except (ImportError, ModuleNotFoundError) as exc:
         raise ProfilerNotImplemented(
-            f"{_BACKEND} requires vllm_env with {_PRODUCTION_MODULE}"
+            f"{_LABEL} requires vllm_env with {_PRODUCTION_MODULE}"
         ) from exc
     state_cls = getattr(module, "_SM90State", None)
     if state_cls is None:
-        raise ProfilerNotImplemented(f"{_BACKEND} requires {_PRODUCTION_MODULE}._SM90State")
+        raise ProfilerNotImplemented(f"{_LABEL} requires {_PRODUCTION_MODULE}._SM90State")
     return state_cls
 
 
@@ -148,6 +198,7 @@ def _build_sm90_operands(
     num_heads: int,
     selected_k: int,
     device: Any,
+    fp8: bool = False,
 ) -> _Sm90Operands:
     contexts = _row_contexts(validated.valid_counts, selected_k=selected_k)
     base = _build_operands(
@@ -159,12 +210,20 @@ def _build_sm90_operands(
         score_dim=_LATENT_DIM,
     )
     q_pe = torch.empty((validated.num_queries, num_heads, 0), dtype=torch.bfloat16, device=device)
+    cache = reference_cache = base.cache
+    if fp8:
+        # concat_and_cache_mla's fp8 path stores `scaled_convert(x, 1.0)`: the
+        # round-to-nearest e4m3 of each BF16 latent element. The BF16 staging
+        # copy is dropped once both views exist.
+        cache = base.cache.to(torch.float8_e4m3fn)
+        reference_cache = cache.to(torch.bfloat16)
     return _Sm90Operands(
         q=base.q,
         q_pe=q_pe,
-        cache=base.cache,
+        cache=cache,
         selected_indices=base.selected_indices,
         contexts=contexts,
+        reference_cache=reference_cache,
     )
 
 
@@ -177,12 +236,18 @@ def _make_state(
     selected_k: int,
     softmax_scale: float,
     device: Any,
+    fp8: bool = False,
 ) -> Any:
-    """`FlashInferMLASparseSM90Builder.__init__`'s `_SM90State` for this model."""
+    """`FlashInferMLASparseSM90Builder.__init__`'s `_SM90State` for this model.
+
+    The KV dtype is `_planned_kv_data_type`'s: ``float8_e4m3fn`` for an FP8
+    cache (the spec's uint8 storage dtype would fail FlashInfer's plan), else
+    the BF16 spec dtype.
+    """
     return state_cls(
         device,
         num_heads,
-        torch.bfloat16,
+        torch.float8_e4m3fn if fp8 else torch.bfloat16,
         # Production never plans past max_num_batched_tokens; a larger synthetic
         # batch sizes the buffers to itself.
         max(_MAX_NUM_BATCHED_TOKENS, num_queries),
@@ -215,12 +280,14 @@ def _plan_and_pack(torch: Any, state: Any, operands: _Sm90Operands, *, selected_
     state.pack_indices(operands.selected_indices[:, 0, :].contiguous())
 
 
-def _launch(state: Any, operands: _Sm90Operands) -> Any:
-    """`forward_mqa`'s run call for a BF16 cache (no ckv/kpe scales)."""
+def _launch(state: Any, operands: _Sm90Operands, *, fp8: bool = False) -> Any:
+    """`forward_mqa`'s run call: no scales for a BF16 cache, ckv/kpe scales of
+    1.0 for an e4m3 one."""
     flat = operands.cache.reshape(-1, 1, _LATENT_DIM)
     ckv = flat[..., :_LATENT_DIM]
     kpe = flat[..., _LATENT_DIM:]
-    return state.wrapper.run(operands.q, operands.q_pe, ckv, kpe)
+    scale_kwargs = _FP8_SCALE_KWARGS if fp8 else {}
+    return state.wrapper.run(operands.q, operands.q_pe, ckv, kpe, **scale_kwargs)
 
 
 def _check_correctness(
@@ -229,8 +296,14 @@ def _check_correctness(
     operands: _Sm90Operands,
     *,
     softmax_scale: float,
+    fp8: bool = False,
 ) -> None:
-    """Validate the planned production call against the Torch reference."""
+    """Validate the planned production call against the Torch reference.
+
+    The reference reads ``reference_cache``: for an e4m3 cache its exact BF16
+    dequantization, which is what the kernel's shared-memory repack produces at
+    scale 1.0, so the BF16 tolerances apply unchanged.
+    """
     from profiling.runners.attention.dsa_sparse_mla_attention_reference import (
         dsa_sparse_mla_attention_reference,
     )
@@ -243,14 +316,14 @@ def _check_correctness(
     snapshots = tuple(tensor.clone() for _, tensor in inputs)
 
     def invoke() -> Any:
-        returned = _launch(state, operands)
+        returned = _launch(state, operands, fp8=fp8)
         torch.cuda.synchronize()
         return returned
 
     output = invoke()
     expected = dsa_sparse_mla_attention_reference(
         operands.q,
-        operands.cache,
+        operands.reference_cache,
         operands.selected_indices,
         softmax_scale=softmax_scale,
     )
@@ -289,7 +362,8 @@ def _check_correctness(
         raise AssertionError("FlashInfer SM90 sparse output aliases an input")
 
 
-def profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_bf16(
+def _profile(
+    variant: _CacheVariant,
     *,
     num_queries: int,
     num_cache_tokens: int,
@@ -309,6 +383,7 @@ def profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_bf16(
     cache_layout: str,
 ) -> ComputeMetrics:
     """Profile `BatchMLAPagedAttentionWrapper.run` as FLASHINFER_MLA_SPARSE_SM90 plans it."""
+    backend = variant.backend
     validated = _validate_args(
         num_queries=num_queries,
         num_cache_tokens=num_cache_tokens,
@@ -326,10 +401,11 @@ def profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_bf16(
         valid_counts=valid_counts,
         index_distribution=index_distribution,
         cache_layout=cache_layout,
-        # The same rope-free BF16 latent rows FA3 reads (kv_lora_rank 512,
-        # qk_rope_head_dim 0). num_heads is the per-rank q-head count; the
-        # planner packs any head count into its 64-row query tiles.
-        expected_cache_layout=_FA3_CACHE_LAYOUT,
+        # The same rope-free latent rows FA3 reads (kv_lora_rank 512,
+        # qk_rope_head_dim 0), BF16 or e4m3. num_heads is the per-rank q-head
+        # count; the planner packs any head count into its 64-row query tiles.
+        expected_cache_dtype=variant.cache_dtype,
+        expected_cache_layout=variant.cache_layout,
         expected_rope_dim=0,
     )
     # Reject counts the pooled indexer cannot produce, and calls the planner's
@@ -337,20 +413,21 @@ def profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_bf16(
     _row_contexts(validated.valid_counts, selected_k=selected_k)
     if num_queries > _MAX_PLAN_WORKS:
         raise ProfilerNotImplemented(
-            f"{_BACKEND} plans at most {_MAX_PLAN_WORKS} work items (one per row at "
+            f"{backend} plans at most {_MAX_PLAN_WORKS} work items (one per row at "
             f"least), got {num_queries} rows"
         )
 
     try:
         import torch
     except ImportError as exc:  # pragma: no cover - environment dependent
-        raise ProfilerNotImplemented(f"{_BACKEND} requires PyTorch in vllm_env") from exc
+        raise ProfilerNotImplemented(f"{backend} requires PyTorch in vllm_env") from exc
 
+    fp8 = variant.fp8
     try:
         state_cls = _load_sm90_state_cls()
         device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_sm90_operands(
-            torch, validated, num_heads=num_heads, selected_k=selected_k, device=device
+            torch, validated, num_heads=num_heads, selected_k=selected_k, device=device, fp8=fp8
         )
         state = _make_state(
             torch,
@@ -360,21 +437,22 @@ def profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_bf16(
             selected_k=selected_k,
             softmax_scale=float(softmax_scale),
             device=device,
+            fp8=fp8,
         )
         _plan_and_pack(torch, state, operands, selected_k=selected_k)
-        _check_correctness(torch, state, operands, softmax_scale=float(softmax_scale))
+        _check_correctness(torch, state, operands, softmax_scale=float(softmax_scale), fp8=fp8)
 
         def kernel() -> Any:
-            return _launch(state, operands)
+            return _launch(state, operands, fp8=fp8)
 
         time_ms = Timer.cupti(kernel, kernel_name=_KERNEL_NAME)
         energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
     except (KernelLaunchFailed, ProfilerNotImplemented):
         raise
     except torch.OutOfMemoryError as exc:
-        raise OOMError(f"{_BACKEND} ran out of GPU memory") from exc
+        raise OOMError(f"{backend} ran out of GPU memory") from exc
     except Exception as exc:
-        raise KernelLaunchFailed(f"{_BACKEND} native callable failed") from exc
+        raise KernelLaunchFailed(f"{backend} native callable failed") from exc
 
     flops = _logical_flops(
         num_queries=num_queries,
@@ -387,11 +465,12 @@ def profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_bf16(
         num_heads=num_heads,
         selected_k=selected_k,
         valid_counts=validated.valid_counts,
+        cache_bytes=variant.cache_bytes,
         score_dim=_LATENT_DIM,
     )
     seconds = time_ms / 1000.0
     if not math.isfinite(seconds) or seconds <= 0.0:
-        raise KernelLaunchFailed(f"{_BACKEND} measured a non-positive time {time_ms} ms")
+        raise KernelLaunchFailed(f"{backend} measured a non-positive time {time_ms} ms")
     return ComputeMetrics(
         time_ms=float(time_ms),
         energy_j=float(energy_j),
@@ -400,4 +479,21 @@ def profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_bf16(
     )
 
 
-__all__ = ["profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_bf16"]
+def profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_bf16(
+    **kwargs: Any,
+) -> ComputeMetrics:
+    """The planned FlashInfer SM90 call over a BF16 latent cache."""
+    return _profile(_BF16_VARIANT, **kwargs)
+
+
+def profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_fp8(
+    **kwargs: Any,
+) -> ComputeMetrics:
+    """The same call over an e4m3 latent cache (`--kv-cache-dtype fp8`)."""
+    return _profile(_FP8_VARIANT, **kwargs)
+
+
+__all__ = [
+    "profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_bf16",
+    "profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_fp8",
+]

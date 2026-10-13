@@ -41,6 +41,12 @@
 //! 133, 121.5 us at 264, 176.8 us at 265). The grid therefore samples Q at full
 //! waves above 132 and `cache_coords` rounds a query up to its wave, so the
 //! linear cache interpolates in waves and never across a step.
+//!
+//! With `--kv-cache-dtype fp8` the same backend runs over e4m3 latent rows
+//! (`vllm_flashinfer_sparse_sm90_fp8`, layout `token_major_mqa_fp8_latent`):
+//! FlashInfer's Hopper kernel loads the FP8 tiles and repacks them to BF16 in
+//! shared memory, measured 2.8-3.3x the BF16 cache's time per call on H200.
+//! It shares the BF16 backend's planner, grid and wave projection.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};
@@ -110,6 +116,19 @@ const FA3_POOLED_CACHE_AXIS: [u32; 18] = [
 
 /// The H200 FlashInfer backend (vLLM `FLASHINFER_MLA_SPARSE_SM90`).
 pub const FLASHINFER_SM90_SPARSE_BACKEND: &str = "vllm_flashinfer_sparse_sm90_bf16";
+/// The same FlashInfer call over an FP8 (e4m3) latent cache.
+pub const FLASHINFER_SM90_SPARSE_FP8_BACKEND: &str = "vllm_flashinfer_sparse_sm90_fp8";
+
+/// Whether `backend` is one of the FlashInfer SM90 backends, which share the
+/// planner's wave-aligned grid and query projection.
+fn is_flashinfer_sm90(backend: &str) -> bool {
+    backend == FLASHINFER_SM90_SPARSE_BACKEND || backend == FLASHINFER_SM90_SPARSE_FP8_BACKEND
+}
+
+/// The config prices exactly one FlashInfer SM90 backend.
+fn single_flashinfer_sm90(config: &DsaSparseMlaAttentionKernelConfig) -> bool {
+    matches!(config.backends.as_slice(), [backend] if is_flashinfer_sm90(backend))
+}
 /// FlashInfer SM90 pooled query axis: dense below one wave, where the planner
 /// splits rows into rounded key chunks and the time is not monotone in Q
 /// (128 rows take longer than 132 at 2051 keys), then whole waves of 132 rows
@@ -261,7 +280,7 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
         if config.backends.contains(&FA3_SPARSE_BACKEND) {
             return fa3_sweep_grid(config);
         }
-        if config.backends.contains(&FLASHINFER_SM90_SPARSE_BACKEND) {
+        if config.backends.iter().any(|b| is_flashinfer_sm90(b)) {
             return flashinfer_sm90_sweep_grid(config);
         }
         let (query_axis, cache_axis): (Vec<u32>, Vec<u32>) = match config.valid_counts_pattern {
@@ -300,7 +319,7 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
     }
 
     fn cache_coords(config: &Self::Config, input: &Self::Input) -> Coords {
-        if config.backends == [FLASHINFER_SM90_SPARSE_BACKEND] {
+        if single_flashinfer_sm90(config) {
             let clusters = flashinfer_sm90_clusters(&config.gpu_name)
                 .expect("validate_config admits only GPUs with a known SM count");
             return Coords::new([
@@ -312,10 +331,10 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
     }
 
     fn validate_config(config: &Self::Config) -> anyhow::Result<()> {
-        if config.backends.contains(&FLASHINFER_SM90_SPARSE_BACKEND) {
+        if let Some(backend) = config.backends.iter().find(|b| is_flashinfer_sm90(b)) {
             anyhow::ensure!(
                 flashinfer_sm90_clusters(&config.gpu_name).is_some(),
-                "{FLASHINFER_SM90_SPARSE_BACKEND} rounds queries to the planner's waves, \
+                "{backend} rounds queries to the planner's waves, \
                  whose SM count is known only for NVIDIA H200, got {}",
                 config.gpu_name
             );
@@ -616,14 +635,14 @@ fn fa3_sweep_grid(config: &DsaSparseMlaAttentionKernelConfig) -> SweepGrid {
 /// alone, and only the pooled pattern its H200 worklet uses.
 fn flashinfer_sm90_sweep_grid(config: &DsaSparseMlaAttentionKernelConfig) -> SweepGrid {
     assert!(
-        config.backends == [FLASHINFER_SM90_SPARSE_BACKEND],
-        "{FLASHINFER_SM90_SPARSE_BACKEND} has its own grid and cannot share a config with {:?}",
+        single_flashinfer_sm90(config),
+        "the FlashInfer SM90 backends have their own grid and price one config each, got {:?}",
         config.backends
     );
     let ValidCountsPattern::PooledUniformFull { .. } = config.valid_counts_pattern else {
         panic!(
-            "{FLASHINFER_SM90_SPARSE_BACKEND} sweeps only PooledUniformFull, got {:?}",
-            config.valid_counts_pattern
+            "{:?} sweeps only PooledUniformFull, got {:?}",
+            config.backends, config.valid_counts_pattern
         );
     };
     // No `index_topk` point: 2048 keys are whole tiles, faster than the
@@ -666,8 +685,8 @@ mod tests {
         canonical_valid_counts, speculative_cache_axis, speculative_query_axis,
         DsaSparseMlaAttentionKernelConfig, DsaSparseMlaAttentionKernelInput,
         DsaSparseMlaAttentionSpec, CAUSAL_CACHE_AXIS, CAUSAL_QUERY_AXIS, FA3_COMBINE_MAX_QUERIES,
-        FA3_SPARSE_BACKEND, FLASHINFER_SM90_SPARSE_BACKEND, SPECULATIVE_CACHE_AXIS,
-        SPECULATIVE_QUERY_AXIS, UNIFORM_CACHE_AXIS, UNIFORM_QUERY_AXIS,
+        FA3_SPARSE_BACKEND, FLASHINFER_SM90_SPARSE_BACKEND, FLASHINFER_SM90_SPARSE_FP8_BACKEND,
+        SPECULATIVE_CACHE_AXIS, SPECULATIVE_QUERY_AXIS, UNIFORM_CACHE_AXIS, UNIFORM_QUERY_AXIS,
     };
     use crate::timing::bridge::{ArgsPayload, DType};
     use crate::timing::cache::{CacheKind, Extrapolation};
@@ -1161,6 +1180,62 @@ mod tests {
         h100.gpu_name = "NVIDIA H100".into();
         assert!(DsaSparseMlaAttentionSpec::validate_config(&h100).is_err());
         assert!(DsaSparseMlaAttentionSpec::validate_config(&fa3).is_ok());
+    }
+
+    /// Catches the FP8-cache rows drifting from the BF16 FlashInfer rows in
+    /// anything but the cache identity (the 475 profiled coordinates must be
+    /// the same planner-wave grid, and the payload must say e4m3 latent rows),
+    /// or the two backends being mixed in one config.
+    #[test]
+    fn flashinfer_sm90_fp8_rows_share_the_grid_and_change_only_the_cache() {
+        let bf16 = flashinfer_sm90_config();
+        let fp8 = DsaSparseMlaAttentionKernelConfig {
+            backends: vec![FLASHINFER_SM90_SPARSE_FP8_BACKEND],
+            cache_dtype: DType::Fp8E4m3,
+            cache_layout: "token_major_mqa_fp8_latent".into(),
+            ..bf16.clone()
+        };
+        assert_eq!(fp8.kv_dtype(), Some(DType::Fp8E4m3));
+        assert_eq!(fp8.compute_dtype(), Some(DType::Bf16));
+        let grid = DsaSparseMlaAttentionSpec::sweep_grid(&fp8);
+        assert_eq!(grid, DsaSparseMlaAttentionSpec::sweep_grid(&bf16));
+        let input = DsaSparseMlaAttentionKernelInput {
+            num_queries: 133,
+            num_cache_tokens: 3000,
+        };
+        assert_eq!(
+            DsaSparseMlaAttentionSpec::cache_coords(&fp8, &input).to_vec(),
+            vec![264.0, 3000.0]
+        );
+        let payloads =
+            DsaSparseMlaAttentionSpec::enumerate(&fp8, &grid, FLASHINFER_SM90_SPARSE_FP8_BACKEND);
+        assert_eq!(payloads.len(), 475);
+        let bf16_payloads =
+            DsaSparseMlaAttentionSpec::enumerate(&bf16, &grid, FLASHINFER_SM90_SPARSE_BACKEND);
+        let mut fields =
+            serde_json::to_value(payload_for(&payloads, &grid, 264, 2051).fields()).unwrap();
+        assert_eq!(fields["cache_dtype"], "fp8_e4m3");
+        assert_eq!(fields["cache_layout"], "token_major_mqa_fp8_latent");
+        fields["backend"] = Value::from(FLASHINFER_SM90_SPARSE_BACKEND);
+        fields["cache_dtype"] = Value::from("bf16");
+        fields["cache_layout"] = Value::from("token_major_mqa_bf16_latent");
+        assert_eq!(
+            fields,
+            serde_json::to_value(payload_for(&bf16_payloads, &grid, 264, 2051).fields()).unwrap()
+        );
+        let mut h100 = fp8.clone();
+        h100.gpu_name = "NVIDIA H100".into();
+        assert!(DsaSparseMlaAttentionSpec::validate_config(&h100).is_err());
+        let mixed = DsaSparseMlaAttentionKernelConfig {
+            backends: vec![
+                FLASHINFER_SM90_SPARSE_BACKEND,
+                FLASHINFER_SM90_SPARSE_FP8_BACKEND,
+            ],
+            ..fp8
+        };
+        assert!(
+            std::panic::catch_unwind(|| DsaSparseMlaAttentionSpec::sweep_grid(&mixed)).is_err()
+        );
     }
 
     #[test]

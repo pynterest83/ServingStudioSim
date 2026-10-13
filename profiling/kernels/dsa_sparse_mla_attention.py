@@ -71,7 +71,8 @@ DOC = KernelDoc(
         "one FA3 call: prepare_varlen_num_blocks, FlashAttnFwdSm90 and, when FA3 "
         "splits the keys, FlashAttnFwdCombine. vllm_flashinfer_sparse_sm90_bf16 counts "
         "only BatchMLAPageAttentionHopperKernel, the one launch of FlashInfer's planned "
-        "MLA run. Setup and output checks run before timing."
+        "MLA run; vllm_flashinfer_sparse_sm90_fp8 counts the same launch over an e4m3 "
+        "cache. Setup and output checks run before timing."
     ),
     caveats=(
         "Selected positions and tensor values are constructed, not taken from "
@@ -94,6 +95,11 @@ DOC = KernelDoc(
         "to the exact counts; production reuses a plan while the bounds stay inside "
         "the slack. The plan, its kv_end clamp and the per-call index pack are "
         "separate launches outside the timed run.",
+        "vllm_flashinfer_sparse_sm90_fp8 has the same limits with the "
+        "token_major_mqa_fp8_latent layout: e4m3 latent rows at per-tensor scale "
+        "1.0 (GLM-5.3-Flash ships no KV scales), the BF16 synthetic cache rounded "
+        "to e4m3 and checked against the reference on its exact BF16 "
+        "dequantization.",
     ),
     reference="profiling.runners.attention.dsa_sparse_mla_attention_reference",
 )
@@ -220,8 +226,7 @@ register(
         backend="vllm_flashinfer_sparse_sm90_bf16",
         # vLLM FlashInferMLASparseSM90Backend.supports_compute_capability: major
         # == 9; FlashInfer JIT-builds its BatchMLAPagedAttention FA3 (Hopper
-        # wgmma/TMA) module for sm_90a. The backend also admits FP8 caches; only
-        # the BF16 cache H200 GLM-5.3-Flash serves is profiled here.
+        # wgmma/TMA) module for sm_90a. The FP8 cache is its own backend below.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             kv=frozenset({DType.BF16}),
@@ -241,6 +246,45 @@ register(
                 "vLLM's FLASHINFER_MLA_SPARSE_SM90: FlashInfer's planned "
                 "BatchMLAPagedAttentionWrapper (FA3) run over rope-free BF16 latent rows, "
                 "with the selected rows packed as a page-size-1 CSR page table, on H200."
+            ),
+            url=(
+                "https://github.com/vllm-project/vllm/blob/main/"
+                "vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py"
+            ),
+        ),
+    )
+)
+
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_flashinfer_sparse_sm90_fp8",
+        # The same SM90-only backend and sm_90a FlashInfer module, instantiated
+        # with an e4m3 DTypeKV: FlashInferMLASparseSM90Backend admits
+        # kv_cache_dtype fp8 / fp8_e4m3 (`_FP8_KV_DTYPES`), the builder plans
+        # float8_e4m3fn and FlashInfer's Hopper kernel repacks the FP8 tiles to
+        # BF16 in shared memory (USE_KV_REPACK, mla_hopper.cuh). Queries and
+        # output stay BF16 (`supports_quant_query_input = False`).
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            kv=frozenset({DType.FP8_E4M3}),
+            sm_targets=frozenset({"sm_90a"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.dsa_sparse_mla_flashinfer_sm90",
+            function_name="profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_fp8",
+        ),
+        table_name=KIND,
+        args_schema=DsaSparseMlaAttentionArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's FLASHINFER_MLA_SPARSE_SM90 with --kv-cache-dtype fp8: the same "
+                "planned FlashInfer MLA run over rope-free e4m3 latent rows (per-tensor "
+                "scale 1.0), dequantized to BF16 in shared memory, on H200."
             ),
             url=(
                 "https://github.com/vllm-project/vllm/blob/main/"

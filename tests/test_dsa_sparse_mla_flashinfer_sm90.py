@@ -226,7 +226,9 @@ def test_profile_times_only_the_hopper_kernel_after_plan_and_check(monkeypatch) 
     )
     monkeypatch.setattr(runner, "_check_correctness", lambda *_a, **_k: calls.append("correctness"))
     monkeypatch.setattr(
-        runner, "_launch", lambda state, ops: calls.append(("launch", state, ops)) or "out"
+        runner,
+        "_launch",
+        lambda state, ops, **kwargs: calls.append(("launch", state, ops, kwargs)) or "out",
     )
 
     def fake_timer(callable_, *, kernel_name):
@@ -244,11 +246,135 @@ def test_profile_times_only_the_hopper_kernel_after_plan_and_check(monkeypatch) 
         ("plan", "state", operands, 2176),
         "correctness",
         ("timer", "BatchMLAPageAttentionHopperKernel"),
-        ("launch", "state", operands),
+        ("launch", "state", operands, {"fp8": False}),
     ]
     flops = 2 * 2 * 16 * 2176 * (512 + 512)
     logical_bytes = 2 * 2 * 16 * 512 + 4 * 2 * 2176 + 2 * (2048 + 2049) * 512
     logical_bytes += 2 * 2 * 16 * 512 + 8 * 2 * 16
     assert metrics.time_ms == 2.0
     assert metrics.tflops == pytest.approx(flops / 0.002 / 1e12)
+    assert metrics.memory_bandwidth_gbps == pytest.approx(logical_bytes / 0.002 / 1e9)
+
+
+_FP8_BACKEND = "vllm_flashinfer_sparse_sm90_fp8"
+_FP8_SPEC = _SPEC | {"cache_dtype": "fp8_e4m3", "cache_layout": "token_major_mqa_fp8_latent"}
+
+
+def test_fp8_registration_is_the_sm90_e4m3_cache_in_vllm_env() -> None:
+    """Catches the FP8 cache leaking onto the BF16 rows (or the reverse): the
+    launcher picks a backend by the config's KV dtype, so each dtype must map
+    to exactly one SM90 FlashInfer backend."""
+    spec = find_kernel_profiler_spec(KIND, _FP8_BACKEND)
+    assert spec.args_schema is DsaSparseMlaAttentionArgs
+    assert spec.table_name == KIND
+    assert spec.supports.allows(DType.BF16, DType.FP8_E4M3, gpu="NVIDIA H200")
+    assert not spec.supports.allows(DType.BF16, DType.BF16, gpu="NVIDIA H200")
+    assert not spec.supports.allows(DType.FP8_E4M3, DType.FP8_E4M3, gpu="NVIDIA H200")
+    assert not spec.supports.allows(DType.BF16, DType.FP8_E4M3, gpu="NVIDIA B200")
+    assert spec.subprocess_env == "vllm_env"
+    assert spec.runner_ref.function_name == (
+        "profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_fp8"
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({}, "reached the build"),
+        ({"cache_dtype": "bf16"}, "cache_dtype must be fp8_e4m3"),
+        ({"cache_layout": "token_major_mqa_bf16_latent"}, "cache_layout must be"),
+        ({"q_dtype": "fp8_e4m3"}, "q_dtype must be bf16"),
+        ({"valid_counts": "u:2052x2"}, "at most"),
+    ],
+)
+def test_fp8_runner_accepts_only_the_e4m3_latent_layout(monkeypatch, overrides, match) -> None:
+    """Catches the FP8 backend measuring a BF16 cache (or an FP8 query) under
+    the FP8 key, which would price --kv-cache-dtype fp8 with BF16 times."""
+
+    def reached(*_args, **kwargs):
+        assert kwargs["fp8"] is True
+        raise ProfilerNotImplemented("reached the build")
+
+    monkeypatch.setattr(runner, "_load_sm90_state_cls", lambda: object())
+    monkeypatch.setattr(runner, "_build_sm90_operands", reached)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    with pytest.raises(ProfilerNotImplemented, match=match):
+        runner.profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_fp8(
+            **(_FP8_SPEC | overrides)
+        )
+
+
+def test_fp8_state_cache_and_run_match_forward_mqa() -> None:
+    """Catches a drift from vLLM's FP8 path: a plan declared with the uint8
+    spec dtype instead of float8_e4m3fn, a cache that is not e4m3, a run without
+    forward_mqa's ckv/kpe scales, or a reference that reads values other than
+    the cache's exact dequantization."""
+    validated = shared._ValidatedArgs(
+        num_queries=2,
+        num_cache_tokens=70,
+        valid_counts=(5, 3),
+        index_distribution="unique_scattered_pages",
+    )
+    cpu = torch.device("cpu")
+    operands = runner._build_sm90_operands(
+        torch, validated, num_heads=4, selected_k=8, device=cpu, fp8=True
+    )
+    assert operands.cache.dtype is torch.float8_e4m3fn
+    assert operands.cache.shape == (70, 1, 512)
+    assert operands.reference_cache.dtype is torch.bfloat16
+    assert torch.equal(operands.reference_cache, operands.cache.to(torch.bfloat16))
+    bf16 = runner._build_sm90_operands(torch, validated, num_heads=4, selected_k=8, device=cpu)
+    assert bf16.reference_cache is bf16.cache
+    # Same synthetic values, rounded to e4m3: the indices and queries match.
+    assert torch.equal(operands.selected_indices, bf16.selected_indices)
+    assert torch.equal(operands.q, bf16.q)
+    assert torch.equal(
+        bf16.cache.to(torch.float8_e4m3fn).view(torch.uint8), operands.cache.view(torch.uint8)
+    )
+
+    state = runner._make_state(
+        torch,
+        _FakeState,
+        num_queries=2,
+        num_heads=4,
+        selected_k=8,
+        softmax_scale=0.0625,
+        device=cpu,
+        fp8=True,
+    )
+    assert state.log[0][1][2] is torch.float8_e4m3fn
+    assert runner._launch(state, operands, fp8=True) == "output"
+    (_, (_q, _q_pe, ckv, kpe), run_kwargs) = state.log[1]
+    assert run_kwargs == {"ckv_scale": 1.0, "kpe_scale": 1.0}
+    assert ckv.dtype is torch.float8_e4m3fn and kpe.shape == (70, 1, 0)
+
+
+def test_fp8_profile_counts_one_byte_per_cached_element(monkeypatch) -> None:
+    """Catches FP8 rows logging BF16 cache traffic, which would halve the
+    reported bandwidth of the e4m3 reads."""
+    monkeypatch.setattr(runner, "_load_sm90_state_cls", lambda: "state_cls")
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    flags: list[object] = []
+    monkeypatch.setattr(
+        runner, "_build_sm90_operands", lambda *_a, **kwargs: flags.append(kwargs["fp8"])
+    )
+    monkeypatch.setattr(
+        runner, "_make_state", lambda _torch, _cls, **kwargs: flags.append(kwargs["fp8"])
+    )
+    monkeypatch.setattr(runner, "_plan_and_pack", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        runner, "_check_correctness", lambda *_a, **kwargs: flags.append(kwargs["fp8"])
+    )
+    monkeypatch.setattr(runner, "_launch", lambda *_a, **kwargs: flags.append(kwargs["fp8"]))
+
+    def fake_timer(callable_, *, kernel_name):
+        callable_()
+        return 2.0
+
+    monkeypatch.setattr(runner.Timer, "cupti", fake_timer)
+    monkeypatch.setattr(runner.Energy, "perf", lambda *_a, **_k: 0.5)
+    metrics = runner.profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_fp8(**_FP8_SPEC)
+    assert flags == [True, True, True, True]
+    logical_bytes = 2 * 2 * 16 * 512 + 4 * 2 * 2176 + 1 * (2048 + 2049) * 512
+    logical_bytes += 2 * 2 * 16 * 512 + 8 * 2 * 16
     assert metrics.memory_bandwidth_gbps == pytest.approx(logical_bytes / 0.002 / 1e9)
