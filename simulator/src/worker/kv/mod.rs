@@ -16,6 +16,7 @@ mod shared;
 
 pub use full_attn::FullAttnKv;
 pub use hybrid_gdn::HybridGdnKv;
+pub use shared::host_offload::HostOffloadConfig;
 pub(crate) use shared::prefix_cache::PrefixCacheTokenConfig;
 pub use shared::prefix_cache::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
 
@@ -30,6 +31,10 @@ pub struct ResolvedPrefillContext {
     processed_prefill_tokens: u32,
     active_chunk_tokens: u32,
     cache_return_metadata: Option<PrefixCacheReturnMetadata>,
+    /// The deepest part of `resident_prefix_tokens` that a host (CPU) KV tier
+    /// supplies beyond the GPU hit and must be copied in before the prefill
+    /// runs. Zero without a host tier.
+    host_loaded_prefix_tokens: u32,
 }
 
 impl ResolvedPrefillContext {
@@ -71,7 +76,19 @@ impl ResolvedPrefillContext {
             processed_prefill_tokens: 0,
             active_chunk_tokens: prefill_tokens_to_compute,
             cache_return_metadata: None,
+            host_loaded_prefix_tokens: 0,
         }
+    }
+
+    /// Mark the top `tokens` of the resident prefix as loaded from a host tier.
+    pub(crate) fn with_host_loaded_prefix(mut self, tokens: u32) -> Self {
+        self.host_loaded_prefix_tokens = tokens.min(self.resident_prefix_tokens);
+        self
+    }
+
+    /// Resident prefix tokens a host tier supplies (see the field).
+    pub fn host_loaded_prefix_tokens(self) -> u32 {
+        self.host_loaded_prefix_tokens
     }
 
     /// `None` for a standalone request — nothing to look up or retain.
@@ -304,6 +321,14 @@ pub trait ChunkedPrefillKv: PrefixKv + IterWorkerKv {
     /// scheduler already issued its next verify row. Its KV stays charged
     /// until `release_retaining_prefix`.
     fn hold_trailing_decode_row(&mut self, request: RequestId, partition: PartitionId);
+    /// Host KV tier only: register the host copies that completed by `now`,
+    /// the time the decision about to be made sees. No-op without one.
+    fn settle_host_transfers(&mut self, _now: Time) {}
+    /// Host KV tier only: when the H2D load of an admitted prompt that has
+    /// not started lands. `None` when it waits for no load.
+    fn host_load_ready_at(&self, _request: RequestId) -> Option<Time> {
+        None
+    }
 }
 
 pub trait IterWorkerKv: KvStore {

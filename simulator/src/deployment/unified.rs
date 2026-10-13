@@ -195,6 +195,7 @@ impl Deployment for UnifiedDeployment {
             async_output_processing: async_output_processing(&g.worker)?,
             max_running_requests: max_running_requests(&g.worker),
             checkpoint_release: checkpoint_release(&g.worker),
+            kv_offload: kv_offload(&g.worker)?,
             ..WorkerConfig::default()
         };
 
@@ -982,6 +983,50 @@ fn async_output_processing(worker: &IterWorkerSel) -> anyhow::Result<crate::comm
     }
 }
 
+/// vLLM's native CPU KV offload, carried by the `speculative` selector only:
+/// the host tier's total pinned bytes and copy rates. `None` without
+/// `kv_offload_cpu_gb_total`. Whether the arch and prefix-cache setup support
+/// it is checked by the recipe.
+fn kv_offload(
+    worker: &IterWorkerSel,
+) -> anyhow::Result<Option<crate::worker::kv::HostOffloadConfig>> {
+    let IterWorkerSel::Speculative {
+        kv_offload_cpu_gb_total: Some(gib_total),
+        kv_offload_h2d_gbps,
+        kv_offload_d2h_gbps,
+        kv_offload_transfer_latency_us,
+        ..
+    } = worker
+    else {
+        return Ok(None);
+    };
+    ensure!(
+        gib_total.is_finite() && *gib_total > 0.0,
+        "unified: kv_offload_cpu_gb_total must be finite and > 0, got {gib_total}"
+    );
+    for (name, rate) in [
+        ("kv_offload_h2d_gbps", *kv_offload_h2d_gbps),
+        ("kv_offload_d2h_gbps", *kv_offload_d2h_gbps),
+    ] {
+        ensure!(
+            rate.is_finite() && rate > 0.0,
+            "unified: {name} must be finite and > 0, got {rate}"
+        );
+    }
+    let latency_us = *kv_offload_transfer_latency_us;
+    ensure!(
+        latency_us.is_finite() && latency_us >= 0.0,
+        "unified: kv_offload_transfer_latency_us must be finite and >= 0, got {latency_us}"
+    );
+    Ok(Some(crate::worker::kv::HostOffloadConfig {
+        // vLLM: `kv_offloading_size * (1 << 30)`.
+        cpu_bytes_total: (gib_total * (1u64 << 30) as f64) as u64,
+        h2d_bytes_per_s: kv_offload_h2d_gbps * 1e9,
+        d2h_bytes_per_s: kv_offload_d2h_gbps * 1e9,
+        transfer_latency: crate::common::Time::from_ns((latency_us * 1e3).round() as u64),
+    }))
+}
+
 /// Draft candidate count, carried by the `speculative` selector only. Every other
 /// worker leaves it at `0`, which is what marks it as not speculating.
 fn speculative_draft_tokens(worker: &IterWorkerSel) -> u32 {
@@ -1436,10 +1481,43 @@ pools:
             prefix_match_unit_tokens: None,
             async_scheduling: false,
             async_output_processing_ms: 0.0,
+            kv_offload_cpu_gb_total: None,
+            kv_offload_h2d_gbps: 37.7,
+            kv_offload_d2h_gbps: 24.3,
+            kv_offload_transfer_latency_us: 7.0,
             what_if_kernel_time_scale: Vec::new(),
             max_running_requests: None,
             recurrent_checkpoint_release: Default::default(),
         }
+    }
+
+    #[test]
+    fn kv_offload_is_off_unless_sized_and_validates_its_rates() {
+        assert_eq!(kv_offload(&speculative_worker(5)).unwrap(), None);
+        assert_eq!(kv_offload(&barebone_worker()).unwrap(), None);
+        let sized = |gib: f64, h2d: f64, latency_us: f64| {
+            let mut worker = speculative_worker(5);
+            if let IterWorkerSel::Speculative {
+                kv_offload_cpu_gb_total,
+                kv_offload_h2d_gbps,
+                kv_offload_transfer_latency_us,
+                ..
+            } = &mut worker
+            {
+                *kv_offload_cpu_gb_total = Some(gib);
+                *kv_offload_h2d_gbps = h2d;
+                *kv_offload_transfer_latency_us = latency_us;
+            }
+            kv_offload(&worker)
+        };
+        let config = sized(256.0, 37.7, 7.0).unwrap().unwrap();
+        assert_eq!(config.cpu_bytes_total, 256 << 30);
+        assert_eq!(config.h2d_bytes_per_s, 37.7e9);
+        assert_eq!(config.d2h_bytes_per_s, 24.3e9);
+        assert_eq!(config.transfer_latency, crate::common::Time::from_us(7));
+        assert!(sized(0.0, 37.7, 7.0).is_err());
+        assert!(sized(128.0, 0.0, 7.0).is_err());
+        assert!(sized(128.0, 37.7, -1.0).is_err());
     }
 
     /// The smallest speculative model the recipe accepts: a routed-MoE down

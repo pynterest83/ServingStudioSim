@@ -359,6 +359,22 @@ fn default_gpu_time_multiplier() -> f64 {
     1.0
 }
 
+/// serde fallbacks for the speculative selector's host KV tier: the H200 TP4
+/// PCIe rates measured with pinned memory and all four ranks copying at once
+/// (`logs/20261013_0_glm53_h200_gpu5/pcie_bw.json`, worst rank), and the
+/// fixed per-copy time of a lone one-page copy beyond bytes over bandwidth.
+fn default_kv_offload_h2d_gbps() -> f64 {
+    37.7
+}
+
+fn default_kv_offload_d2h_gbps() -> f64 {
+    24.3
+}
+
+fn default_kv_offload_transfer_latency_us() -> f64 {
+    7.0
+}
+
 /// serde fallback for the speculative selector's `batch_policy`.
 const fn default_batch_policy() -> BatchPolicy {
     BatchPolicy::Mix
@@ -594,6 +610,33 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(default = 0.0)]
         async_output_processing_ms: f64,
+        /// vLLM's native CPU KV offload (`--kv-offloading-size` with
+        /// `--kv-offloading-backend native` and `VLLM_USE_SIMPLE_KV_OFFLOAD=1`,
+        /// the `SimpleCPUOffloadConnector`): GiB of pinned host memory summed
+        /// over the replica's ranks, which vLLM splits evenly per rank. Prompts
+        /// store their attention blocks and replay-boundary states to the host,
+        /// and a prompt the GPU prefix cache cannot serve as deeply resumes from
+        /// the host after an H2D copy, waiting at least one step. None (the
+        /// default) has no host tier. Modeled only for a hybrid arch under
+        /// `eagle_block_drop` with prefix caching and no finer
+        /// `prefix_match_unit_tokens`.
+        #[serde(default)]
+        kv_offload_cpu_gb_total: Option<f64>,
+        /// Host KV tier only: per-rank host-to-device bandwidth (GB/s, 1e9
+        /// bytes) while every rank of the replica copies at once.
+        #[serde(default = "default_kv_offload_h2d_gbps")]
+        #[param(default = 37.7)]
+        kv_offload_h2d_gbps: f64,
+        /// Host KV tier only: per-rank device-to-host bandwidth (GB/s) while
+        /// every rank copies at once.
+        #[serde(default = "default_kv_offload_d2h_gbps")]
+        #[param(default = 24.3)]
+        kv_offload_d2h_gbps: f64,
+        /// Host KV tier only: fixed time (µs) of one copy on top of bytes over
+        /// bandwidth.
+        #[serde(default = "default_kv_offload_transfer_latency_us")]
+        #[param(default = 7.0)]
+        kv_offload_transfer_latency_us: f64,
         /// EXPLORATION ONLY — a counterfactual, never set in a reproduction
         /// preset or alignment pack. A list of `{match, factor}` rules: every
         /// kernel slot whose dotted name contains `match` on whole `.` segments

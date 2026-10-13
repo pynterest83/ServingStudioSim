@@ -49,6 +49,14 @@
 //! output from the front of the queue; a preempted unfinished prompt restarts.
 //! `with_max_running_requests` (vLLM's `max_num_seqs`) caps admission in
 //! every KV mode.
+//!
+//! With a host KV tier (vLLM's CPU offload) a waiting prompt whose deepest
+//! prefix sits in host memory is admitted without running: the KV store
+//! copies the prefix in, and the prompt waits outside the running set (vLLM's
+//! `WAITING_FOR_REMOTE_KVS`, never preempted, no budget spent) until a
+//! decision sees the copy done (`ChunkedPrefillKv::host_load_ready_at`). It is
+//! then scheduled ahead of fresh requests, in admission order, and stamped
+//! first scheduled. At least one step passes in between.
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -77,6 +85,10 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     /// Per partition: prompts that have started and still have prefill tokens
     /// left to schedule, in start order.
     started_prefills: Vec<Vec<AdmissionCandidate>>,
+    /// Per partition: admitted prompts that wait for a host KV load before
+    /// they first run, in admission order. Not running: they spend no budget,
+    /// count against no running cap, and are never preempted.
+    loading_prefills: Vec<Vec<AdmissionCandidate>>,
     /// Context-token spacing that every non-final chunk must end on, when the
     /// engine can only checkpoint recurrent state at those boundaries.
     chunk_end_quantum: Option<u32>,
@@ -193,6 +205,7 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             current_new_token_ratio,
             balance,
             started_prefills: Vec::new(),
+            loading_prefills: Vec::new(),
             chunk_end_quantum: None,
             eagle_block_drop: false,
             partial_tail_unit: None,
@@ -797,8 +810,11 @@ where
             now
         };
         self.started_prefills.resize_with(num_partitions, Vec::new);
+        self.loading_prefills.resize_with(num_partitions, Vec::new);
         self.trailing_decode_rows
             .resize_with(num_partitions, Vec::new);
+        // Host copies reported done by the time this decision is made.
+        kv_store.settle_host_transfers(decision_time);
         batch_plan.reset_decode_participation(num_partitions, true);
         for (partition, trailing) in self.trailing_decode_rows.iter().enumerate() {
             if !trailing.is_empty() {
@@ -847,6 +863,7 @@ where
                 .map(|partition| {
                     let started = self.started_prefills[partition]
                         .iter()
+                        .chain(&self.loading_prefills[partition])
                         .filter(|candidate| candidate.remaining_output_tokens > 1)
                         .count() as u32;
                     (self.max_batch_tokens / decode_budget)
@@ -916,6 +933,71 @@ where
             let partition = partition_index as u16;
             let running_before_admission = self.running_count(kv_store, partition_index);
             let mut admitted = 0u32;
+            // Prompts whose host load this decision sees done run first, as
+            // vLLM drains its KV-holding waiting requests first; one still
+            // copying is skipped and keeps its place.
+            let mut loading_index = 0;
+            while loading_index < self.loading_prefills[partition_index].len()
+                && !retracted_before_admission
+                && remaining_budgets[partition_index] > drafting_slots
+            {
+                if self
+                    .max_running_requests
+                    .is_some_and(|max_running| running_before_admission + admitted >= max_running)
+                {
+                    break;
+                }
+                let candidate = self.loading_prefills[partition_index][loading_index];
+                if kv_store
+                    .host_load_ready_at(candidate.request_id)
+                    .is_some_and(|ready| ready > decision_time)
+                {
+                    loading_index += 1;
+                    continue;
+                }
+                let resolved_prefill = kv_store.resolved_prefill_context(candidate.request_id);
+                let chunk_tokens = next_chunk_tokens(
+                    resolved_prefill,
+                    remaining_budgets[partition_index] - drafting_slots,
+                    chunk_end_quantum,
+                    eagle_block_drop,
+                    partial_tail_unit,
+                    max_batch_tokens,
+                );
+                if chunk_tokens == 0 {
+                    break;
+                }
+                // A waiting request that cannot be allocated stops the
+                // waiting loop; it preempts nobody.
+                if incremental
+                    && !kv_store.allocate_incremental(
+                        candidate.request_id,
+                        partition,
+                        u64::from(resolved_prefill.active_chunk().0 + chunk_tokens),
+                        now,
+                    )
+                {
+                    break;
+                }
+                self.loading_prefills[partition_index].remove(loading_index);
+                self.admission_order
+                    .insert(candidate.request_id, self.next_admission);
+                self.next_admission += 1;
+                {
+                    let mut store = context.requests.borrow_mut();
+                    context.stamp_stage(
+                        &mut store[candidate.request_id],
+                        decision_time,
+                        UnifiedStage::Prefill as u16,
+                    );
+                }
+                kv_store.schedule_prefill_chunk(candidate.request_id, partition, chunk_tokens);
+                remaining_budgets[partition_index] -= chunk_tokens + drafting_slots;
+                admitted += 1;
+                if chunk_tokens < resolved_prefill.remaining_prefill_tokens() {
+                    self.started_prefills[partition_index].push(candidate);
+                }
+            }
             while !retracted_before_admission && remaining_budgets[partition_index] > drafting_slots
             {
                 if self
@@ -946,18 +1028,25 @@ where
                     candidate.fresh_prompt_tokens,
                     candidate.session_input,
                 );
+                // A prompt resuming from the host is admitted to wait for its
+                // load and runs nothing now (vLLM schedules no tokens for it).
+                let loads_from_host = resolved_prefill.host_loaded_prefix_tokens() > 0;
                 // A fresh prompt whose first chunk cannot end on a checkpoint
                 // boundary within the budget stops admission (vLLM breaks its
                 // waiting loop here rather than skipping ahead).
-                let chunk_tokens = next_chunk_tokens(
-                    resolved_prefill,
-                    remaining_budgets[partition_index] - drafting_slots,
-                    chunk_end_quantum,
-                    eagle_block_drop,
-                    partial_tail_unit,
-                    max_batch_tokens,
-                );
-                if chunk_tokens == 0 {
+                let chunk_tokens = if loads_from_host {
+                    0
+                } else {
+                    next_chunk_tokens(
+                        resolved_prefill,
+                        remaining_budgets[partition_index] - drafting_slots,
+                        chunk_end_quantum,
+                        eagle_block_drop,
+                        partial_tail_unit,
+                        max_batch_tokens,
+                    )
+                };
+                if chunk_tokens == 0 && !loads_from_host {
                     break;
                 }
                 let footprint = match bounded_config {
@@ -998,9 +1087,11 @@ where
                 }
                 let popped = policy.pop(policy_context);
                 debug_assert_eq!(popped, Some(candidate));
-                self.admission_order
-                    .insert(candidate.request_id, self.next_admission);
-                self.next_admission += 1;
+                if !loads_from_host {
+                    self.admission_order
+                        .insert(candidate.request_id, self.next_admission);
+                    self.next_admission += 1;
+                }
                 if candidate.remaining_output_tokens > 1 {
                     if let Some(slots) = future_decode_slots.as_mut() {
                         slots[partition_index] -= 1;
@@ -1013,7 +1104,9 @@ where
                     footprint,
                     now,
                 );
-                admitted += 1;
+                if !loads_from_host {
+                    admitted += 1;
+                }
                 if incremental {
                     let allocated = kv_store.allocate_incremental(
                         candidate.request_id,
@@ -1037,7 +1130,9 @@ where
                             resolved_prefill.resident_prefix_tokens(),
                         );
                     }
-                    context.stamp_stage(record, decision_time, UnifiedStage::Prefill as u16);
+                    if !loads_from_host {
+                        context.stamp_stage(record, decision_time, UnifiedStage::Prefill as u16);
+                    }
                 }
                 assert!(
                     self.prefill_episodes
@@ -1045,6 +1140,10 @@ where
                         .is_none(),
                     "request entered two simultaneous prefill episodes"
                 );
+                if loads_from_host {
+                    self.loading_prefills[partition_index].push(candidate);
+                    continue;
+                }
                 kv_store.schedule_prefill_chunk(candidate.request_id, partition, chunk_tokens);
                 remaining_budgets[partition_index] -= chunk_tokens + drafting_slots;
                 if chunk_tokens < resolved_prefill.remaining_prefill_tokens() {
@@ -1271,7 +1370,11 @@ where
                 return true;
             }
         }
-        for started_prefills in &mut self.started_prefills {
+        for started_prefills in self
+            .started_prefills
+            .iter_mut()
+            .chain(self.loading_prefills.iter_mut())
+        {
             let started_count = started_prefills.len();
             started_prefills.retain(|candidate| candidate.request_id != request);
             if started_prefills.len() != started_count {

@@ -552,6 +552,10 @@ pub struct WorkerConfig {
     /// speculative selector's `recurrent_checkpoint_release`). Only the hybrid
     /// speculative recipe reads it.
     pub checkpoint_release: crate::worker::config::RecurrentCheckpointRelease,
+    /// vLLM's native CPU KV offload (from the `speculative` selector's
+    /// `kv_offload_*`). `None` has no host tier. Only the hybrid speculative
+    /// recipe reads it.
+    pub kv_offload: Option<crate::worker::kv::HostOffloadConfig>,
 }
 
 impl Default for WorkerConfig {
@@ -579,6 +583,7 @@ impl Default for WorkerConfig {
             async_output_processing: Time::ZERO,
             max_running_requests: None,
             checkpoint_release: crate::worker::config::RecurrentCheckpointRelease::Completion,
+            kv_offload: None,
         }
     }
 }

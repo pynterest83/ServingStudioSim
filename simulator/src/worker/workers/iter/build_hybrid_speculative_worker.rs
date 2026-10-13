@@ -17,13 +17,16 @@
 //! `--prefix-match-unit`) adds each prompt's partial-tail boundary at that unit,
 //! both as a retained resume point (`HybridGdnKv::with_prefix_match_unit`) and
 //! as a chunk stop (`ChunkedPrefillAdmission::with_prefix_match_unit`).
+//! `kv_offload` (vLLM's native CPU offload) puts a host KV tier behind the
+//! retained prefixes (`HybridGdnKv::with_host_offload`): each rank pins an even
+//! share of the configured bytes in whole GPU pages.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::arch::contract::SpeculativeUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
-use crate::log::PrefixCacheLogger;
+use crate::log::{KvOffloadLogger, PrefixCacheLogger};
 use crate::worker::admission::{
     ChunkedPrefillAdmission, LoadBalance, PendingOrder, SpeculativeDecodeCompletion,
 };
@@ -68,6 +71,9 @@ pub(crate) fn build_hybrid_speculative_worker<M: SpeculativeUnifiedModel>(
         "speculative verify width must fit max_batch_tokens"
     );
     let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
+    let kv_offload_logger = config
+        .kv_offload
+        .and_then(|_| KvOffloadLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id));
     let num_partitions = model.num_attn_dp_groups().max(1) as usize;
     let kv_capacity = full_attention_token_capacity(
         model.num_attn_shards(),
@@ -171,6 +177,40 @@ pub(crate) fn build_hybrid_speculative_worker<M: SpeculativeUnifiedModel>(
     } else {
         kv_store
     };
+    // vLLM's native CPU offload: `cpu_bytes_to_use / world_size` per rank, in
+    // whole pages of the GPU block (`SimpleCPUOffloadConnector`).
+    let kv_store = match config.kv_offload {
+        Some(offload) => {
+            assert!(
+                eagle_replay_boundaries
+                    && prefix_match_unit.is_none_or(|unit| unit == checkpoint_interval_tokens),
+                "kv_offload is modeled only under eagle_block_drop with prefix caching and \
+                 the checkpoint-interval match unit"
+            );
+            let ranks = u64::from(model.gpus_per_replica().max(1));
+            let bytes_per_token =
+                model.total_kv_bytes_per_token() as f64 / f64::from(model.num_attn_shards().max(1));
+            let page_bytes = bytes_per_token * f64::from(checkpoint_interval_tokens);
+            let pages = ((offload.cpu_bytes_total / ranks) as f64 / page_bytes).floor() as u64;
+            let capacity_tokens = pages * u64::from(checkpoint_interval_tokens);
+            tracing::info!(
+                worker = id.0,
+                pool_tag,
+                host_pages_per_rank = pages,
+                host_capacity_tokens = capacity_tokens,
+                page_bytes,
+                "hybrid speculative: host KV tier"
+            );
+            kv_store.with_host_offload(
+                capacity_tokens,
+                checkpoint_charge_tokens,
+                bytes_per_token,
+                offload,
+                kv_offload_logger,
+            )
+        }
+        None => kv_store,
+    };
     let balance = if num_partitions == 1 {
         LoadBalance::Single
     } else {
@@ -241,7 +281,7 @@ mod tests {
     use crate::timing::LeafMetrics;
     use crate::worker::config::{KvAdmissionConfig, RecurrentCheckpointRelease};
     use crate::worker::iter_worker::IterWorker;
-    use crate::worker::kv::PrefixCachePolicy;
+    use crate::worker::kv::{HostOffloadConfig, PrefixCachePolicy};
     use crate::worker::types::WorkerMsgCommon;
 
     const DRAFT_TOKENS: u32 = 5;
@@ -476,6 +516,101 @@ mod tests {
         assert_eq!(
             second_turn(true, None, None, Some(CHECKPOINT_INTERVAL)),
             (16, 50 - 16)
+        );
+    }
+
+    /// `second_turn`'s session (40-token prompt, then 10 fresh tokens over it)
+    /// on a GPU that retains nothing, behind a host tier copying at
+    /// `host_bytes_per_s` each way plus 10 µs (`None`: no host tier). Returns
+    /// the second turn's hit, prefill tokens processed and first output time.
+    fn host_second_turn(host_bytes_per_s: Option<f64>) -> (u32, u32, Time) {
+        let requests = shared_with(&[(0, 40, OUTPUT_TOKENS), (1, 10, OUTPUT_TOKENS)]);
+        {
+            let mut requests = requests.borrow_mut();
+            for (id, declared_prefix_tokens) in [(0, 0), (1, 40)] {
+                let definition = &mut requests[RequestId(id)].request.definition;
+                definition.decoding = DecodingStrategy::Speculative {
+                    accept_rate: AcceptanceProfile::Uniform(1.0),
+                };
+                definition.session = SessionInput::Session {
+                    session_id: 7,
+                    session_start_time: Time::ZERO,
+                    declared_prefix_tokens,
+                };
+            }
+        }
+        let model = Arc::new(HybridModel {
+            state_tokens: STATE_TOKENS,
+            checkpoint_tokens: None,
+            most_requests: AtomicU32::new(0),
+        });
+        let config = WorkerConfig {
+            attn_kv_bytes: 100_000 * KV_BYTES_PER_TOKEN,
+            max_batch_tokens: Some(2048),
+            kv_admission: KvAdmissionConfig::Incremental,
+            speculative_draft_tokens: DRAFT_TOKENS,
+            speculative_acceptance_seed: Some(7),
+            eagle_block_drop: true,
+            prefix_cache: PrefixCacheConfig::Opportunistic {
+                policy: PrefixCachePolicy::Lru,
+                max_retained_bytes: Some(0),
+            },
+            kv_offload: host_bytes_per_s.map(|rate| HostOffloadConfig {
+                cpu_bytes_total: 1 << 30,
+                h2d_bytes_per_s: rate,
+                d2h_bytes_per_s: rate,
+                transfer_latency: Time::from_us(10),
+            }),
+            ..WorkerConfig::default()
+        };
+        let mut worker = build_hybrid_speculative_worker(
+            WorkerId(0),
+            "test",
+            model,
+            requests.clone(),
+            config,
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        for (id, ticks) in [(0u32, 0..200), (1, 200..400)] {
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(id)));
+            for tick in ticks {
+                worker.tick(Time::from_ms(tick as f64), &mut Vec::new());
+            }
+            assert!(
+                requests.borrow()[RequestId(id)].lifecycle.completed,
+                "turn {id}"
+            );
+        }
+        let requests = requests.borrow();
+        let second = &requests[RequestId(1)];
+        (
+            second.telemetry.prefix_cache_hit_tokens.expect("resolved"),
+            second.progress.prefill_tokens_processed,
+            second.telemetry.first_output_time.expect("first token"),
+        )
+    }
+
+    #[test]
+    fn a_host_tier_serves_the_turn_the_gpu_dropped_after_its_load() {
+        // No host tier: the GPU kept nothing, so turn two recomputes all 50
+        // tokens from its arrival, in two 1 ms chunks split at the prompt's
+        // last cacheable boundary (32).
+        assert_eq!(host_second_turn(None), (0, 50, Time::from_ms(202.0)));
+        // The host kept the prompt's blocks [0, 32) and its replay state at
+        // 16: turn two resumes there after copying 16 attention tokens and a
+        // 100-token state, 118_784 bytes, at 1e7 B/s plus 10 µs (11.89 ms).
+        // It runs from the first decision past the copy, the 212 ms tick,
+        // again in two chunks.
+        let (hit, processed, first_token) = host_second_turn(Some(1e7));
+        assert_eq!((hit, processed), (16, 50 - 16));
+        assert_eq!(first_token, Time::from_ms(214.0));
+        // Even an instant copy waits for the next decision.
+        assert_eq!(
+            host_second_turn(Some(1e15)),
+            (16, 50 - 16, Time::from_ms(203.0))
         );
     }
 

@@ -44,6 +44,16 @@
 //! replay boundaries and backs every hit off one block
 //! ([`CheckpointRetention::EagleReplayBoundaries`]).
 //!
+//! ## Host tier
+//!
+//! [`HybridGdnKv::with_host_offload`] adds vLLM's native CPU offload behind the
+//! GPU prefix cache, one [`HostKvTier`] per partition: prompts store their
+//! attention blocks and replay-boundary states to host memory when their
+//! prefill ends, finished requests their decoded blocks, and an admission the
+//! GPU tier cannot serve as deeply may resume from the host after an H2D copy
+//! (the lifecycle holds it until [`ChunkedPrefillKv::host_load_ready_at`]).
+//! Off by default.
+//!
 //! ## Not modeled
 //!
 //! Live snapshots yield to admission but are never *proactively* shed: there is
@@ -56,9 +66,11 @@ use std::collections::HashMap;
 
 use crate::common::{RequestId, SessionInput, Time};
 use crate::log::{
-    KvSampler, KvSubmit, PrefixCacheActivation, PrefixCacheEvent, PrefixCacheEventKind,
-    PrefixCacheEvictionReason, PrefixCacheLogger, PrefixCacheRetentionReason,
+    KvOffloadEvent, KvOffloadLogger, KvOffloadOperation, KvSampler, KvSubmit,
+    PrefixCacheActivation, PrefixCacheEvent, PrefixCacheEventKind, PrefixCacheEvictionReason,
+    PrefixCacheLogger, PrefixCacheRetentionReason,
 };
+use crate::worker::kv::shared::host_offload::{HostKvTier, HostOffloadConfig};
 use crate::worker::kv::shared::prefix_cache::{
     CheckpointRelease, CheckpointRetention, PrefixCache, PrefixCacheMutation,
     PrefixCacheReturnMetadata,
@@ -111,6 +123,15 @@ pub struct HybridGdnKv {
     /// vLLM v1 block allocation instead of an up-front reservation (see
     /// [`IncrementalBlocks`]). `None` keeps the reserved footprint.
     incremental: Option<IncrementalBlocks>,
+    /// A host (CPU) KV tier behind the retained-prefix tier (see
+    /// [`Self::with_host_offload`]). `None` has no host memory.
+    host_offload: Option<HostOffload>,
+}
+
+/// Every partition's host tier and the worker's `kv_offload_event` stream.
+struct HostOffload {
+    tiers: Vec<HostKvTier>,
+    logger: Option<KvOffloadLogger>,
 }
 
 /// vLLM v1's `KVCacheManager.allocate_slots` ledger: a running request holds
@@ -246,6 +267,7 @@ impl KvStore for HybridGdnKv {
         if let Some(incremental) = self.incremental.as_mut() {
             incremental.free(request, self.state_tokens_per_request);
         }
+        self.forget_host_load(request);
         self.ledger.take_held(request);
         self.ledger.forget_promise(request);
         self.ledger.forget_chunked_prefill(request);
@@ -331,6 +353,7 @@ impl IterWorkerKv for HybridGdnKv {
         if let Some(incremental) = self.incremental.as_mut() {
             incremental.free(request, self.state_tokens_per_request);
         }
+        self.forget_host_load(request);
         let Some(partition) = self.ledger.forget_placement(request) else {
             self.ledger.take_held(request);
             self.ledger.forget_chunked_prefill(request);
@@ -380,7 +403,13 @@ impl PrefixKv for HybridGdnKv {
         let mut best_resident_tokens = 0;
         for (partition_index, prefix_cache) in self.prefix_caches.iter().enumerate() {
             // No fresh prompt length here: rank by the uncapped declaration.
-            let resident_tokens = prefix_cache.peek(session_id, declared_prefix_tokens);
+            let gpu_tokens = prefix_cache.peek(session_id, declared_prefix_tokens);
+            let resident_tokens = gpu_tokens.max(self.host_peek(
+                partition_index,
+                session_id,
+                gpu_tokens,
+                declared_prefix_tokens,
+            ));
             if resident_tokens > best_resident_tokens {
                 best_resident_tokens = resident_tokens;
                 best_partition = Some(
@@ -404,13 +433,25 @@ impl PrefixKv for HybridGdnKv {
                 session_id,
                 declared_prefix_tokens,
                 ..
-            } => self.prefix_caches[partition as usize].peek(
-                session_id,
-                self.lookup_reach(
+            } => {
+                let reach = self.lookup_reach(
                     declared_prefix_tokens,
                     declared_prefix_tokens.saturating_add(fresh_prompt_tokens),
-                ),
-            ),
+                );
+                let gpu_tokens = self.prefix_caches[partition as usize].peek(session_id, reach);
+                // A host tier is asked only past the GPU hit (vLLM looks up
+                // the external cache from the local hit on).
+                let host_tokens = self.host_peek(partition as usize, session_id, gpu_tokens, reach);
+                if host_tokens > gpu_tokens {
+                    return ResolvedPrefillContext::new(
+                        session_input,
+                        host_tokens,
+                        fresh_prompt_tokens,
+                    )
+                    .with_host_loaded_prefix(host_tokens - gpu_tokens);
+                }
+                gpu_tokens
+            }
         };
         ResolvedPrefillContext::new(session_input, resident_prefix_tokens, fresh_prompt_tokens)
     }
@@ -437,10 +478,10 @@ impl PrefixKv for HybridGdnKv {
             // exists), so the accounting keeps the boundary and tolerates the
             // one-token gap rather than inventing an unaligned snapshot.
             debug_assert!(
-                take_result
-                    .hit_tokens
-                    .abs_diff(resolved_prefill.resident_prefix_tokens())
-                    <= 1,
+                take_result.hit_tokens.abs_diff(
+                    resolved_prefill.resident_prefix_tokens()
+                        - resolved_prefill.host_loaded_prefix_tokens()
+                ) <= 1,
                 "prefill context changed between preview and reservation"
             );
             self.journal.record(PrefixCacheEvent {
@@ -462,6 +503,7 @@ impl PrefixKv for HybridGdnKv {
             });
             resolved_prefill =
                 resolved_prefill.with_cache_return_metadata(take_result.return_metadata);
+            self.activate_host_prefix(request, partition, session_id, resolved_prefill, now);
         }
         self.ledger.set_prefill_context(request, resolved_prefill);
         self.reserve(request, partition, footprint, now);
@@ -494,6 +536,21 @@ impl PrefixKv for HybridGdnKv {
             .decode_current_kv(request)
             .or(prompt_tokens)
             .unwrap_or(0);
+        if let Some(session_id) = session_id.filter(|_| self.host_offload.is_some()) {
+            // The connector's finish-time flush: the blocks completed since
+            // the prompt was stored, i.e. the decoded output.
+            let block = u64::from(self.checkpoint_interval_tokens);
+            let prompt_end = prompt_tokens.unwrap_or(0) / block * block;
+            self.host_store(
+                request,
+                partition,
+                session_id,
+                now,
+                prompt_end,
+                context_tokens,
+                &[],
+            );
+        }
         self.release(request, partition);
         if let Some(session_id) = session_id {
             if self.checkpoint_release.at_prefill_end() {
@@ -650,6 +707,8 @@ impl ChunkedPrefillKv for HybridGdnKv {
         debug_assert!(self.ledger.has_chunked_prefill(request));
         self.ledger.schedule_prefill_chunk(request, chunk_tokens);
         self.partitions[partition as usize].add_prefill_admit(request);
+        // A prompt that resumed from the host runs once its load landed.
+        self.forget_host_load(request);
     }
 
     fn complete_prefill_chunk(&mut self, request: RequestId) {
@@ -685,6 +744,9 @@ impl ChunkedPrefillKv for HybridGdnKv {
                     now,
                 );
             }
+        }
+        if let Some(session_id) = resolved_prefill.session_id() {
+            self.store_prompt_to_host(request, partition, session_id, resolved_prefill, now);
         }
     }
 
@@ -765,6 +827,22 @@ impl ChunkedPrefillKv for HybridGdnKv {
     fn hold_trailing_decode_row(&mut self, request: RequestId, partition: PartitionId) {
         self.partitions[partition as usize].hold_trailing_row(request);
     }
+
+    fn settle_host_transfers(&mut self, now: Time) {
+        if let Some(host) = self.host_offload.as_mut() {
+            for tier in &mut host.tiers {
+                tier.settle(now);
+            }
+        }
+    }
+
+    fn host_load_ready_at(&self, request: RequestId) -> Option<Time> {
+        self.host_offload
+            .as_ref()?
+            .tiers
+            .iter()
+            .find_map(|tier| tier.load_ready_at(request))
+    }
 }
 
 impl HybridGdnKv {
@@ -817,6 +895,7 @@ impl HybridGdnKv {
             eagle_replay_boundaries: false,
             checkpoint_release: CheckpointRelease::OnCompletion,
             incremental: None,
+            host_offload: None,
         }
     }
 
@@ -903,6 +982,186 @@ impl HybridGdnKv {
             .map(|cache| cache.with_match_unit(match_unit_tokens))
             .collect();
         self
+    }
+
+    /// vLLM's native CPU offload (`SimpleCPUOffloadConnector`, see
+    /// [`HostKvTier`]): each partition gets a host tier of `capacity_tokens`
+    /// (whole checkpoint-interval blocks of one rank), whose boundary states
+    /// cost `state_tokens` each and whose copies move `bytes_per_token` per
+    /// token equivalent at the configured rates. Needs
+    /// [`Self::with_eagle_replay_boundaries`] first: the host lookup is the
+    /// same EAGLE replay rule.
+    pub(crate) fn with_host_offload(
+        mut self,
+        capacity_tokens: u64,
+        state_tokens: u64,
+        bytes_per_token: f64,
+        config: HostOffloadConfig,
+        logger: Option<KvOffloadLogger>,
+    ) -> Self {
+        assert!(
+            self.eagle_replay_boundaries,
+            "a host KV tier is modeled only under EAGLE replay boundaries"
+        );
+        let block_tokens = u64::from(self.checkpoint_interval_tokens);
+        self.host_offload = Some(HostOffload {
+            tiers: (0..self.partitions.len())
+                .map(|_| {
+                    HostKvTier::new(
+                        capacity_tokens,
+                        block_tokens,
+                        state_tokens,
+                        bytes_per_token,
+                        config,
+                    )
+                })
+                .collect(),
+            logger,
+        });
+        self
+    }
+
+    /// The host tier's resume point for `session_id` on `partition` beyond a
+    /// GPU hit of `gpu_tokens`; 0 without a host tier or a deeper hit.
+    fn host_peek(&self, partition: usize, session_id: u32, gpu_tokens: u32, reach: u32) -> u32 {
+        self.host_offload.as_ref().map_or(0, |host| {
+            host.tiers[partition].peek(session_id, gpu_tokens, reach)
+        })
+    }
+
+    /// Admission of a session request on a worker with a host tier: issue the
+    /// H2D load of the part the host supplies, and log the tier split.
+    fn activate_host_prefix(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        session_id: u32,
+        resolved_prefill: ResolvedPrefillContext,
+        now: Time,
+    ) {
+        let Some(host) = self.host_offload.as_mut() else {
+            return;
+        };
+        let tier = &mut host.tiers[partition as usize];
+        let host_tokens = resolved_prefill.host_loaded_prefix_tokens();
+        let resident = resolved_prefill.resident_prefix_tokens();
+        let gpu_tokens = resident - host_tokens;
+        let load = (host_tokens > 0)
+            .then(|| tier.load(now, request, session_id, gpu_tokens, resident))
+            .unwrap_or_default();
+        let host_used_tokens = tier.used_tokens();
+        if let Some(logger) = host.logger.as_mut() {
+            logger.record(KvOffloadEvent {
+                partition_id: partition,
+                time: now,
+                operation: KvOffloadOperation::Activate,
+                request_id: request,
+                session_id,
+                gpu_hit_tokens: u64::from(gpu_tokens),
+                host_hit_tokens: if host_tokens > 0 {
+                    u64::from(resident)
+                } else {
+                    0
+                },
+                tokens: load.tokens,
+                bytes: load.bytes,
+                transfer_start: if host_tokens > 0 { load.start } else { now },
+                transfer_done: if host_tokens > 0 { load.done } else { now },
+                host_used_tokens,
+            });
+        }
+    }
+
+    /// The prompt's eager stores, at its prefill end: every attention block of
+    /// the prompt the host lacks, and the replay-boundary states the prefill
+    /// computed (those above its resume point), which the GPU hands over as
+    /// it caches them.
+    fn store_prompt_to_host(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        session_id: u32,
+        resolved_prefill: ResolvedPrefillContext,
+        now: Time,
+    ) {
+        if self.host_offload.is_none() {
+            return;
+        }
+        let block = u64::from(self.checkpoint_interval_tokens);
+        let prompt = u64::from(resolved_prefill.post_prefill_context_tokens());
+        let resident = u64::from(resolved_prefill.resident_prefix_tokens());
+        let boundaries: Vec<u64> = [
+            (prompt.saturating_sub(1) / block * block).saturating_sub(block),
+            (prompt / block * block).saturating_sub(block),
+        ]
+        .into_iter()
+        .filter(|&boundary| boundary > resident)
+        .collect();
+        self.host_store(request, partition, session_id, now, 0, prompt, &boundaries);
+    }
+
+    /// Queue one host store and log it and the evictions it caused.
+    #[allow(clippy::too_many_arguments)]
+    fn host_store(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        session_id: u32,
+        now: Time,
+        start: u64,
+        end: u64,
+        boundaries: &[u64],
+    ) {
+        let Some(host) = self.host_offload.as_mut() else {
+            return;
+        };
+        let tier = &mut host.tiers[partition as usize];
+        let mut evictions = Vec::new();
+        let receipt = tier.store(now, session_id, start, end, boundaries, &mut evictions);
+        let host_used_tokens = tier.used_tokens();
+        let Some(logger) = host.logger.as_mut() else {
+            return;
+        };
+        for eviction in evictions {
+            logger.record(KvOffloadEvent {
+                partition_id: partition,
+                time: now,
+                operation: KvOffloadOperation::Evict,
+                request_id: request,
+                session_id: eviction.session,
+                gpu_hit_tokens: 0,
+                host_hit_tokens: 0,
+                tokens: eviction.tokens,
+                bytes: 0,
+                transfer_start: now,
+                transfer_done: now,
+                host_used_tokens,
+            });
+        }
+        if let Some(receipt) = receipt {
+            logger.record(KvOffloadEvent {
+                partition_id: partition,
+                time: now,
+                operation: KvOffloadOperation::Store,
+                request_id: request,
+                session_id,
+                gpu_hit_tokens: 0,
+                host_hit_tokens: 0,
+                tokens: receipt.tokens,
+                bytes: receipt.bytes,
+                transfer_start: receipt.start,
+                transfer_done: receipt.done,
+                host_used_tokens,
+            });
+        }
+    }
+
+    fn forget_host_load(&mut self, request: RequestId) {
+        if let Some(host) = self.host_offload.as_mut() {
+            for tier in &mut host.tiers {
+                tier.forget_load(request);
+            }
+        }
     }
 
     /// How far a lookup for a prompt of `prompt_tokens` may reach into its
