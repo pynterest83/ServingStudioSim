@@ -171,4 +171,119 @@ mod tests {
         assert_eq!(rows, 16 * 8);
         assert!(!fields.contains_key("folded_rank_position"));
     }
+
+    /// A 6-wide verify corpus over the 288-expert, top-8 shape: the H200
+    /// GLM-5.3-Flash MTP-5 binding in miniature.
+    fn verify_corpus(tag: &str) -> ExpertDemand {
+        let dir = crate::timing::token_corpus::tests::temp_dir(tag);
+        crate::timing::token_corpus::tests::synthetic(&dir, 288, 8, 2, 64);
+        let manifest = dir.join("manifest.json");
+        ExpertDemand::corpus(manifest.to_str().unwrap(), 6, 0..2).unwrap()
+    }
+
+    fn token_axis(expert_demand: ExpertDemand) -> Vec<u32> {
+        let config = VllmFusedMoeDemandKernelConfig {
+            expert_demand,
+            ..config()
+        };
+        let axis = VllmFusedMoeDemandSpec::sweep_grid(&config).axes()[0].clone();
+        axis.into_iter().map(|tokens| tokens as u32).collect()
+    }
+
+    /// Without a bound the grid is the one every cached corpus config was
+    /// profiled on: the fixed head, the shared token axis, then 6 x (1..=8).
+    #[test]
+    fn a_corpus_without_a_bound_keeps_its_profiled_grid() {
+        let head = [1, 4, 8, 16, 32, 48];
+        let mut expected = head.to_vec();
+        expected.extend(
+            Axis::token_axis()
+                .into_iter()
+                .map(|tokens| tokens as u32)
+                .filter(|tokens| !head.contains(tokens)),
+        );
+        expected.extend([6, 12, 18, 24, 30, 36, 42]);
+        assert_eq!(token_axis(verify_corpus("axis-default")), expected);
+    }
+
+    /// A bound of 144 adds exactly the verify multiples 54..=144 -- the
+    /// 66-102-row decode batches the default grid crossed with one segment.
+    #[test]
+    fn a_bound_adds_the_verify_multiples_up_to_it() {
+        let default = token_axis(verify_corpus("axis-bound-base"));
+        let bounded = token_axis(
+            verify_corpus("axis-bound")
+                .with_axis_max_tokens(144)
+                .unwrap(),
+        );
+        assert_eq!(bounded[..default.len()], default[..]);
+        let added: Vec<u32> = bounded[default.len()..].to_vec();
+        assert_eq!(added, (9..=24).map(|blocks| 6 * blocks).collect::<Vec<_>>());
+        // A bound between multiples stops at the last whole block.
+        let floored = token_axis(
+            verify_corpus("axis-bound-floor")
+                .with_axis_max_tokens(149)
+                .unwrap(),
+        );
+        assert_eq!(floored, bounded);
+    }
+
+    /// The bound reaches the kernel-config record only when it is set, so a
+    /// config built without one keeps the identity its rows were recorded under.
+    #[test]
+    fn the_identity_names_the_bound_only_when_set() {
+        let demand = verify_corpus("axis-identity");
+        let identity = |expert_demand: ExpertDemand| {
+            VllmFusedMoeDemandKernelConfig {
+                expert_demand,
+                ..config()
+            }
+            .identity()
+        };
+        let default = identity(demand.clone());
+        let corpus = &default["expert_demand"]["corpus"];
+        assert!(corpus.is_object(), "{default}");
+        assert!(corpus.get("axis_max_tokens").is_none(), "{default}");
+        let mut keys: Vec<&str> = corpus
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "checksum_fnv1a64",
+                "data_file",
+                "group_size",
+                "layer_end",
+                "layer_start",
+                "num_experts",
+                "num_layers",
+                "num_tokens",
+                "sampling_candidates",
+                "schema_version",
+                "seed",
+                "top_k",
+            ]
+        );
+
+        let bounded = identity(demand.with_axis_max_tokens(144).unwrap());
+        assert_eq!(bounded["expert_demand"]["corpus"]["axis_max_tokens"], 144);
+        let mut stripped = bounded.clone();
+        stripped["expert_demand"]["corpus"]
+            .as_object_mut()
+            .unwrap()
+            .remove("axis_max_tokens");
+        assert_eq!(stripped, default, "the bound is the only identity change");
+        // A config serialized without the field reads back as no bound.
+        let ExpertDemand::Corpus(reread) = serde_json::from_value::<ExpertDemand>(
+            serde_json::to_value(verify_corpus("axis-reread")).unwrap(),
+        )
+        .unwrap() else {
+            panic!("a corpus reads back as a corpus");
+        };
+        assert_eq!(reread.axis_max_tokens, 0);
+    }
 }

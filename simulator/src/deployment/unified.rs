@@ -309,6 +309,7 @@ impl Deployment for UnifiedDeployment {
                 moe_backend,
                 mla_kv_cache_dtype,
                 kda_state_dtype,
+                moe_demand_axis_max_tokens,
                 ..
             } => {
                 ensure_speculative(&g.worker, *draft_tokens)?;
@@ -326,6 +327,7 @@ impl Deployment for UnifiedDeployment {
                     *moe_backend,
                     *mla_kv_cache_dtype,
                     *kda_state_dtype,
+                    *moe_demand_axis_max_tokens,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,

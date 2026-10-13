@@ -24,6 +24,13 @@ use super::token_corpus::{select_candidate, TokenCorpus, TokenCorpusConfig};
 /// The seed every demand source folds at, so a profiled shape is reproducible.
 const FOLD_SEED: u64 = 0xF01D_5EED;
 
+/// Verify-width multiples every corpus token axis profiles.
+const DEFAULT_VERIFY_MULTIPLES: u32 = 8;
+
+/// The most verify-width multiples an `axis_max_tokens` bound may ask for:
+/// each is one more profiled row per MoE launch, slice and backend.
+const MAX_VERIFY_MULTIPLES: u32 = 128;
+
 /// Payloads already read this process, keyed by the file, the checksum that
 /// identifies its contents, and every dimension `load` validated them against.
 ///
@@ -153,17 +160,61 @@ impl ExpertDemand {
     /// A block-structured batch only ever presents multiples of the verify
     /// width, and the small end of the axis is where the sources disagree most,
     /// so profiling those points is what keeps the cache from interpolating
-    /// across the interesting region.
+    /// across the interesting region. A corpus profiles the first eight
+    /// multiples, or every multiple up to its `axis_max_tokens` when that
+    /// reaches further.
     pub fn token_axis(&self, base: Vec<f64>) -> Vec<f64> {
         match self {
             Self::Popularity { .. } => base,
             Self::Corpus(config) => super::sweep::Axis::chain([
                 base,
-                (1..=8)
+                (1..=Self::verify_multiples(config))
                     .map(|multiple| f64::from(config.group_size) * f64::from(multiple))
                     .collect(),
             ]),
         }
+    }
+
+    /// Verify blocks a corpus's token axis profiles: eight, or as many whole
+    /// blocks as fit under its bound.
+    fn verify_multiples(config: &TokenCorpusConfig) -> u32 {
+        (config.axis_max_tokens / config.group_size).max(DEFAULT_VERIFY_MULTIPLES)
+    }
+
+    /// Profile verify-width multiples up to `max_tokens` instead of the first
+    /// eight.
+    ///
+    /// The default eight stop at 48 tokens for a 6-wide verify block, while a
+    /// decode batch of 11-17 such blocks presents 66-102 rows, and the token
+    /// axis has no other point between 64 and 128. A Triton MoE config that
+    /// changes `BLOCK_SIZE_M` inside that gap is then interpolated straight
+    /// across, so a deployment that lives there names its own bound.
+    ///
+    /// Only a corpus has a block structure to extend; a bound that adds no
+    /// block, or one so wide that it would multiply the profiled grid, is
+    /// refused rather than silently ignored.
+    pub fn with_axis_max_tokens(self, max_tokens: u32) -> anyhow::Result<Self> {
+        let Self::Corpus(mut config) = self else {
+            anyhow::bail!(
+                "a MoE demand axis bound needs routing=corpus: only a corpus samples verify blocks"
+            );
+        };
+        let multiples = max_tokens / config.group_size;
+        anyhow::ensure!(
+            multiples > DEFAULT_VERIFY_MULTIPLES,
+            "MoE demand axis bound {max_tokens} adds no verify block of {} tokens beyond the \
+             {DEFAULT_VERIFY_MULTIPLES} always profiled ({} tokens)",
+            config.group_size,
+            config.group_size * DEFAULT_VERIFY_MULTIPLES
+        );
+        anyhow::ensure!(
+            multiples <= MAX_VERIFY_MULTIPLES,
+            "MoE demand axis bound {max_tokens} asks for {multiples} verify blocks of {} tokens; \
+             at most {MAX_VERIFY_MULTIPLES} are profiled",
+            config.group_size
+        );
+        config.axis_max_tokens = max_tokens;
+        Ok(Self::Corpus(config))
     }
 }
 
@@ -450,6 +501,28 @@ mod tests {
                 "{multiple} verify blocks must be profiled"
             );
         }
+    }
+
+    #[test]
+    fn an_axis_bound_that_adds_no_verify_block_is_refused() {
+        let corpus = crate::timing::token_corpus::tests::synthetic(
+            &crate::timing::token_corpus::tests::temp_dir("axis-refused"),
+            256,
+            8,
+            4,
+            64,
+        );
+        // Group size 8: the default already reaches 64 tokens.
+        let refused = |demand: ExpertDemand, bound| {
+            format!("{:#}", demand.with_axis_max_tokens(bound).unwrap_err())
+        };
+        assert!(refused(ExpertDemand::Corpus(corpus.clone()), 71).contains("adds no verify block"));
+        assert!(refused(ExpertDemand::Corpus(corpus.clone()), 8 * 129).contains("at most 128"));
+        assert!(refused(popularity(64, 5), 144).contains("routing=corpus"));
+        let bounded = ExpertDemand::Corpus(corpus)
+            .with_axis_max_tokens(72)
+            .unwrap();
+        assert_eq!(bounded.token_axis(vec![]).last(), Some(&72.0));
     }
 
     /// A config that restates a cached corpus's dimensions gets the check a

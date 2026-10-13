@@ -667,6 +667,16 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(string, default = "fp32", choices = KDA_STATE_DTYPES, cache_key)]
         kda_state_dtype: KdaStateDtype,
+        /// Profile the routed MoE at every verify-width multiple up to this
+        /// many tokens (the body and MTP step 0; `routing = corpus` only).
+        /// Unset profiles the first eight multiples (48 tokens at MTP 5), and
+        /// the token axis has no other point between 64 and 128, where vLLM's
+        /// Triton config changes `BLOCK_SIZE_M`. A decode batch of 11-17
+        /// verify blocks (66-102 rows) is then interpolated across that
+        /// switch; 144 adds 54, 60, ..., 144.
+        #[serde(default)]
+        #[param(cache_key)]
+        moe_demand_axis_max_tokens: Option<u32>,
     },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by

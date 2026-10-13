@@ -51,6 +51,17 @@ pub struct TokenCorpusConfig {
     /// the active-group count the same way assuming balanced routing does.
     #[serde(default = "default_candidates")]
     pub sampling_candidates: u32,
+    /// Largest token count the sweep's verify-width multiples reach. Zero, the
+    /// default, profiles the first eight multiples, as every corpus always has;
+    /// a bound adds `group_size` multiples up to it, for a deployment whose
+    /// batches routinely present more than eight verify blocks. Left out of
+    /// the serialized form at zero, so a config without it keeps its identity.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub axis_max_tokens: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 fn default_candidates() -> u32 {
@@ -146,6 +157,8 @@ impl TokenCorpusConfig {
         config.seed = seed;
         config.layer_start = layers.start;
         config.layer_end = layers.end;
+        // A sweep bound is the deployment's choice, never the capture's.
+        config.axis_max_tokens = 0;
         config.validate()?;
         Ok(config)
     }

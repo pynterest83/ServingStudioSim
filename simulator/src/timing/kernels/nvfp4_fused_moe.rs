@@ -382,6 +382,7 @@ mod tests {
                 layer_end: 4,
                 seed: 0,
                 sampling_candidates: 16,
+                axis_max_tokens: 0,
             },
         );
 

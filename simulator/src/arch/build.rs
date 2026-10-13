@@ -1295,6 +1295,7 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe_speculative_model(
     moe_backend: FusedMoeBackend,
     mla_kv_cache_dtype: MlaKvCacheDtype,
     kda_state_dtype: KdaStateDtype,
+    moe_demand_axis_max_tokens: Option<u32>,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1324,12 +1325,12 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe_speculative_model(
     let verify_width = draft_tokens
         .checked_add(1)
         .context("speculative draft_tokens + 1 overflows u32")?;
-    let body = routed_layers as usize;
-    let demand = Glm53FlashSpecDemand {
-        body: source.demand(0..body, verify_width)?,
-        mtp_step0: source.demand(body..body + 1, verify_width)?,
-        mtp_recurrent: source.demand(body..body + 1, 1)?,
-    };
+    let demand = glm53_flash_spec_demand(
+        &source,
+        routed_layers as usize,
+        verify_width,
+        moe_demand_axis_max_tokens,
+    )?;
     let parallel = Glm53FlashSpecParallel {
         tp_size,
         max_model_len,
@@ -1347,6 +1348,34 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe_speculative_model(
     let resolved = glm53_flash_vllm_fp8_kda_dsa_moe_speculative::resolve_configs(&configs);
     glm53_flash_vllm_fp8_kda_dsa_moe_speculative::build(name.to_string(), resolved, bridge)
         .context("building H200 GLM-5.3-Flash MTP model (often a missing profile.db row)")
+}
+
+/// The H200 GLM-5.3-Flash MTP model's three MoE demands: the body and MTP step
+/// 0 at the verify width, the later MTP steps at width 1.
+///
+/// `axis_max_tokens` widens the verify-width callables only: the later MTP
+/// steps present one row per request, already on the token axis's dense small
+/// end, and a width-1 bound would add a profiled point per token.
+fn glm53_flash_spec_demand(
+    source: &ExpertDemandSource<'_>,
+    body: usize,
+    verify_width: u32,
+    axis_max_tokens: Option<u32>,
+) -> Result<Glm53FlashSpecDemand> {
+    let verify_demand = |layers: std::ops::Range<usize>| -> Result<ExpertDemand> {
+        let demand = source.demand(layers, verify_width)?;
+        match axis_max_tokens {
+            Some(max_tokens) => demand
+                .with_axis_max_tokens(max_tokens)
+                .context("moe_demand_axis_max_tokens"),
+            None => Ok(demand),
+        }
+    };
+    Ok(Glm53FlashSpecDemand {
+        body: verify_demand(0..body)?,
+        mtp_step0: verify_demand(body..body + 1)?,
+        mtp_recurrent: source.demand(body..body + 1, 1)?,
+    })
 }
 
 /// Build the GLM target graph driven by a DFlash2 block-parallel proposer.
@@ -1985,6 +2014,7 @@ pub fn build_speculative_iter_model(
             moe_backend,
             mla_kv_cache_dtype,
             kda_state_dtype,
+            moe_demand_axis_max_tokens,
         } => Ok((
             Box::new(glm53_flash_vllm_fp8_kda_dsa_moe_speculative_model(
                 model,
@@ -2000,6 +2030,7 @@ pub fn build_speculative_iter_model(
                 *moe_backend,
                 *mla_kv_cache_dtype,
                 *kda_state_dtype,
+                *moe_demand_axis_max_tokens,
                 gpu,
                 name,
                 bridge,
@@ -2479,6 +2510,44 @@ mod tests {
             !mtp.token_axis(vec![1.0]).contains(&48.0),
             "a width-1 draft pass has no block structure to widen the axis for"
         );
+    }
+
+    /// The MTP selector's axis bound reaches the body and the MTP step-0
+    /// demand, and only those; without it all three keep their default axes.
+    #[test]
+    fn the_moe_demand_axis_bound_widens_only_the_verify_width_callables() {
+        let dir = crate::timing::token_corpus::tests::temp_dir("arch-corpus-axis");
+        let corpus = crate::timing::token_corpus::tests::synthetic(&dir, 64, 4, 8, 512);
+        let manifest = corpus.data_file.replace("routes.u16", "manifest.json");
+        let source = ExpertDemandSource {
+            kind: RoutingKind::Corpus,
+            seed: None,
+            num_experts: 64,
+            experts_per_token: 4,
+            ep_size: 1,
+            expert_popularity_file: None,
+            token_corpus_file: Some(&manifest),
+            num_routed_layers: 7,
+        };
+        let top = |demand: &ExpertDemand| demand.token_axis(vec![]).last().copied();
+
+        let default = glm53_flash_spec_demand(&source, 7, 6, None).unwrap();
+        assert_eq!(top(&default.body), Some(48.0));
+        assert_eq!(top(&default.mtp_step0), Some(48.0));
+        assert_eq!(top(&default.mtp_recurrent), Some(8.0));
+
+        let bounded = glm53_flash_spec_demand(&source, 7, 6, Some(144)).unwrap();
+        assert_eq!(top(&bounded.body), Some(144.0));
+        assert_eq!(top(&bounded.mtp_step0), Some(144.0));
+        assert_eq!(bounded.mtp_recurrent, default.mtp_recurrent);
+
+        let popularity = ExpertDemandSource {
+            kind: RoutingKind::Uniform,
+            token_corpus_file: None,
+            ..source
+        };
+        let error = glm53_flash_spec_demand(&popularity, 7, 6, Some(144)).unwrap_err();
+        assert!(format!("{error:#}").contains("routing=corpus"), "{error:#}");
     }
 
     #[test]
