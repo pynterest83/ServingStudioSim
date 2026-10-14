@@ -227,7 +227,9 @@ pub(crate) fn build_hybrid_speculative_worker<M: SpeculativeUnifiedModel>(
         SpeculativeDecodeCompletion::new(
             draft_tokens,
             config.speculative_acceptance_seed.unwrap_or(0),
-        ),
+        )
+        .with_position_bands(config.speculative_acceptance_position_bands)
+        .with_request_spread(config.speculative_acceptance_request_spread),
         drafting_slots,
     );
     let admission = match config.max_running_requests {

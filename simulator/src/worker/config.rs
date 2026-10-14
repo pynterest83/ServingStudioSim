@@ -534,6 +534,28 @@ pub enum IterWorkerSel {
         /// selects which deterministic stream, not whether there is one.
         #[serde(default)]
         acceptance_seed: Option<u64>,
+        /// Opt-in output-position acceptance: inclusive upper bounds on the
+        /// output tokens a request has emitted before a verify, strictly
+        /// increasing, one per band except the open last band. Together with
+        /// `acceptance_position_band_rates` the bands REPLACE every request's
+        /// own `accept_rate` (measured MTP acceptance rises with the position
+        /// in the output; a pooled per-request chain makes short requests'
+        /// TPOT optimistic). Pair with pooled-chain traces. Empty (the
+        /// default) draws from each request's own chain.
+        #[serde(default)]
+        acceptance_position_band_max_tokens: Vec<u32>,
+        /// Conditional acceptance per band and draft position, band-major:
+        /// `(len(acceptance_position_band_max_tokens) + 1) * draft_tokens`
+        /// values in [0, 1]. Empty (the default) leaves the knob off.
+        #[serde(default)]
+        acceptance_position_band_rates: Vec<f32>,
+        /// Opt-in per-request acceptance spread: each request draws one odds
+        /// multiplier from this list (uniformly, keyed by acceptance_seed and
+        /// request id) and every draft-position probability p of its chain
+        /// becomes p*m / (1 - p + p*m). Values finite and > 0, at most 64.
+        /// Empty (the default) leaves every chain unscaled.
+        #[serde(default)]
+        acceptance_request_odds_multipliers: Vec<f32>,
         /// How resident decode shares an iteration with chunked prefill. See
         /// [`IterWorkerSel::ChunkedPrefill`]. Defaults to mixed batches;
         /// separate-prefill-priority also works and defers resident decode

@@ -15,7 +15,8 @@ mod prefill_handoff_admission;
 mod token_budget;
 
 pub use decode_completion::{
-    DecodeCompletion, SingleTokenDecodeCompletion, SpeculativeDecodeCompletion,
+    AcceptancePositionBands, AcceptanceRequestSpread, DecodeCompletion,
+    SingleTokenDecodeCompletion, SpeculativeDecodeCompletion,
 };
 pub use fresh_request_slot_admission::FreshRequestSlotAdmission;
 pub use local_prefill_decode_admission::LocalPrefillDecodeAdmission;

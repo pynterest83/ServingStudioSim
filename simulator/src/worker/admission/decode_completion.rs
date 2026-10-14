@@ -96,12 +96,188 @@ impl<K: IterWorkerKv> DecodeCompletion<K> for SingleTokenDecodeCompletion {
     }
 }
 
+/// Opt-in acceptance chains keyed by output position: the verify of a request
+/// that has already emitted `n` output tokens draws from the chain of the first
+/// band whose inclusive upper bound is `>= n` (the last band is open).
+///
+/// Measured MTP acceptance rises with the position inside the output (on the
+/// agentic GLM passes, tokens per verify go from ~3.9 over the first 64 output
+/// tokens to ~5.4 beyond 8k) and barely depends on the request's total length
+/// once the position is fixed. One pooled chain per request matches the pooled
+/// tokens per verify yet gives short requests the acceptance of long ones, so
+/// their TPOT, and therefore the request-level TPOT percentiles, come out
+/// optimistic. When set, the bands REPLACE the request's own `accept_rate`, so
+/// pair them with pooled-chain traces, not per-request measured chains (which
+/// already carry the position effect of that request's length).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AcceptancePositionBands {
+    /// Inclusive upper bounds on output tokens emitted before the verify, one
+    /// per band except the open last one; strictly increasing. Only the first
+    /// `bands - 1` entries are live. Fixed capacity keeps the worker
+    /// configuration `Copy`.
+    max_output_tokens: [u32; MAX_ACCEPTANCE_BANDS - 1],
+    /// One per-position conditional chain per band; only the first `bands`
+    /// rows and `draft_tokens` columns are live.
+    rates: [[f32; MAX_BAND_DRAFT_TOKENS]; MAX_ACCEPTANCE_BANDS],
+    bands: usize,
+    draft_tokens: usize,
+}
+
+/// Most output-position bands [`AcceptancePositionBands`] holds.
+pub const MAX_ACCEPTANCE_BANDS: usize = 16;
+/// Widest draft window [`AcceptancePositionBands`] holds.
+pub const MAX_BAND_DRAFT_TOKENS: usize = 16;
+
+impl AcceptancePositionBands {
+    /// Build from the selector's flat lists: `rates` holds
+    /// `(max_output_tokens.len() + 1) * draft_tokens` conditional probabilities,
+    /// band-major. Both lists empty means the knob is off (`Ok(None)`).
+    pub fn from_flat(
+        max_output_tokens: &[u32],
+        rates: &[f32],
+        draft_tokens: u32,
+    ) -> Result<Option<Self>, String> {
+        if max_output_tokens.is_empty() && rates.is_empty() {
+            return Ok(None);
+        }
+        let width = draft_tokens as usize;
+        if width == 0 || width > MAX_BAND_DRAFT_TOKENS {
+            return Err(format!(
+                "acceptance position bands need a draft width in 1..={MAX_BAND_DRAFT_TOKENS}, \
+                 got {width}"
+            ));
+        }
+        let bands = max_output_tokens.len() + 1;
+        if bands > MAX_ACCEPTANCE_BANDS {
+            return Err(format!(
+                "acceptance_position_band_max_tokens allows at most {} bounds, got {}",
+                MAX_ACCEPTANCE_BANDS - 1,
+                max_output_tokens.len()
+            ));
+        }
+        if rates.len() != bands * width {
+            return Err(format!(
+                "acceptance_position_band_rates must hold {bands} bands x {width} draft \
+                 positions = {} values (one band per acceptance_position_band_max_tokens \
+                 bound plus the open last band), got {}",
+                bands * width,
+                rates.len()
+            ));
+        }
+        if max_output_tokens.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(
+                "acceptance_position_band_max_tokens must be strictly increasing".to_string(),
+            );
+        }
+        if let Some(rate) = rates
+            .iter()
+            .find(|rate| !rate.is_finite() || !(0.0..=1.0).contains(*rate))
+        {
+            return Err(format!(
+                "acceptance_position_band_rates must lie in [0, 1], got {rate}"
+            ));
+        }
+        let mut out = Self {
+            max_output_tokens: [0; MAX_ACCEPTANCE_BANDS - 1],
+            rates: [[0.0; MAX_BAND_DRAFT_TOKENS]; MAX_ACCEPTANCE_BANDS],
+            bands,
+            draft_tokens: width,
+        };
+        out.max_output_tokens[..bands - 1].copy_from_slice(max_output_tokens);
+        for (row, chain) in out.rates.iter_mut().zip(rates.chunks(width)) {
+            row[..width].copy_from_slice(chain);
+        }
+        Ok(Some(out))
+    }
+
+    /// The conditional chain a verify draws from after `output_tokens_emitted`
+    /// tokens, one probability per draft position.
+    fn chain_for(&self, output_tokens_emitted: u32) -> &[f32] {
+        let band = self.max_output_tokens[..self.bands - 1]
+            .partition_point(|bound| *bound < output_tokens_emitted);
+        &self.rates[band][..self.draft_tokens]
+    }
+}
+
+/// Opt-in per-request acceptance spread: every request draws one odds
+/// multiplier `m` (uniformly from the list, keyed by seed and request id, so it
+/// is fixed for the request's life and independent of batching), and each draft
+/// position's conditional probability `p` of its chain becomes
+/// `p m / (1 - p + p m)`.
+///
+/// Measured per-request tokens per verify spread far wider than the per-step
+/// Bernoulli noise of one shared chain (agentic GLM passes: sd ~0.8 vs ~0.2 at
+/// 257-1024 output tokens), so the slowest-accepting requests set the TPOT
+/// tail. The list is typically lognormal quantiles recentered so the pooled
+/// tokens per verify is unchanged. Odds scaling needs no transcendental
+/// function, keeping runs bit-identical across machines.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AcceptanceRequestSpread {
+    multipliers: [f32; MAX_ACCEPTANCE_SPREAD],
+    len: usize,
+}
+
+/// Most odds multipliers [`AcceptanceRequestSpread`] holds.
+pub const MAX_ACCEPTANCE_SPREAD: usize = 64;
+
+/// Decorrelates the per-request multiplier draw from the per-step draws.
+const REQUEST_SPREAD_SALT: u64 = 0xA5A5_5A5A_C3C3_3C3C;
+
+impl AcceptanceRequestSpread {
+    /// Build from the selector's list; empty means the knob is off.
+    pub fn from_list(multipliers: &[f32]) -> Result<Option<Self>, String> {
+        if multipliers.is_empty() {
+            return Ok(None);
+        }
+        if multipliers.len() > MAX_ACCEPTANCE_SPREAD {
+            return Err(format!(
+                "acceptance_request_odds_multipliers allows at most {MAX_ACCEPTANCE_SPREAD} \
+                 values, got {}",
+                multipliers.len()
+            ));
+        }
+        if let Some(value) = multipliers
+            .iter()
+            .find(|value| !value.is_finite() || **value <= 0.0)
+        {
+            return Err(format!(
+                "acceptance_request_odds_multipliers must be finite and > 0, got {value}"
+            ));
+        }
+        let mut out = Self {
+            multipliers: [1.0; MAX_ACCEPTANCE_SPREAD],
+            len: multipliers.len(),
+        };
+        out.multipliers[..multipliers.len()].copy_from_slice(multipliers);
+        Ok(Some(out))
+    }
+
+    /// The odds multiplier `request` keeps for its whole life under `seed`.
+    fn multiplier(&self, seed: u64, request: RequestId) -> f64 {
+        let key =
+            (seed ^ REQUEST_SPREAD_SALT) ^ u64::from(request.0).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+        f64::from(self.multipliers[(splitmix64(key) % self.len as u64) as usize])
+    }
+}
+
+/// `p` with its odds scaled by `multiplier`; exact at 0 and 1.
+fn scale_odds(p: f32, multiplier: f64) -> f32 {
+    let p = f64::from(p);
+    (p * multiplier / (1.0 - p + p * multiplier)) as f32
+}
+
 /// The speculating engine: a fixed `draft_tokens + 1` verify window per resident
 /// request, retiring the target's own token plus the leading run of accepted
 /// drafts.
 pub struct SpeculativeDecodeCompletion {
     draft_tokens: u32,
     seed: u64,
+    /// Opt-in output-position acceptance that replaces each request's own
+    /// chain; `None` (the default) draws from the request's `accept_rate`.
+    position_bands: Option<AcceptancePositionBands>,
+    /// Opt-in per-request odds multiplier on every position probability;
+    /// `None` (the default) leaves the chain as is.
+    request_spread: Option<AcceptanceRequestSpread>,
     /// Scratch, indexed by retired count: `request_buckets[n]` holds the
     /// requests that retired `n` tokens this iteration. Requests in the same
     /// iteration advance by different distances, so KV takes one
@@ -123,8 +299,24 @@ impl SpeculativeDecodeCompletion {
         Self {
             draft_tokens,
             seed,
+            position_bands: None,
+            request_spread: None,
             request_buckets: vec![Vec::new(); bucket_count],
         }
+    }
+
+    /// Draw every verify from the output-position chains instead of the
+    /// request's own `accept_rate` (see [`AcceptancePositionBands`]).
+    pub(crate) fn with_position_bands(mut self, bands: Option<AcceptancePositionBands>) -> Self {
+        self.position_bands = bands;
+        self
+    }
+
+    /// Give every request a fixed odds multiplier on its chain (see
+    /// [`AcceptanceRequestSpread`]).
+    pub(crate) fn with_request_spread(mut self, spread: Option<AcceptanceRequestSpread>) -> Self {
+        self.request_spread = spread;
+        self
     }
 
     /// Tokens this verify retires: the target's own token, plus the leading run
@@ -136,9 +328,24 @@ impl SpeculativeDecodeCompletion {
         accept_rate: &AcceptanceProfile,
         remaining_output_tokens: u32,
     ) -> u32 {
+        let band_chain = self
+            .position_bands
+            .as_ref()
+            .map(|bands| bands.chain_for(output_tokens_emitted));
+        let multiplier = self
+            .request_spread
+            .as_ref()
+            .map(|spread| spread.multiplier(self.seed, request));
         let mut accepted = 1_u32;
         for draft_position in 0..self.draft_tokens {
-            let position_rate = accept_rate.at_position(draft_position, self.draft_tokens);
+            let position_rate = match band_chain {
+                Some(chain) => chain[draft_position as usize],
+                None => accept_rate.at_position(draft_position, self.draft_tokens),
+            };
+            let position_rate = match multiplier {
+                Some(multiplier) => scale_odds(position_rate, multiplier),
+                None => position_rate,
+            };
             if !bernoulli(
                 self.seed,
                 request,
@@ -685,5 +892,159 @@ mod tests {
         let mut grown = 0;
         kv_store.visit_decode_members(0, |_, current_kv| grown = current_kv - 8);
         assert_eq!(grown, 1);
+    }
+
+    fn bands(max_output_tokens: &[u32], rates: &[f32]) -> AcceptancePositionBands {
+        AcceptancePositionBands::from_flat(max_output_tokens, rates, DRAFT_TOKENS)
+            .unwrap()
+            .expect("non-empty lists build bands")
+    }
+
+    #[test]
+    fn empty_position_band_lists_leave_the_knob_off() {
+        assert_eq!(
+            AcceptancePositionBands::from_flat(&[], &[], DRAFT_TOKENS),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn position_bands_select_by_tokens_already_emitted_with_inclusive_bounds() {
+        let bands = bands(&[1, 4], &[0.1, 0.1, 0.1, 0.2, 0.2, 0.2, 0.3, 0.3, 0.3]);
+        let first = |emitted| bands.chain_for(emitted)[0];
+        assert_eq!(first(0), 0.1);
+        assert_eq!(first(1), 0.1, "the bound is inclusive");
+        assert_eq!(first(2), 0.2);
+        assert_eq!(first(4), 0.2);
+        assert_eq!(first(5), 0.3, "past the last bound the open band applies");
+        assert_eq!(first(u32::MAX), 0.3);
+    }
+
+    #[test]
+    fn malformed_position_bands_are_refused() {
+        let build = |bounds: &[u32], rates: &[f32]| {
+            AcceptancePositionBands::from_flat(bounds, rates, DRAFT_TOKENS)
+        };
+        assert!(build(&[8], &[0.5; 3]).unwrap_err().contains("2 bands x 3"));
+        assert!(build(&[], &[0.5; 4]).is_err());
+        assert!(build(&[8, 8], &[0.5; 9])
+            .unwrap_err()
+            .contains("strictly increasing"));
+        assert!(build(&[8], &[0.5, 0.5, 0.5, 0.5, 1.5, 0.5])
+            .unwrap_err()
+            .contains("[0, 1]"));
+        assert!(build(&[8], &[0.5, 0.5, 0.5, 0.5, f32::NAN, 0.5]).is_err());
+        assert!(AcceptancePositionBands::from_flat(&[], &[0.5], 0).is_err());
+        let too_many: Vec<u32> = (1..=MAX_ACCEPTANCE_BANDS as u32).collect();
+        let rates = vec![0.5; (too_many.len() + 1) * DRAFT_TOKENS as usize];
+        assert!(build(&too_many, &rates).unwrap_err().contains("at most"));
+    }
+
+    #[test]
+    fn position_bands_replace_the_request_chain_by_output_position() {
+        // The request's own chain accepts nothing; the first band (<= 1 token
+        // emitted, i.e. the first verify after prefill) accepts every draft and
+        // the open band accepts nothing again.
+        let (mut kv_store, context) = one_resident_decode(64, 63, uniform(0.0));
+        let mut policy = SpeculativeDecodeCompletion::new(DRAFT_TOKENS, 7)
+            .with_position_bands(Some(bands(&[1], &[1.0, 1.0, 1.0, 0.0, 0.0, 0.0])));
+        assert_eq!(
+            run_one_iteration(&mut policy, &mut kv_store, &context),
+            (DRAFT_TOKENS + 1, u64::from(DRAFT_TOKENS + 1)),
+            "one emitted token falls in the first band: the whole window is accepted"
+        );
+        assert_eq!(
+            run_one_iteration(&mut policy, &mut kv_store, &context),
+            (1, u64::from(DRAFT_TOKENS + 2)),
+            "five emitted tokens fall in the open band: only the target token \
+             (KV growth is cumulative over both verifies)"
+        );
+    }
+
+    #[test]
+    fn absent_position_bands_draw_exactly_the_request_chain() {
+        // Same seed and request: `with_position_bands(None)` must not touch the
+        // keyed draws, so every existing run stays bit-identical.
+        let draws = |policy: SpeculativeDecodeCompletion| {
+            let (mut kv_store, context) = one_resident_decode(4096, 4095, uniform(0.7));
+            let mut policy = policy;
+            (0..200)
+                .map(|_| run_one_iteration(&mut policy, &mut kv_store, &context).0)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            draws(SpeculativeDecodeCompletion::new(DRAFT_TOKENS, 11)),
+            draws(SpeculativeDecodeCompletion::new(DRAFT_TOKENS, 11).with_position_bands(None))
+        );
+    }
+
+    #[test]
+    fn an_empty_spread_is_off_and_malformed_spreads_are_refused() {
+        assert_eq!(AcceptanceRequestSpread::from_list(&[]), Ok(None));
+        assert!(AcceptanceRequestSpread::from_list(&[1.0, 0.0])
+            .unwrap_err()
+            .contains("> 0"));
+        assert!(AcceptanceRequestSpread::from_list(&[f32::INFINITY]).is_err());
+        assert!(
+            AcceptanceRequestSpread::from_list(&[1.0; MAX_ACCEPTANCE_SPREAD + 1])
+                .unwrap_err()
+                .contains("at most")
+        );
+    }
+
+    #[test]
+    fn odds_scaling_is_exact_at_the_ends_and_monotone() {
+        assert_eq!(scale_odds(0.0, 3.0), 0.0);
+        assert_eq!(scale_odds(1.0, 0.25), 1.0);
+        assert!((scale_odds(0.5, 3.0) - 0.75).abs() < 1e-6, "odds 1 -> 3");
+        assert!((scale_odds(0.8, 1.0) - 0.8).abs() < 1e-7);
+        assert!(scale_odds(0.8, 0.5) < 0.8 && scale_odds(0.8, 2.0) > 0.8);
+    }
+
+    #[test]
+    fn a_unit_spread_draws_exactly_the_request_chain() {
+        // m = 1 is the identity on every probability, so the keyed draws, and
+        // with them every retired count, are unchanged.
+        let draws = |policy: SpeculativeDecodeCompletion| {
+            let (mut kv_store, context) = one_resident_decode(4096, 4095, uniform(0.7));
+            let mut policy = policy;
+            (0..200)
+                .map(|_| run_one_iteration(&mut policy, &mut kv_store, &context).0)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            draws(SpeculativeDecodeCompletion::new(DRAFT_TOKENS, 11)),
+            draws(
+                SpeculativeDecodeCompletion::new(DRAFT_TOKENS, 11)
+                    .with_request_spread(AcceptanceRequestSpread::from_list(&[1.0, 1.0]).unwrap())
+            )
+        );
+    }
+
+    #[test]
+    fn the_request_spread_is_fixed_per_request_and_scales_its_whole_chain() {
+        // A huge multiplier turns p = 0.5 into ~1 for every position; a tiny
+        // one into ~0. Each request keeps the same draw for its whole life, and
+        // with two values both appear across enough requests.
+        let spread = AcceptanceRequestSpread::from_list(&[1e9, 1e-9])
+            .unwrap()
+            .unwrap();
+        let policy =
+            SpeculativeDecodeCompletion::new(DRAFT_TOKENS, 5).with_request_spread(Some(spread));
+        let half = AcceptanceProfile::Uniform(0.5);
+        let mut seen = [false; 2];
+        for request in 0..64 {
+            let first = policy.accepted_length(RequestId(request), 1, &half, 100);
+            assert!(first == 1 || first == DRAFT_TOKENS + 1, "{first}");
+            for emitted in [7, 50, 99] {
+                assert_eq!(
+                    policy.accepted_length(RequestId(request), emitted, &half, 100),
+                    first,
+                    "the multiplier must not change within a request"
+                );
+            }
+            seen[usize::from(first == 1)] = true;
+        }
+        assert_eq!(seen, [true, true]);
     }
 }

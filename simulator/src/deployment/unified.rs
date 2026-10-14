@@ -189,6 +189,12 @@ impl Deployment for UnifiedDeployment {
             ssm_checkpoint_interval_tokens: ssm_checkpoint_interval_tokens(&g.worker),
             speculative_draft_tokens: speculative_draft_tokens(&g.worker),
             speculative_acceptance_seed: speculative_acceptance_seed(&g.worker),
+            speculative_acceptance_position_bands: speculative_acceptance_position_bands(
+                &g.worker,
+            )?,
+            speculative_acceptance_request_spread: speculative_acceptance_request_spread(
+                &g.worker,
+            )?,
             eagle_block_drop: eagle_block_drop(&g.worker),
             prefix_match_unit_tokens: prefix_match_unit_tokens(&g.worker)?,
             async_scheduling: async_scheduling(&g.worker),
@@ -1054,6 +1060,45 @@ fn speculative_acceptance_seed(worker: &IterWorkerSel) -> Option<u64> {
     }
 }
 
+/// The opt-in output-position acceptance chains of a speculative worker,
+/// validated against its draft width. `None` when both lists are empty or the
+/// worker does not speculate.
+fn speculative_acceptance_position_bands(
+    worker: &IterWorkerSel,
+) -> anyhow::Result<Option<crate::worker::admission::AcceptancePositionBands>> {
+    match worker {
+        IterWorkerSel::Speculative {
+            draft_tokens,
+            acceptance_position_band_max_tokens,
+            acceptance_position_band_rates,
+            ..
+        } => crate::worker::admission::AcceptancePositionBands::from_flat(
+            acceptance_position_band_max_tokens,
+            acceptance_position_band_rates,
+            *draft_tokens,
+        )
+        .map_err(|error| anyhow::anyhow!(error)),
+        _ => Ok(None),
+    }
+}
+
+/// The opt-in per-request acceptance odds multipliers of a speculative worker.
+/// `None` when the list is empty or the worker does not speculate.
+fn speculative_acceptance_request_spread(
+    worker: &IterWorkerSel,
+) -> anyhow::Result<Option<crate::worker::admission::AcceptanceRequestSpread>> {
+    match worker {
+        IterWorkerSel::Speculative {
+            acceptance_request_odds_multipliers,
+            ..
+        } => crate::worker::admission::AcceptanceRequestSpread::from_list(
+            acceptance_request_odds_multipliers,
+        )
+        .map_err(|error| anyhow::anyhow!(error)),
+        _ => Ok(None),
+    }
+}
+
 /// The speculative GLM arch pairs only with the speculative worker: it builds a
 /// different model type, so no other recipe can even name it.
 fn ensure_speculative(worker: &IterWorkerSel, arch_draft_tokens: u32) -> anyhow::Result<()> {
@@ -1480,6 +1525,9 @@ pools:
             max_batch_tokens: 8192,
             draft_tokens,
             acceptance_seed: Some(7),
+            acceptance_position_band_max_tokens: Vec::new(),
+            acceptance_position_band_rates: Vec::new(),
+            acceptance_request_odds_multipliers: Vec::new(),
             batch_policy: BatchPolicy::Mix,
             kv_admission: Default::default(),
             gpu_time_multiplier: 1.0,
@@ -1566,6 +1614,62 @@ pools:
         fn gpus_per_replica(&self) -> u16 {
             1
         }
+    }
+
+    #[test]
+    fn acceptance_position_bands_are_opt_in_and_validated_against_the_draft_width() {
+        assert_eq!(
+            speculative_acceptance_position_bands(&speculative_worker(2)).unwrap(),
+            None
+        );
+        assert_eq!(
+            speculative_acceptance_position_bands(&barebone_worker()).unwrap(),
+            None
+        );
+        let parse = |lists: &str| -> IterWorkerSel {
+            serde_yaml::from_str(&format!(
+                "type: speculative\nattn_gpu_memory_gb: 80.0\nmax_batch_tokens: 8192\n\
+                 draft_tokens: 2\n{lists}"
+            ))
+            .expect("parse speculative worker")
+        };
+        let worker = parse(
+            "acceptance_position_band_max_tokens: [64]\n\
+             acceptance_position_band_rates: [0.8, 0.7, 0.95, 0.9]\n",
+        );
+        assert_eq!(
+            speculative_acceptance_position_bands(&worker).unwrap(),
+            crate::worker::admission::AcceptancePositionBands::from_flat(
+                &[64],
+                &[0.8, 0.7, 0.95, 0.9],
+                2
+            )
+            .unwrap()
+        );
+        assert!(speculative_acceptance_position_bands(&worker)
+            .unwrap()
+            .is_some());
+        let error = speculative_acceptance_position_bands(&parse(
+            "acceptance_position_band_max_tokens: [64]\n\
+             acceptance_position_band_rates: [0.8, 0.7, 0.95]\n",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("2 bands x 2"), "{error}");
+
+        assert_eq!(
+            speculative_acceptance_request_spread(&speculative_worker(2)).unwrap(),
+            None
+        );
+        let spread = parse("acceptance_request_odds_multipliers: [0.5, 1.0, 2.0]\n");
+        assert_eq!(
+            speculative_acceptance_request_spread(&spread).unwrap(),
+            crate::worker::admission::AcceptanceRequestSpread::from_list(&[0.5, 1.0, 2.0]).unwrap()
+        );
+        assert!(speculative_acceptance_request_spread(&parse(
+            "acceptance_request_odds_multipliers: [0.5, -1.0]\n"
+        ))
+        .is_err());
     }
 
     #[test]

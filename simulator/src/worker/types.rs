@@ -529,6 +529,15 @@ pub struct WorkerConfig {
     /// draw must be reproducible run-to-run like every other modeled quantity,
     /// so this selects *which* deterministic stream, never whether there is one.
     pub speculative_acceptance_seed: Option<u64>,
+    /// Opt-in output-position acceptance chains that replace each request's
+    /// own `accept_rate` (from the `speculative` selector). `None` (the
+    /// default) draws from the request's chain.
+    pub speculative_acceptance_position_bands:
+        Option<crate::worker::admission::AcceptancePositionBands>,
+    /// Opt-in per-request odds multiplier on every acceptance probability
+    /// (from the `speculative` selector). `None` (the default) is off.
+    pub speculative_acceptance_request_spread:
+        Option<crate::worker::admission::AcceptanceRequestSpread>,
     /// Reproduce vLLM's `use_eagle_block_drop` chunk split (from the
     /// `speculative` selector). Only the hybrid speculative recipe reads it.
     pub eagle_block_drop: bool,
@@ -577,6 +586,8 @@ impl Default for WorkerConfig {
             ssm_checkpoint_interval_tokens: None,
             speculative_draft_tokens: 0,
             speculative_acceptance_seed: None,
+            speculative_acceptance_position_bands: None,
+            speculative_acceptance_request_spread: None,
             eagle_block_drop: false,
             prefix_match_unit_tokens: None,
             async_scheduling: false,
