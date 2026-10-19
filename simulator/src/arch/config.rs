@@ -681,6 +681,16 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(default = false, cache_key)]
         mla_fp8_flashinfer_b1: bool,
+        /// vLLM's `--moe-backend flashinfer_cutlass` (FlashInfer
+        /// `cutlass_fused_moe`, DeepSeek FP8 block scales, SM90) for every
+        /// routed MoE layer (body and MTP) of at least this many tokens,
+        /// priced on `nvfp4_fused_moe` / `flashinfer_cutlass_fp8_block_sm90`;
+        /// smaller layers keep the Triton launches of `moe_backend`. `1` is
+        /// CUTLASS everywhere; a larger value is a per-shape hybrid, which
+        /// vLLM v0.31 does not ship. Unset (default) is Triton everywhere.
+        #[serde(default)]
+        #[param(cache_key)]
+        moe_flashinfer_cutlass_min_tokens: Option<u32>,
         /// What-if KDA recurrent state dtype. `fp32` is production; `bf16`
         /// halves the recurrent state page and so the hybrid block (with an
         /// FP8 latent, 2304 -> 1280 tokens). Kernel costs keep the FP32 rows.

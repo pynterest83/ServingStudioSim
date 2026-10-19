@@ -1296,6 +1296,7 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe_speculative_model(
     mla_kv_cache_dtype: MlaKvCacheDtype,
     mla_fp8_prefill_bf16_workspace: bool,
     mla_fp8_flashinfer_b1: bool,
+    moe_flashinfer_cutlass_min_tokens: Option<u32>,
     kda_state_dtype: KdaStateDtype,
     moe_demand_axis_max_tokens: Option<u32>,
     gpu: &str,
@@ -1344,6 +1345,7 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe_speculative_model(
         mla_kv_cache_dtype,
         mla_fp8_prefill_bf16_workspace,
         mla_fp8_flashinfer_b1,
+        moe_flashinfer_cutlass_min_tokens,
         kda_state_dtype,
     };
     let configs =
@@ -2019,6 +2021,7 @@ pub fn build_speculative_iter_model(
             mla_kv_cache_dtype,
             mla_fp8_prefill_bf16_workspace,
             mla_fp8_flashinfer_b1,
+            moe_flashinfer_cutlass_min_tokens,
             kda_state_dtype,
             moe_demand_axis_max_tokens,
         } => Ok((
@@ -2037,6 +2040,7 @@ pub fn build_speculative_iter_model(
                 *mla_kv_cache_dtype,
                 *mla_fp8_prefill_bf16_workspace,
                 *mla_fp8_flashinfer_b1,
+                *moe_flashinfer_cutlass_min_tokens,
                 *kda_state_dtype,
                 *moe_demand_axis_max_tokens,
                 gpu,

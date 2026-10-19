@@ -67,6 +67,12 @@
 //! on the FP8 call take `vllm_flashinfer_sparse_sm90_fp8_b1` (same plan and
 //! grid; only the kernel time differs). Also a no-op with a BF16 cache. The KDA kernels keep the FP32-state rows: the BF16 KDA state
 //! traffic is not profiled on H200.
+//!
+//! `moe_flashinfer_cutlass_min_tokens: N` prices every routed MoE layer (body
+//! and MTP) of at least `N` tokens as vLLM's `--moe-backend flashinfer_cutlass`
+//! (FlashInfer `cutlass_fused_moe`, DeepSeek FP8 block scales, SM90) instead
+//! of the Triton launches: `1` is that backend everywhere, a larger `N` the
+//! per-shape hybrid (Triton under `moe_backend` below `N`).
 
 use anyhow::Result;
 
@@ -220,6 +226,10 @@ pub struct Glm53FlashSpecParallel {
     /// The fork's B1 FlashInfer header overlay: FP8-call rows priced on
     /// `vllm_flashinfer_sparse_sm90_fp8_b1`. No effect with a BF16 latent.
     pub mla_fp8_flashinfer_b1: bool,
+    /// Routed MoE layers of at least this many tokens run FlashInfer's CUTLASS
+    /// FP8 block-scale fused MoE (`--moe-backend flashinfer_cutlass`); `None`
+    /// keeps the Triton launches everywhere.
+    pub moe_flashinfer_cutlass_min_tokens: Option<u32>,
     /// KDA recurrent state element type: sizes the state page and the hybrid
     /// block, not the kernel rows.
     pub kda_state_dtype: KdaStateDtype,
@@ -408,6 +418,7 @@ pub fn build_configs(
         sum_backends: MOE_SUM_BACKENDS.to_vec(),
         elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
         expert_demand: expert_demand.clone(),
+        flashinfer_cutlass_min_tokens: parallel.moe_flashinfer_cutlass_min_tokens,
     };
     let fp32 = DType::Fp32.size_bytes();
     Ok(Glm53FlashSpecConfigs {
@@ -1768,6 +1779,7 @@ mod tests {
                 mla_kv_cache_dtype: MlaKvCacheDtype::default(),
                 mla_fp8_prefill_bf16_workspace: false,
                 mla_fp8_flashinfer_b1: false,
+                moe_flashinfer_cutlass_min_tokens: None,
                 kda_state_dtype: KdaStateDtype::default(),
             },
             &Glm53FlashSpecDemand {
@@ -2166,6 +2178,64 @@ mod tests {
             "mla_kv_cache_dtype": "fp8",
             "mla_fp8_flashinfer_b1": true,
         })));
+    }
+
+    /// Catches the CUTLASS option leaking into the default tree or missing a
+    /// routed callable: unset, no routed worklet gets a CUTLASS leaf; set, the
+    /// body and both MTP callables carry the same threshold.
+    #[test]
+    fn the_cutlass_option_reaches_every_routed_callable_and_defaults_off() {
+        let off = resolve_configs(&configs());
+        for routed in [
+            &off.routed_body,
+            &off.routed_mtp_step0,
+            &off.routed_mtp_recurrent,
+        ] {
+            assert!(routed.cutlass.is_none());
+        }
+        let mut parallel = configs().parallel;
+        parallel.moe_flashinfer_cutlass_min_tokens = Some(2048);
+        let on =
+            resolve_configs(&build_configs(&model_cfg(), &parallel, &uniform_demand()).unwrap());
+        for routed in [
+            &on.routed_body,
+            &on.routed_mtp_step0,
+            &on.routed_mtp_recurrent,
+        ] {
+            assert_eq!(routed.raw_cfg.flashinfer_cutlass_min_tokens, Some(2048));
+            assert_eq!(
+                routed.cutlass.as_ref().unwrap().backends,
+                ["flashinfer_cutlass_fp8_block_sm90"]
+            );
+        }
+    }
+
+    /// Existing presets omit the CUTLASS threshold and keep the Triton tree.
+    #[test]
+    fn the_cutlass_threshold_parses_and_defaults_off() {
+        use crate::arch::config::IterArchSel;
+        let parse = |extra: serde_json::Value| {
+            let mut arch = serde_json::json!({
+                "type": ARCH_KIND,
+                "model_config": "model/config/glm53_flash.json",
+                "fp8": true,
+            });
+            arch.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            match serde_json::from_value::<IterArchSel>(arch).unwrap() {
+                IterArchSel::Glm53FlashVllmFp8KdaDsaMoeSpeculative {
+                    moe_flashinfer_cutlass_min_tokens,
+                    ..
+                } => moe_flashinfer_cutlass_min_tokens,
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(parse(serde_json::json!({})), None);
+        assert_eq!(
+            parse(serde_json::json!({"moe_flashinfer_cutlass_min_tokens": 1024})),
+            Some(1024)
+        );
     }
 
     /// The case-03 capture sizes: MTP 5 adds 6 and 12 to vLLM's default list.

@@ -316,6 +316,7 @@ impl Deployment for UnifiedDeployment {
                 mla_kv_cache_dtype,
                 mla_fp8_prefill_bf16_workspace,
                 mla_fp8_flashinfer_b1,
+                moe_flashinfer_cutlass_min_tokens,
                 kda_state_dtype,
                 moe_demand_axis_max_tokens,
                 ..
@@ -336,6 +337,7 @@ impl Deployment for UnifiedDeployment {
                     *mla_kv_cache_dtype,
                     *mla_fp8_prefill_bf16_workspace,
                     *mla_fp8_flashinfer_b1,
+                    *moe_flashinfer_cutlass_min_tokens,
                     *kda_state_dtype,
                     *moe_demand_axis_max_tokens,
                     &gpu_name,

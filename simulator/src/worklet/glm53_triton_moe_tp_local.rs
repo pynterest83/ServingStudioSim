@@ -19,6 +19,19 @@
 //! Placeholders: `single_group_topk` (sigmoid `noaux_tc` grouped top-k has no
 //! L1 kind; `moe_fused_topk` is the softmax kernel) and SiLU-and-mul are
 //! byte-sized elementwise leaves.
+//!
+//! With `flashinfer_cutlass_min_tokens` set, a layer of at least that many
+//! tokens runs vLLM's `--moe-backend flashinfer_cutlass` instead
+//! (`FlashInferExperts`, DeepSeek FP8 block scales on SM90): one FlashInfer
+//! `cutlass_fused_moe` call from BF16 hidden states and the router's top-k to
+//! the reduced output, priced as one `nvfp4_fused_moe` leaf on the
+//! `flashinfer_cutlass_fp8_block_sm90` rows. It replaces every routed leaf
+//! here (input quant, alignment, both launches, activation, second quant and
+//! `moe_sum`); the router worklet is unchanged. Below the threshold the
+//! Triton launches run as before, so `Some(1)` is CUTLASS everywhere and a
+//! larger value is a per-shape hybrid (which vLLM v0.31 does not ship: it
+//! needs a dispatching experts class in the fork). `None` keeps the cost tree
+//! exactly as it was.
 
 use crate::op::Op;
 use crate::timing::bridge::DType;
@@ -29,6 +42,7 @@ use crate::timing::kernels::{
     Fp8PerTokenGroupQuantKernelInput, GemmFp32OutputKernel, GemmFp32OutputKernelConfig,
     GemmFp32OutputKernelInput, MoeAlignBlockSizeKernel, MoeAlignBlockSizeKernelConfig,
     MoeAlignBlockSizeKernelInput, MoeSumKernel, MoeSumKernelConfig, MoeSumKernelInput,
+    Nvfp4FusedMoeKernel, Nvfp4FusedMoeKernelConfig, Nvfp4FusedMoeKernelInput,
     VllmFusedMoeDemandKernel, VllmFusedMoeDemandKernelConfig, VllmFusedMoeDemandKernelInput,
     LAUNCH_ROLE_DOWN, LAUNCH_ROLE_GATE_UP,
 };
@@ -44,6 +58,11 @@ const QUANT_GROUP_SIZE: u32 = 128;
 const SMALL_BATCH_BLOCK_M: u32 = 16;
 const LARGE_BATCH_BLOCK_M: u32 = 64;
 const SMALL_BATCH_MAX_TOKENS: u32 = 64;
+/// The `nvfp4_fused_moe` backend of vLLM's `FlashInferExperts` on SM90 with an
+/// FP8 128x128 block checkpoint.
+pub const FLASHINFER_CUTLASS_FP8_BLOCK_SM90: &str = "flashinfer_cutlass_fp8_block_sm90";
+/// The router hands finished top-k ids and weights to the CUTLASS call.
+const PRECOMPUTED_ROUTING: &str = "precomputed";
 
 /// Which measured `vllm_fused_moe` rows price the two Triton launches. vLLM
 /// reads a tuned config folder (`VLLM_TUNED_CONFIG_FOLDER`) before its shipped
@@ -195,6 +214,9 @@ pub struct Glm53TritonMoeTpLocalWorkletConfig {
     pub sum_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
     pub expert_demand: ExpertDemand,
+    /// Layers of at least this many tokens run FlashInfer's CUTLASS fused MoE
+    /// instead of the Triton launches; `None` never does.
+    pub flashinfer_cutlass_min_tokens: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -207,6 +229,7 @@ pub struct Glm53TritonMoeTpLocalWorkletResolved {
     pub down_quant: Fp8PerTokenGroupQuantKernelConfig,
     pub down: VllmFusedMoeDemandKernelConfig,
     pub sum: MoeSumKernelConfig,
+    pub cutlass: Option<Nvfp4FusedMoeKernelConfig>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -223,6 +246,7 @@ pub struct Glm53TritonMoeTpLocalWorklet {
     pub down_quant: Op<Fp8PerTokenGroupQuantKernel>,
     pub down: Op<VllmFusedMoeDemandKernel>,
     pub sum: Op<MoeSumKernel>,
+    pub cutlass: Option<Op<Nvfp4FusedMoeKernel>>,
     resolved: Glm53TritonMoeTpLocalWorkletResolved,
 }
 
@@ -288,6 +312,27 @@ impl Glm53TritonMoeTpLocalWorklet {
                 hidden_dim: cfg.hidden.clone(),
                 dtype: cfg.activation_dtype,
             },
+            cutlass: cfg
+                .flashinfer_cutlass_min_tokens
+                .map(|_| Nvfp4FusedMoeKernelConfig {
+                    backends: vec![FLASHINFER_CUTLASS_FP8_BLOCK_SM90],
+                    gpu_name: cfg.gpu_name.clone(),
+                    hidden_size: cfg.hidden.clone(),
+                    intermediate_size: cfg.intermediate_per_rank.clone(),
+                    num_experts: cfg.num_experts.clone(),
+                    num_local_experts: cfg.num_experts.clone(),
+                    top_k: cfg.top_k,
+                    input_dtype: cfg.activation_dtype,
+                    weight_format: DType::Fp8E4m3,
+                    group_size: QUANT_GROUP_SIZE,
+                    routing_method: PRECOMPUTED_ROUTING.to_string(),
+                    n_group: 1,
+                    topk_group: 1,
+                    routed_scaling_numerator: 1,
+                    routed_scaling_denominator: 1,
+                    expert_demand: cfg.expert_demand.clone(),
+                    folded_rank_position: 0,
+                }),
             raw_cfg: cfg.clone(),
         }
     }
@@ -331,6 +376,10 @@ impl Glm53TritonMoeTpLocalWorklet {
             )?,
             down: atomic(n, "down", r.down, VllmFusedMoeDemandKernel::build, bridge)?,
             sum: atomic(n, "sum", r.sum, MoeSumKernel::build, bridge)?,
+            cutlass: r
+                .cutlass
+                .map(|config| atomic(n, "cutlass", config, Nvfp4FusedMoeKernel::build, bridge))
+                .transpose()?,
             name,
             resolved,
         })
@@ -338,27 +387,45 @@ impl Glm53TritonMoeTpLocalWorklet {
 
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let cfg = &self.resolved.raw_cfg;
+        let mut children = vec![
+            self.input_quant.compile(builder),
+            self.align.compile(builder),
+            self.gate_up.compile(builder),
+            self.act_and_mul.compile(builder),
+            self.down_quant.compile(builder),
+            self.down.compile(builder),
+            self.sum.compile(builder),
+        ];
+        if let Some(cutlass) = &self.cutlass {
+            children.push(cutlass.compile(builder));
+        }
+        let cutlass_label = match cfg.flashinfer_cutlass_min_tokens {
+            Some(min_tokens) => format!("; FlashInfer CUTLASS at T>={min_tokens}"),
+            None => String::new(),
+        };
         CostNode::Labeled {
             label: format!(
-                "{} (Glm53TritonMoeTpLocalWorklet) [TP rank; all {} experts, top-{}, I/rank={}]",
-                self.name, cfg.num_experts, cfg.top_k, cfg.intermediate_per_rank
+                "{} (Glm53TritonMoeTpLocalWorklet) [TP rank; all {} experts, top-{}, I/rank={}{}]",
+                self.name, cfg.num_experts, cfg.top_k, cfg.intermediate_per_rank, cutlass_label
             ),
-            child: Box::new(CostNode::Sum(vec![
-                self.input_quant.compile(builder),
-                self.align.compile(builder),
-                self.gate_up.compile(builder),
-                self.act_and_mul.compile(builder),
-                self.down_quant.compile(builder),
-                self.down.compile(builder),
-                self.sum.compile(builder),
-            ])),
+            child: Box::new(CostNode::Sum(children)),
         }
     }
 
     pub fn eval(&self, input: &Glm53TritonMoeTpLocalWorkletInput, ev: &mut Evaluator) {
         let cfg = &self.resolved.raw_cfg;
         let tokens = input.num_tokens;
-        let zero = tokens == 0;
+        let cutlass = runs_cutlass(cfg.flashinfer_cutlass_min_tokens, tokens);
+        if let Some(op) = &self.cutlass {
+            push_or_zero(
+                op,
+                Nvfp4FusedMoeKernelInput { num_tokens: tokens },
+                !cutlass,
+                ev,
+            );
+        }
+        // The Triton launches stay in the tree as zero slots (INV-1).
+        let zero = tokens == 0 || cutlass;
         let selections = tokens
             .checked_mul(cfg.top_k)
             .expect("tokens x top_k must fit u32");
@@ -410,6 +477,12 @@ impl Glm53TritonMoeTpLocalWorklet {
     }
 }
 
+/// Whether a layer of `tokens` runs the CUTLASS call: at least the threshold,
+/// and never an empty layer.
+fn runs_cutlass(min_tokens: Option<u32>, tokens: u32) -> bool {
+    tokens > 0 && min_tokens.is_some_and(|min_tokens| tokens >= min_tokens)
+}
+
 /// vLLM's Triton `BLOCK_SIZE_M` for this token count (default config).
 fn block_size_m(tokens: u32) -> u32 {
     if tokens <= SMALL_BATCH_MAX_TOKENS {
@@ -444,6 +517,7 @@ mod tests {
             sum_backends: vec!["vllm_cuda"],
             elementwise_backends: vec!["triton"],
             expert_demand: ExpertDemand::popularity(&RoutingDistribution::uniform(288), 1),
+            flashinfer_cutlass_min_tokens: None,
         }
     }
 
@@ -459,6 +533,43 @@ mod tests {
         assert_eq!(r.down.launch_role, LAUNCH_ROLE_DOWN);
         assert_eq!(r.input_quant.scale_format, COLUMN_MAJOR_SCALE_FORMAT);
         assert_eq!(r.down_quant.hidden_size.get(), 512);
+    }
+
+    /// The CUTLASS leaf exists only when asked for, on the SM90 FP8 block-scale
+    /// rows with the TP rank's shapes and the same routed demand as the Triton
+    /// launches it replaces.
+    #[test]
+    fn the_cutlass_leaf_prices_the_whole_tp_rank_call_on_its_own_rows() {
+        assert!(Glm53TritonMoeTpLocalWorklet::resolve_config(&cfg())
+            .cutlass
+            .is_none());
+        let with = Glm53TritonMoeTpLocalWorkletConfig {
+            flashinfer_cutlass_min_tokens: Some(1024),
+            ..cfg()
+        };
+        let r = Glm53TritonMoeTpLocalWorklet::resolve_config(&with);
+        let cutlass = r.cutlass.expect("threshold set");
+        assert_eq!(cutlass.backends, [FLASHINFER_CUTLASS_FP8_BLOCK_SM90]);
+        assert_eq!(cutlass.hidden_size.get(), 4096);
+        assert_eq!(cutlass.intermediate_size.get(), 512);
+        assert_eq!(cutlass.num_local_experts.get(), 288);
+        assert_eq!(cutlass.num_experts.get(), 288);
+        assert_eq!(cutlass.input_dtype, DType::Bf16);
+        assert_eq!(cutlass.weight_format, DType::Fp8E4m3);
+        assert_eq!(cutlass.routing_method, "precomputed");
+        assert_eq!(cutlass.expert_demand, r.gate_up.expert_demand);
+    }
+
+    /// The threshold is inclusive, `Some(1)` is CUTLASS for every non-empty
+    /// layer, and `None` never switches.
+    #[test]
+    fn the_threshold_picks_cutlass_from_that_token_count_up() {
+        assert!(!runs_cutlass(None, 8192));
+        assert!(!runs_cutlass(Some(2048), 2047));
+        assert!(runs_cutlass(Some(2048), 2048));
+        assert!(runs_cutlass(Some(1), 1));
+        assert!(!runs_cutlass(Some(1), 0));
+        assert!(!runs_cutlass(Some(0), 0));
     }
 
     #[test]
