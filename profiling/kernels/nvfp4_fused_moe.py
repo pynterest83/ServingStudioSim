@@ -14,6 +14,14 @@ activations and `routing_method="precomputed_dsv4"`: finished top-k ids and
 weights come in, so it only permutes (n_group = topk_group = 1, routed scale
 1/1; the router already applied the scale). `input_dtype` is the unquantized
 activation and output precision in every backend.
+
+The SM90 CUTLASS backend (`flashinfer_cutlass_fp8_block_sm90`, FlashInfer's
+`cutlass_fused_moe` with `use_deepseek_fp8_block_scale`, vLLM's
+`--moe-backend flashinfer_cutlass`) also takes `fp8_e4m3` / group 128 and
+`routing_method="precomputed"`: vLLM's router runs first and hands over top-k
+ids and weights, so n_group = topk_group = 1 and routed scaling is 1/1. It takes
+BF16 hidden states and quantizes them inside the call, and it ends with the
+finalize (top-k weighted reduce), like the vLLM SM100 backends.
 """
 
 from __future__ import annotations
@@ -93,7 +101,9 @@ DOC = KernelDoc(
         "SGLang backend leaves the combine to a later kernel, "
         "moe_finalize_fuse_shared. The FP8 block-scale and MXFP4 backends also "
         "combine. The MXFP4 backend takes finished top-k ids and weights, so its "
-        "routing step only groups tokens by expert."
+        "routing step only groups tokens by expert. The SM90 CUTLASS FP8 "
+        "block-scale backend also starts from finished top-k ids and weights, "
+        "but from BF16 hidden states that it quantizes itself; it combines too."
     ),
     category="MoE",
     subcategory="Expert compute",
@@ -115,6 +125,10 @@ DOC = KernelDoc(
         "weight_bytes = active_experts·(3·intermediate_size·hidden_size "
         "+ 4·3·intermediate_size·hidden_size/128²); "
         "GB/s = (routing_bytes + activation_bytes + weight_bytes + 2·hidden_size·num_tokens) / time",
+        "SM90 CUTLASS FP8 block-scale: routing_bytes = 8·num_tokens·top_k; "
+        "activation_bytes = 2·hidden_size·num_tokens (BF16 in); weight_bytes as FP8 "
+        "block-scale; GB/s = (routing_bytes + activation_bytes + weight_bytes "
+        "+ 2·hidden_size·num_tokens) / time",
         "MXFP4: routing_bytes = 8·num_tokens·top_k; "
         "activation_bytes = local_rows·(hidden_size + hidden_size/32); "
         "weight_bytes = active_experts·(3·intermediate_size·hidden_size/2 "
@@ -138,7 +152,13 @@ DOC = KernelDoc(
         "The MXFP4 backend accepts only precomputed_dsv4 routing with group 32, "
         "n_group = topk_group = 1 and routed scaling 1/1, with the SwiGLU clamp "
         "applied; it too tunes up to 8192 tokens.",
-        "Activation quantization is outside the call, and the router logits are synthetic.",
+        "The SM90 CUTLASS backend accepts only precomputed routing with group 128, "
+        "n_group = topk_group = 1, routed scaling 1/1 and every expert local (TP "
+        "without EP); its BF16 -> FP8 activation quantization is inside the call, and "
+        "its grouped GEMMs are NVRTC-compiled on first use (cached under "
+        "~/.tensorrt_llm), outside the timed launches.",
+        "Activation quantization is outside the call (except the SM90 CUTLASS "
+        "backend), and the router logits are synthetic.",
         "GB/s counts logical traffic for the local rows and the experts that "
         "have rows; small side outputs are left out.",
     ),
@@ -261,5 +281,37 @@ register(
             ),
             url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/experts/trtllm_mxfp4_moe.py",
         ),
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashinfer_cutlass_fp8_block_sm90",
+        # vLLM enables FlashInferExperts' FP8 block-scale scheme on exactly SM90
+        # (`_supports_quant_scheme`: kFp8Static128BlockSym x kFp8Dynamic128Sym and
+        # `is_device_capability(90)`), and FlashInfer JIT-builds fused_moe_90 with
+        # the sm90a flags (`gen_cutlass_fused_moe_sm90_module`).
+        supports=BackendSupport(
+            compute=frozenset({DType.FP8_E4M3}),
+            sm_targets=frozenset({"sm_90a"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.moe.fp8_block_fused_moe_cutlass_sm90",
+            function_name="profile_fp8_block_fused_moe_cutlass_sm90",
+        ),
+        table_name=KIND,
+        args_schema=Nvfp4FusedMoeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        doc=BackendDoc(
+            summary=(
+                "FlashInfer cutlass_fused_moe with DeepSeek FP8 block scales on SM90, "
+                "as vLLM's FlashInferExperts (--moe-backend flashinfer_cutlass) calls it "
+                "on precomputed top-k, including final expert combination."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py",
+        ),
+        subprocess_env="vllm_env",
     )
 )
