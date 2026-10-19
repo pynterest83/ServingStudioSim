@@ -1754,6 +1754,13 @@ mod tests {
     }
 
     fn configs_with_moe(moe_backend: FusedMoeBackend) -> Glm53FlashSpecConfigs {
+        configs_with_moe_and_draft(moe_backend, 5)
+    }
+
+    fn configs_with_moe_and_draft(
+        moe_backend: FusedMoeBackend,
+        draft_tokens: u32,
+    ) -> Glm53FlashSpecConfigs {
         let uniform = ExpertDemand::popularity(&RoutingDistribution::uniform(288), 43);
         build_configs(
             &model_cfg(),
@@ -1762,7 +1769,7 @@ mod tests {
                 max_model_len: 8192,
                 gpu_name: "NVIDIA H200".into(),
                 cudagraph_capture_sizes: vec![1, 2, 4, 6, 8, 12, 16, 24, 32, 512],
-                draft_tokens: 5,
+                draft_tokens,
                 sparse_mla_backend: SparseMlaBackend::default(),
                 moe_backend,
                 mla_kv_cache_dtype: MlaKvCacheDtype::default(),
@@ -2209,6 +2216,56 @@ mod tests {
         full.dedup();
         assert_eq!(full.len(), 48);
         assert_eq!(full.last(), Some(&498));
+    }
+
+    /// MTP draft lengths 6 and 7 (the 20261019_3 what-if): every K-dependent
+    /// shape follows `K` — verify width `K + 1` on the KDA leaves and the DSA
+    /// decode rows (still flattened to `next_n = 1`: SM90 DeepGEMM takes only
+    /// 1, 2, 4), `K - 1` recurrent MTP steps, `3 x (2 + K) + 1` state pages per
+    /// request, and FULL decode graphs at multiples of `K + 1`. The H200 K=7
+    /// FP8 server (20261019_3 tock, case 37) logged the same 2304-token
+    /// attention block as K=5 and `Maximum concurrency for 262,144 tokens per
+    /// request: 21.81x` = 3097 pages / (114 + 28), against 22.78x =
+    /// 3098 / (114 + 22) at K=5.
+    #[test]
+    fn draft_lengths_six_and_seven_scale_every_k_dependent_shape() {
+        let model = model_cfg();
+        for (k, pages, resident, full_max) in [(6, 25, 22, 497), (7, 28, 25, 512)] {
+            let c = configs_with_moe_and_draft(FusedMoeBackend::default(), k);
+            let r = resolve_configs(&c);
+            assert_eq!(r.kda.recurrent_verify.query_len, k + 1);
+            assert_eq!(r.kda.conv_verify.query_len, k + 1);
+            assert!(r.dsa.flatten_decode_indexer, "K={k}");
+            assert_eq!(r.dsa.mqa_logits_decode.next_n, 1);
+            assert_eq!(r.dsa.topk_decode.next_n, 1);
+            assert_eq!(state_pages_per_request(&model, k), pages);
+            assert_eq!(resident_state_pages_per_request(&model, k), resident);
+            assert_eq!(
+                hybrid_block_size(&model, 4, k, MlaKvCacheDtype::Fp8, KdaStateDtype::Fp32),
+                2304
+            );
+            let dispatch = GraphDispatch::new(&h200_capture_sizes(), k + 1);
+            assert_eq!(dispatch.full_graph_max_tokens, full_max, "K={k}");
+            assert_eq!(dispatch.mode(full_max, false), GraphMode::FullGraph);
+            // One more verify group: PIECEWISE while within the largest
+            // capture size (K=6: 497 + 7 = 504), eager past it.
+            let next = if full_max + k + 1 <= 512 {
+                GraphMode::Piecewise
+            } else {
+                GraphMode::Eager
+            };
+            assert_eq!(dispatch.mode(full_max + k + 1, false), next, "K={k}");
+            assert_eq!(dispatch.mode(513, false), GraphMode::Eager);
+        }
+        // vLLM's concurrency line: ceil(262144 / 2304) = 114 attention pages
+        // per full-length request plus the state pages.
+        assert_eq!(262_144_u32.div_ceil(2304), 114);
+        assert!(
+            (3097.0 / f64::from(114 + state_pages_per_request(&model, 7)) - 21.81).abs() < 0.01
+        );
+        assert!(
+            (3098.0 / f64::from(114 + state_pages_per_request(&model, 5)) - 22.78).abs() < 0.01
+        );
     }
 
     #[test]

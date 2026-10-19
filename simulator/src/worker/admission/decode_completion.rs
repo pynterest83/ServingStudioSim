@@ -962,6 +962,40 @@ mod tests {
     }
 
     #[test]
+    fn seven_wide_position_bands_retire_up_to_eight_tokens() {
+        // MTP K = 7 (the 20261019_3 what-if): the band chains are 7 wide and a
+        // verify retires the target token plus the leading accepted run.
+        const K: u32 = 7;
+        let seven = |rates: &[f32]| {
+            AcceptancePositionBands::from_flat(&[], rates, K)
+                .unwrap()
+                .expect("non-empty lists build bands")
+        };
+        assert!(AcceptancePositionBands::from_flat(&[], &[0.9; 5], K)
+            .unwrap_err()
+            .contains("1 bands x 7"));
+        let (mut kv_store, context) = one_resident_decode(64, 63, uniform(0.0));
+        let mut policy = SpeculativeDecodeCompletion::new(K, 7)
+            .with_position_bands(Some(seven(&[1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0])));
+        assert_eq!(
+            DecodeCompletion::<FullAttnKv>::query_tokens_per_request(&policy),
+            K + 1
+        );
+        assert_eq!(
+            run_one_iteration(&mut policy, &mut kv_store, &context),
+            (6, 6),
+            "draft 6 is rejected: the target token plus drafts 1-5"
+        );
+        let (mut kv_store, context) = one_resident_decode(64, 63, uniform(0.0));
+        let mut policy =
+            SpeculativeDecodeCompletion::new(K, 7).with_position_bands(Some(seven(&[1.0; 7])));
+        assert_eq!(
+            run_one_iteration(&mut policy, &mut kv_store, &context),
+            (K + 1, u64::from(K + 1))
+        );
+    }
+
+    #[test]
     fn absent_position_bands_draw_exactly_the_request_chain() {
         // Same seed and request: `with_position_bands(None)` must not touch the
         // keyed draws, so every existing run stays bit-identical.
