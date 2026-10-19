@@ -672,6 +672,15 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(default = false, cache_key)]
         mla_fp8_prefill_bf16_workspace: bool,
+        /// The vLLM fork's `VLLM_FLASHINFER_INCLUDE_OVERLAY` with the B1
+        /// FlashInfer headers (branch exp/fp8-repack-b1): with an FP8 latent,
+        /// every MQA row on the FP8 FlashInfer plan (decode rows; prefill rows
+        /// too unless the BF16 workspace takes them) is priced on the
+        /// `vllm_flashinfer_sparse_sm90_fp8_b1` rows. No effect on a BF16
+        /// latent, whose kernel the overlay does not change.
+        #[serde(default)]
+        #[param(default = false, cache_key)]
+        mla_fp8_flashinfer_b1: bool,
         /// What-if KDA recurrent state dtype. `fp32` is production; `bf16`
         /// halves the recurrent state page and so the hybrid block (with an
         /// FP8 latent, 2304 -> 1280 tokens). Kernel costs keep the FP32 rows.

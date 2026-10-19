@@ -62,7 +62,10 @@
 //! adds the vLLM fork's `VLLM_FP8_KV_PREFILL_BF16_WORKSPACE=1`: prefill rows
 //! of a sparse-MQA step run on a BF16 plan over a per-layer dequantized
 //! workspace (`glm53_dsa_spec_attn_local`); it does nothing with a BF16 cache,
-//! as in vLLM. The KDA kernels keep the FP32-state rows: the BF16 KDA state
+//! as in vLLM. `mla_fp8_flashinfer_b1: true` is the fork's
+//! `VLLM_FLASHINFER_INCLUDE_OVERLAY` with the B1 FlashInfer headers: the rows
+//! on the FP8 call take `vllm_flashinfer_sparse_sm90_fp8_b1` (same plan and
+//! grid; only the kernel time differs). Also a no-op with a BF16 cache. The KDA kernels keep the FP32-state rows: the BF16 KDA state
 //! traffic is not profiled on H200.
 
 use anyhow::Result;
@@ -214,6 +217,9 @@ pub struct Glm53FlashSpecParallel {
     /// latent, sparse-MQA prefill rows run on a BF16 plan over a dequantized
     /// workspace. No effect with a BF16 latent.
     pub mla_fp8_prefill_bf16_workspace: bool,
+    /// The fork's B1 FlashInfer header overlay: FP8-call rows priced on
+    /// `vllm_flashinfer_sparse_sm90_fp8_b1`. No effect with a BF16 latent.
+    pub mla_fp8_flashinfer_b1: bool,
     /// KDA recurrent state element type: sizes the state page and the hybrid
     /// block, not the kernel rows.
     pub kda_state_dtype: KdaStateDtype,
@@ -439,6 +445,7 @@ pub fn build_configs(
             verify_width: parallel.draft_tokens + 1,
             kv_cache_dtype,
             prefill_workspace_tokens,
+            fp8_flashinfer_b1: parallel.mla_fp8_flashinfer_b1 && kv_cache_dtype == DType::Fp8E4m3,
             gpu_name: gpu.clone(),
             bf16_gemm_backends: BF16_GEMM_BACKENDS.to_vec(),
             fp32_gemm_backends: FP32_GEMM_BACKENDS.to_vec(),
@@ -1760,6 +1767,7 @@ mod tests {
                 moe_backend,
                 mla_kv_cache_dtype: MlaKvCacheDtype::default(),
                 mla_fp8_prefill_bf16_workspace: false,
+                mla_fp8_flashinfer_b1: false,
                 kda_state_dtype: KdaStateDtype::default(),
             },
             &Glm53FlashSpecDemand {
@@ -2060,6 +2068,50 @@ mod tests {
         assert!(with(MlaKvCacheDtype::Fp8, fa3, false, 8192).is_err());
     }
 
+    /// Catches the B1 option pricing anything but the FP8 call on the B1 rows:
+    /// it must swap only that backend, keep the BF16 workspace rows on the
+    /// stock BF16 call, and change nothing on a BF16 latent.
+    #[test]
+    fn the_b1_option_swaps_only_the_fp8_call_rows() {
+        let with = |mla, workspace: bool, b1: bool| {
+            let mut parallel = configs().parallel;
+            parallel.mla_kv_cache_dtype = mla;
+            parallel.sparse_mla_backend = SparseMlaBackend::FlashinferMlaSparseSm90;
+            parallel.mla_fp8_prefill_bf16_workspace = workspace;
+            parallel.mla_fp8_flashinfer_b1 = b1;
+            parallel.max_model_len = 262_144;
+            resolve_configs(&build_configs(&model_cfg(), &parallel, &uniform_demand()).unwrap())
+        };
+        let stock = with(MlaKvCacheDtype::Fp8, true, false);
+        let b1 = with(MlaKvCacheDtype::Fp8, true, true);
+        assert_eq!(
+            b1.dsa.sparse_attention.backends,
+            ["vllm_flashinfer_sparse_sm90_fp8_b1"]
+        );
+        let mut same = b1.dsa.sparse_attention.clone();
+        same.backends = stock.dsa.sparse_attention.backends.clone();
+        assert_eq!(same, stock.dsa.sparse_attention);
+        let ws = |r: &Glm53FlashSpecResolved| {
+            r.dsa
+                .prefill_workspace
+                .as_ref()
+                .unwrap()
+                .attention
+                .backends
+                .clone()
+        };
+        assert_eq!(ws(&b1), ["vllm_flashinfer_sparse_sm90_bf16"]);
+        assert_eq!(ws(&b1), ws(&stock));
+        assert_eq!(
+            with(MlaKvCacheDtype::Bf16, false, true)
+                .dsa
+                .sparse_attention,
+            with(MlaKvCacheDtype::Bf16, false, false)
+                .dsa
+                .sparse_attention
+        );
+    }
+
     /// Existing presets omit the workspace option and keep it off.
     #[test]
     fn the_prefill_workspace_option_parses_and_defaults_off() {
@@ -2085,6 +2137,34 @@ mod tests {
         assert!(parse(serde_json::json!({
             "mla_kv_cache_dtype": "fp8",
             "mla_fp8_prefill_bf16_workspace": true,
+        })));
+    }
+
+    /// Existing presets omit the B1 option and keep it off.
+    #[test]
+    fn the_b1_option_parses_and_defaults_off() {
+        use crate::arch::config::IterArchSel;
+        let parse = |extra: serde_json::Value| {
+            let mut arch = serde_json::json!({
+                "type": ARCH_KIND,
+                "model_config": "model/config/glm53_flash.json",
+                "fp8": true,
+            });
+            arch.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            match serde_json::from_value::<IterArchSel>(arch).unwrap() {
+                IterArchSel::Glm53FlashVllmFp8KdaDsaMoeSpeculative {
+                    mla_fp8_flashinfer_b1,
+                    ..
+                } => mla_fp8_flashinfer_b1,
+                _ => unreachable!(),
+            }
+        };
+        assert!(!parse(serde_json::json!({})));
+        assert!(parse(serde_json::json!({
+            "mla_kv_cache_dtype": "fp8",
+            "mla_fp8_flashinfer_b1": true,
         })));
     }
 

@@ -147,7 +147,7 @@ pub use dsa_sparse_mla_attention::{
     DsaSparseMlaAttentionKernel, DsaSparseMlaAttentionKernelConfig,
     DsaSparseMlaAttentionKernelInput, DsaSparseMlaAttentionSpec, ValidCountsPattern,
     FA3_COMBINE_MAX_QUERIES, FA3_SPARSE_BACKEND, FLASHINFER_SM90_SPARSE_BACKEND,
-    FLASHINFER_SM90_SPARSE_FP8_BACKEND,
+    FLASHINFER_SM90_SPARSE_FP8_B1_BACKEND, FLASHINFER_SM90_SPARSE_FP8_BACKEND,
 };
 pub use dsa_sparse_mla_prefill::{
     DsaSparseMlaPrefillKernel, DsaSparseMlaPrefillKernelConfig, DsaSparseMlaPrefillKernelInput,

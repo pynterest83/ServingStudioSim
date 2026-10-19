@@ -114,7 +114,7 @@ use crate::timing::kernels::{
     MlaCacheGatherKernelConfig, MlaCacheGatherKernelInput, QKvRmsNormKernel,
     QKvRmsNormKernelConfig, QKvRmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
     SingleGemmKernelInput, ValidCountsPattern, FA3_SPARSE_BACKEND, FLASHINFER_SM90_SPARSE_BACKEND,
-    FLASHINFER_SM90_SPARSE_FP8_BACKEND,
+    FLASHINFER_SM90_SPARSE_FP8_B1_BACKEND, FLASHINFER_SM90_SPARSE_FP8_BACKEND,
 };
 use crate::timing::{
     AttnPrefillLog, BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge,
@@ -226,6 +226,10 @@ pub struct Glm53DsaSpecAttnLocalWorkletConfig {
     /// (`VLLM_FP8_KV_PREFILL_BF16_WORKSPACE`); 0 runs every MQA row on the one
     /// call. Nonzero only with an FP8 cache on `FlashinferMlaSparseSm90`.
     pub prefill_workspace_tokens: u32,
+    /// Price the FP8 FlashInfer call on the B1 header overlay's rows
+    /// (`vllm_flashinfer_sparse_sm90_fp8_b1`). Only with an FP8 cache on
+    /// `FlashinferMlaSparseSm90`; the BF16 workspace call is unchanged.
+    pub fp8_flashinfer_b1: bool,
     pub gpu_name: String,
     pub bf16_gemm_backends: Vec<&'static str>,
     pub fp32_gemm_backends: Vec<&'static str>,
@@ -431,6 +435,15 @@ impl Glm53DsaSpecAttnLocalWorklet {
                     cfg.kv_cache_dtype.as_str()
                 )
             });
+        let sparse_backend = if cfg.fp8_flashinfer_b1 {
+            assert_eq!(
+                sparse_backend, FLASHINFER_SM90_SPARSE_FP8_BACKEND,
+                "the B1 overlay rows replace the FP8-cache FlashInfer call only"
+            );
+            FLASHINFER_SM90_SPARSE_FP8_B1_BACKEND
+        } else {
+            sparse_backend
+        };
         let prefill_workspace = (cfg.prefill_workspace_tokens > 0).then(|| {
             assert!(
                 cfg.kv_cache_dtype == DType::Fp8E4m3
@@ -1369,6 +1382,7 @@ mod tests {
             verify_width: 6,
             kv_cache_dtype: DType::Bf16,
             prefill_workspace_tokens: 0,
+            fp8_flashinfer_b1: false,
             gpu_name: "NVIDIA H200".into(),
             bf16_gemm_backends: vec!["torch_linear_vllm"],
             fp32_gemm_backends: vec!["torch_cublas"],

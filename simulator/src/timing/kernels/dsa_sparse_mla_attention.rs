@@ -118,11 +118,18 @@ const FA3_POOLED_CACHE_AXIS: [u32; 18] = [
 pub const FLASHINFER_SM90_SPARSE_BACKEND: &str = "vllm_flashinfer_sparse_sm90_bf16";
 /// The same FlashInfer call over an FP8 (e4m3) latent cache.
 pub const FLASHINFER_SM90_SPARSE_FP8_BACKEND: &str = "vllm_flashinfer_sparse_sm90_fp8";
+/// The FP8-cache call with FlashInfer's Hopper MLA kernel built from the B1
+/// header overlay (vLLM fork `VLLM_FLASHINFER_INCLUDE_OVERLAY`; the FP8 KV
+/// repack unrolled 2x with the per-tensor scale folded in). Same plan, grid
+/// and outputs as `FLASHINFER_SM90_SPARSE_FP8_BACKEND`; only the time differs.
+pub const FLASHINFER_SM90_SPARSE_FP8_B1_BACKEND: &str = "vllm_flashinfer_sparse_sm90_fp8_b1";
 
 /// Whether `backend` is one of the FlashInfer SM90 backends, which share the
 /// planner's wave-aligned grid and query projection.
 fn is_flashinfer_sm90(backend: &str) -> bool {
-    backend == FLASHINFER_SM90_SPARSE_BACKEND || backend == FLASHINFER_SM90_SPARSE_FP8_BACKEND
+    backend == FLASHINFER_SM90_SPARSE_BACKEND
+        || backend == FLASHINFER_SM90_SPARSE_FP8_BACKEND
+        || backend == FLASHINFER_SM90_SPARSE_FP8_B1_BACKEND
 }
 
 /// The config prices exactly one FlashInfer SM90 backend.
@@ -685,8 +692,9 @@ mod tests {
         canonical_valid_counts, speculative_cache_axis, speculative_query_axis,
         DsaSparseMlaAttentionKernelConfig, DsaSparseMlaAttentionKernelInput,
         DsaSparseMlaAttentionSpec, CAUSAL_CACHE_AXIS, CAUSAL_QUERY_AXIS, FA3_COMBINE_MAX_QUERIES,
-        FA3_SPARSE_BACKEND, FLASHINFER_SM90_SPARSE_BACKEND, FLASHINFER_SM90_SPARSE_FP8_BACKEND,
-        SPECULATIVE_CACHE_AXIS, SPECULATIVE_QUERY_AXIS, UNIFORM_CACHE_AXIS, UNIFORM_QUERY_AXIS,
+        FA3_SPARSE_BACKEND, FLASHINFER_SM90_SPARSE_BACKEND, FLASHINFER_SM90_SPARSE_FP8_B1_BACKEND,
+        FLASHINFER_SM90_SPARSE_FP8_BACKEND, SPECULATIVE_CACHE_AXIS, SPECULATIVE_QUERY_AXIS,
+        UNIFORM_CACHE_AXIS, UNIFORM_QUERY_AXIS,
     };
     use crate::timing::bridge::{ArgsPayload, DType};
     use crate::timing::cache::{CacheKind, Extrapolation};
@@ -1235,6 +1243,46 @@ mod tests {
         };
         assert!(
             std::panic::catch_unwind(|| DsaSparseMlaAttentionSpec::sweep_grid(&mixed)).is_err()
+        );
+    }
+
+    /// Catches the B1 rows taking another grid or payload than the stock FP8
+    /// rows they replace (the fill measures exactly the FP8 rows' 475 specs
+    /// under the B1 tag), or falling off the FlashInfer SM90 query projection.
+    #[test]
+    fn flashinfer_sm90_fp8_b1_rows_are_the_fp8_rows_under_another_backend() {
+        let fp8 = DsaSparseMlaAttentionKernelConfig {
+            backends: vec![FLASHINFER_SM90_SPARSE_FP8_BACKEND],
+            cache_dtype: DType::Fp8E4m3,
+            cache_layout: "token_major_mqa_fp8_latent".into(),
+            ..flashinfer_sm90_config()
+        };
+        let b1 = DsaSparseMlaAttentionKernelConfig {
+            backends: vec![FLASHINFER_SM90_SPARSE_FP8_B1_BACKEND],
+            ..fp8.clone()
+        };
+        let grid = DsaSparseMlaAttentionSpec::sweep_grid(&b1);
+        assert_eq!(grid, DsaSparseMlaAttentionSpec::sweep_grid(&fp8));
+        let input = DsaSparseMlaAttentionKernelInput {
+            num_queries: 133,
+            num_cache_tokens: 3000,
+        };
+        assert_eq!(
+            DsaSparseMlaAttentionSpec::cache_coords(&b1, &input).to_vec(),
+            vec![264.0, 3000.0]
+        );
+        let b1_payloads =
+            DsaSparseMlaAttentionSpec::enumerate(&b1, &grid, FLASHINFER_SM90_SPARSE_FP8_B1_BACKEND);
+        let fp8_payloads =
+            DsaSparseMlaAttentionSpec::enumerate(&fp8, &grid, FLASHINFER_SM90_SPARSE_FP8_BACKEND);
+        assert_eq!(b1_payloads.len(), 475);
+        let mut fields =
+            serde_json::to_value(payload_for(&b1_payloads, &grid, 264, 2051).fields()).unwrap();
+        assert_eq!(fields["backend"], FLASHINFER_SM90_SPARSE_FP8_B1_BACKEND);
+        fields["backend"] = Value::from(FLASHINFER_SM90_SPARSE_FP8_BACKEND);
+        assert_eq!(
+            fields,
+            serde_json::to_value(payload_for(&fp8_payloads, &grid, 264, 2051).fields()).unwrap()
         );
     }
 
