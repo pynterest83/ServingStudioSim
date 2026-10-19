@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
@@ -16,6 +17,21 @@ from profiling.db.registry import (
 )
 
 KIND: str = "dsa_sparse_mla_attention"
+
+#: Host path of the FlashInfer include root carrying the B1 patch (the
+#: ``include/`` of FlashInfer 0.7.0.post1 with mla_hopper.cuh from
+#: flashinfer-b1 commit 2a5966c, branch exp/fp8-mla-repack-unroll). The
+#: ``vllm_flashinfer_sparse_sm90_fp8_b1`` worker hands it to the vLLM fork's
+#: ``VLLM_FLASHINFER_INCLUDE_OVERLAY`` (branch exp/fp8-repack-b1); unset, the
+#: backend refuses to run. Host worker only (VIBESIM_VLLM_PROFILE_ENV=host).
+B1_INCLUDE_ENV: str = "VIBESIM_FLASHINFER_B1_INCLUDE"
+#: sha256 of that mla_hopper.cuh; the runner refuses any other overlay.
+B1_MLA_HOPPER_SHA256: str = "cd91b1cd762c9b3b0d3b1a456044a2e06b997a02780a15003e2faf76bea2a6a5"
+
+
+def _b1_worker_env() -> tuple[tuple[str, str], ...]:
+    include = os.environ.get(B1_INCLUDE_ENV, "")
+    return (("VLLM_FLASHINFER_INCLUDE_OVERLAY", include),) if include else ()
 
 
 @dataclass(frozen=True)
@@ -72,7 +88,8 @@ DOC = KernelDoc(
         "splits the keys, FlashAttnFwdCombine. vllm_flashinfer_sparse_sm90_bf16 counts "
         "only BatchMLAPageAttentionHopperKernel, the one launch of FlashInfer's planned "
         "MLA run; vllm_flashinfer_sparse_sm90_fp8 counts the same launch over an e4m3 "
-        "cache. Setup and output checks run before timing."
+        "cache, and vllm_flashinfer_sparse_sm90_fp8_b1 the same launch built from the "
+        "B1-patched mla_hopper.cuh. Setup and output checks run before timing."
     ),
     caveats=(
         "Selected positions and tensor values are constructed, not taken from "
@@ -100,6 +117,11 @@ DOC = KernelDoc(
         "1.0 (GLM-5.3-Flash ships no KV scales), the BF16 synthetic cache rounded "
         "to e4m3 and checked against the reference on its exact BF16 "
         "dequantization.",
+        "vllm_flashinfer_sparse_sm90_fp8_b1 is vllm_flashinfer_sparse_sm90_fp8 with "
+        "FlashInfer's JIT compiling the kernel from the B1 header overlay (FP8 KV "
+        "repack unrolled 2x, per-tensor scale folded into the dequant, async-proxy "
+        "fence); its outputs are bitwise equal to the stock kernel's. It needs "
+        "VIBESIM_FLASHINFER_B1_INCLUDE and a vLLM fork with the include-overlay hook.",
     ),
     reference="profiling.runners.attention.dsa_sparse_mla_attention_reference",
 )
@@ -285,6 +307,49 @@ register(
                 "vLLM's FLASHINFER_MLA_SPARSE_SM90 with --kv-cache-dtype fp8: the same "
                 "planned FlashInfer MLA run over rope-free e4m3 latent rows (per-tensor "
                 "scale 1.0), dequantized to BF16 in shared memory, on H200."
+            ),
+            url=(
+                "https://github.com/vllm-project/vllm/blob/main/"
+                "vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py"
+            ),
+        ),
+    )
+)
+
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_flashinfer_sparse_sm90_fp8_b1",
+        # vllm_flashinfer_sparse_sm90_fp8's call and support, with the
+        # Hopper MLA module JIT-built from the B1 header overlay
+        # (mla_hopper.cuh, sha256 B1_MLA_HOPPER_SHA256). The fork's
+        # vllm.env_override applies VLLM_FLASHINFER_INCLUDE_OVERLAY before
+        # flashinfer is imported, so the worker environment must carry it.
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            kv=frozenset({DType.FP8_E4M3}),
+            sm_targets=frozenset({"sm_90a"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.dsa_sparse_mla_flashinfer_sm90",
+            function_name="profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_fp8_b1",
+        ),
+        table_name=KIND,
+        args_schema=DsaSparseMlaAttentionArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        worker_env=_b1_worker_env(),
+        row_provenance_ref=RunnerRef(
+            module_name="profiling.runners.attention.dsa_sparse_mla_flashinfer_sm90",
+            function_name="b1_row_provenance",
+        ),
+        doc=BackendDoc(
+            summary=(
+                "vLLM's FLASHINFER_MLA_SPARSE_SM90 with --kv-cache-dtype fp8 and the B1 "
+                "FlashInfer header overlay (VLLM_FLASHINFER_INCLUDE_OVERLAY): the FP8 KV "
+                "repack partially unrolled with the per-tensor scale folded in, on H200."
             ),
             url=(
                 "https://github.com/vllm-project/vllm/blob/main/"

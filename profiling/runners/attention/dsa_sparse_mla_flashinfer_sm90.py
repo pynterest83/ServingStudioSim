@@ -71,6 +71,11 @@ from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "dsa_sparse_mla_attention:vllm_flashinfer_sparse_sm90_bf16"
 _FP8_BACKEND = "dsa_sparse_mla_attention:vllm_flashinfer_sparse_sm90_fp8"
+_FP8_B1_BACKEND = "dsa_sparse_mla_attention:vllm_flashinfer_sparse_sm90_fp8_b1"
+# The fork module that applies VLLM_FLASHINFER_INCLUDE_OVERLAY (vLLM fork branch
+# exp/fp8-repack-b1) and the one header the B1 overlay changes.
+_OVERLAY_MODULE = "vllm.utils.flashinfer_overlay"
+_B1_HEADER = "flashinfer/attention/mla_hopper.cuh"
 # Messages shared by both cache dtypes name the vLLM backend.
 _LABEL = "FLASHINFER_MLA_SPARSE_SM90"
 # The same rope-free 512-wide latent rows, one byte per element: vLLM's FP8
@@ -108,6 +113,7 @@ class _CacheVariant:
     cache_layout: str
     cache_bytes: int  # bytes per cached element in the logical traffic
     fp8: bool  # e4m3 cache: planned as float8_e4m3fn, run with ckv/kpe scales
+    b1_overlay: bool = False  # FlashInfer JIT-built from the B1 header overlay
 
 
 _BF16_VARIANT = _CacheVariant(
@@ -123,6 +129,14 @@ _FP8_VARIANT = _CacheVariant(
     cache_layout=_FP8_CACHE_LAYOUT,
     cache_bytes=1,
     fp8=True,
+)
+_FP8_B1_VARIANT = _CacheVariant(
+    backend=_FP8_B1_BACKEND,
+    cache_dtype=DType.FP8_E4M3,
+    cache_layout=_FP8_CACHE_LAYOUT,
+    cache_bytes=1,
+    fp8=True,
+    b1_overlay=True,
 )
 
 
@@ -175,6 +189,49 @@ def _host_kv_lens(torch: Any, contexts: Sequence[int], *, selected_k: int) -> An
     """`_kv_lens_host` on the upper-bound path: ``clamp(context, max_valid)``, CPU int32."""
     lens = torch.tensor(contexts, dtype=torch.int64)
     return torch.clamp(lens, max=_max_valid(selected_k)).to(torch.int32)
+
+
+def _b1_overlay_digest(active: Any) -> str:
+    """Check the worker's applied overlay is exactly the B1 patch; its digest."""
+    import hashlib
+
+    from profiling.kernels.dsa_sparse_mla_attention import B1_INCLUDE_ENV, B1_MLA_HOPPER_SHA256
+
+    if active is None:
+        raise ProfilerNotImplemented(
+            f"{_FP8_B1_BACKEND} needs the B1 FlashInfer overlay: set {B1_INCLUDE_ENV} "
+            "to its include root (host worker)"
+        )
+    if tuple(active.changed) != (_B1_HEADER,):
+        raise ProfilerNotImplemented(
+            f"{_FP8_B1_BACKEND}: the overlay must change only {_B1_HEADER}, "
+            f"it changes {list(active.changed)}"
+        )
+    digest = hashlib.sha256((active.include_dir / _B1_HEADER).read_bytes()).hexdigest()
+    if digest != B1_MLA_HOPPER_SHA256:
+        raise ProfilerNotImplemented(
+            f"{_FP8_B1_BACKEND}: overlay {_B1_HEADER} sha256 {digest} is not the "
+            f"pinned B1 patch {B1_MLA_HOPPER_SHA256}"
+        )
+    return digest
+
+
+def _require_b1_overlay() -> str:
+    """Import the fork's overlay hook (``import vllm`` applies it) and verify it."""
+    try:
+        overlay = importlib.import_module(_OVERLAY_MODULE)
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise ProfilerNotImplemented(
+            f"{_FP8_B1_BACKEND} requires a vLLM fork with {_OVERLAY_MODULE}"
+        ) from exc
+    return _b1_overlay_digest(overlay.active_overlay())
+
+
+def b1_row_provenance(**_kwargs: Any) -> str | None:
+    """``backend_version`` note of a B1 row: the overlay header digest and JIT dir."""
+    overlay = importlib.import_module(_OVERLAY_MODULE)
+    active = overlay.active_overlay()
+    return f"fi_overlay={_b1_overlay_digest(active)[:12]} jit={active.jit_dir}"
 
 
 def _load_sm90_state_cls() -> Any:
@@ -423,6 +480,9 @@ def _profile(
         raise ProfilerNotImplemented(f"{backend} requires PyTorch in vllm_env") from exc
 
     fp8 = variant.fp8
+    if variant.b1_overlay:
+        # Before anything imports flashinfer (the overlay sets its JIT workspace).
+        _require_b1_overlay()
     try:
         state_cls = _load_sm90_state_cls()
         device = torch.device("cuda", torch.cuda.current_device())
@@ -493,7 +553,16 @@ def profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_fp8(
     return _profile(_FP8_VARIANT, **kwargs)
 
 
+def profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_fp8_b1(
+    **kwargs: Any,
+) -> ComputeMetrics:
+    """The FP8-cache call with FlashInfer built from the B1 header overlay."""
+    return _profile(_FP8_B1_VARIANT, **kwargs)
+
+
 __all__ = [
+    "b1_row_provenance",
     "profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_bf16",
     "profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_fp8",
+    "profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_fp8_b1",
 ]

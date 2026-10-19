@@ -378,3 +378,79 @@ def test_fp8_profile_counts_one_byte_per_cached_element(monkeypatch) -> None:
     logical_bytes = 2 * 2 * 16 * 512 + 4 * 2 * 2176 + 1 * (2048 + 2049) * 512
     logical_bytes += 2 * 2 * 16 * 512 + 8 * 2 * 16
     assert metrics.memory_bandwidth_gbps == pytest.approx(logical_bytes / 0.002 / 1e9)
+
+
+_B1_BACKEND = "vllm_flashinfer_sparse_sm90_fp8_b1"
+_B1_HEADER = "flashinfer/attention/mla_hopper.cuh"
+
+
+def test_b1_registration_is_the_fp8_row_with_the_overlay_worker_env(monkeypatch) -> None:
+    """Catches a B1 row that the launcher could pick for another cache dtype or
+    GPU, or whose worker would run without the include overlay (and so measure
+    the stock kernel under the B1 tag)."""
+    import importlib
+
+    import profiling.kernels.dsa_sparse_mla_attention as kmod
+
+    spec = find_kernel_profiler_spec(KIND, _B1_BACKEND)
+    fp8 = find_kernel_profiler_spec(KIND, _FP8_BACKEND)
+    assert spec.supports == fp8.supports and spec.args_schema is fp8.args_schema
+    assert spec.runner_ref.function_name == (
+        "profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_fp8_b1"
+    )
+    assert spec.row_provenance_ref.function_name == "b1_row_provenance"
+    monkeypatch.setenv(kmod.B1_INCLUDE_ENV, "/x/include")
+    assert kmod._b1_worker_env() == (("VLLM_FLASHINFER_INCLUDE_OVERLAY", "/x/include"),)
+    monkeypatch.delenv(kmod.B1_INCLUDE_ENV)
+    assert kmod._b1_worker_env() == ()
+    assert importlib.import_module(spec.runner_ref.module_name) is runner
+
+
+def _overlay(tmp_path, text: bytes, changed=(_B1_HEADER,)):
+    from types import SimpleNamespace
+
+    header = tmp_path / _B1_HEADER
+    header.parent.mkdir(parents=True, exist_ok=True)
+    header.write_bytes(text)
+    return SimpleNamespace(include_dir=tmp_path, jit_dir=tmp_path / "jit", changed=changed)
+
+
+def test_b1_overlay_check_accepts_only_the_pinned_header(tmp_path, monkeypatch) -> None:
+    """Catches B1 rows measured with no overlay, a different patch, or an overlay
+    that also changes other headers."""
+    import hashlib
+
+    import profiling.kernels.dsa_sparse_mla_attention as kmod
+
+    with pytest.raises(ProfilerNotImplemented, match="VIBESIM_FLASHINFER_B1_INCLUDE"):
+        runner._b1_overlay_digest(None)
+    good = _overlay(tmp_path, b"patched")
+    monkeypatch.setattr(kmod, "B1_MLA_HOPPER_SHA256", hashlib.sha256(b"patched").hexdigest())
+    assert runner._b1_overlay_digest(good) == kmod.B1_MLA_HOPPER_SHA256
+    with pytest.raises(ProfilerNotImplemented, match="only"):
+        runner._b1_overlay_digest(_overlay(tmp_path, b"patched", (_B1_HEADER, "flashinfer/x.cuh")))
+    with pytest.raises(ProfilerNotImplemented, match="pinned"):
+        runner._b1_overlay_digest(_overlay(tmp_path, b"other"))
+
+
+def test_b1_profile_checks_the_overlay_before_the_fp8_call(monkeypatch) -> None:
+    """Catches the B1 entry skipping the overlay check (stock kernel under the B1
+    tag) or checking it after the production module imported flashinfer."""
+    calls: list[object] = []
+    monkeypatch.setattr(runner, "_require_b1_overlay", lambda: calls.append("overlay"))
+    monkeypatch.setattr(runner, "_load_sm90_state_cls", lambda: calls.append("state_cls"))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        runner, "_build_sm90_operands", lambda *_a, **kwargs: calls.append(("fp8", kwargs["fp8"]))
+    )
+    monkeypatch.setattr(runner, "_make_state", lambda *_a, **_k: None)
+    monkeypatch.setattr(runner, "_plan_and_pack", lambda *_a, **_k: None)
+    monkeypatch.setattr(runner, "_check_correctness", lambda *_a, **_k: None)
+    monkeypatch.setattr(runner, "_launch", lambda *_a, **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(runner.Timer, "cupti", lambda fn, *, kernel_name: fn() or 2.0)
+    monkeypatch.setattr(runner.Energy, "perf", lambda *_a, **_k: 0.5)
+    runner.profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_fp8_b1(**_FP8_SPEC)
+    assert calls == ["overlay", "state_cls", ("fp8", True), {"fp8": True}]
+    calls.clear()
+    runner.profile_dsa_sparse_mla_attention_vllm_flashinfer_sparse_sm90_fp8(**_FP8_SPEC)
+    assert "overlay" not in calls
